@@ -192,8 +192,8 @@ def _mm2_pv(
     """
     # wait workspace_p[prev_ring_slot] (P from Vec1) ready
     sync_block_wait("vector", "cube", SEM_P_READY, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
-    # wait workspace_pv[prev_ring_slot] slot free (Vec2 released after accumulating)
-    sync_block_wait("vector", "cube", SEM_PV_FREE, PIPE.PIPE_MTE2, PIPE.PIPE_FIX)
+    # Experimental: keep MM2 from blocking on Vec2's previous pv slot.
+    # The goal is to see whether pv reuse is still on the critical path.
 
     for cb_idx in range(CB):
         prev_kv_idx = prev_idx_in_conbine * CB + cb_idx
