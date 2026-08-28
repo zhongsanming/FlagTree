@@ -255,8 +255,8 @@ def _vec1_softmax(
     """
     # wait workspace_s[ring_slot] (all CB score blocks) ready from MM1
     sync_block_wait("cube", "vector", SEM_S_READY, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
-    # wait workspace_p[ring_slot] slot free (MM2 released after reading P)
-    sync_block_wait("cube", "vector", SEM_P_FREE, PIPE.PIPE_MTE2, PIPE.PIPE_MTE3)
+    # Experimental: keep Vec1 from blocking on the next P slot being free.
+    # This lets us test whether the ring itself is the overlap limiter.
 
     # reset running max at the first task of each output tile
     if idx_in_conbine == 0:
