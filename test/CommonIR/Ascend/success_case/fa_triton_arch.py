@@ -287,12 +287,13 @@ def _vec1_softmax(
         n_cand = -block_row_max * sm_scale
         neg_max_prv = tl.minimum(neg_max_even, neg_max_odd)
         neg_max_new = tl.minimum(n_cand, neg_max_prv)
+        delta = neg_max_new - neg_max_prv
 
         # softmax_p = exp(sm_scale * score + neg_max_new)
         softmax_p = tl.exp(sm_scale * attn_score_block + neg_max_new[:, None])
 
-        # rescale = exp(neg_max_new - neg_max_prv): correction factor for Vec2
-        rescale = tl.exp(neg_max_new - neg_max_prv)
+        # rescale = exp(delta): correction factor for Vec2
+        rescale = tl.exp(delta)
         # block_expsum: partial row-sum contributed by this KV block
         block_expsum = tl.sum(softmax_p, axis=-1, keep_dims=False)
 
