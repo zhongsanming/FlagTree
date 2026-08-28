@@ -281,6 +281,8 @@ def _vec1_softmax(
             kv_col_idx = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
             causal_mask = q_row_idx[:, None] >= kv_col_idx[None, :]
             attn_score_block = tl.where(causal_mask, attn_score_block, float("-inf"))
+        else:
+            causal_mask = None
 
         # online softmax: compute new running -max*scale (ping-pong)
         block_row_max = tl.max(attn_score_block, axis=-1, keep_dims=False)
