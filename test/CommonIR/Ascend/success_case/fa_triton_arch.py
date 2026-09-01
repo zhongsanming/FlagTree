@@ -10,7 +10,7 @@ import triton.language as tl
 #
 #  These are the genuine CommonIR builders from
 #    python/triton/experimental/tle/language/dsa/{core,semantic}.py
-#  Each `tile_*` builtin emits a tile.* op into the Triton IR module, so the
+#  Each `tle.dsa.*` builtin emits a tile.* op into the Triton IR module, so the
 #  compiled TTIR *is* the intermediate CommonIR we want to dump.
 #
 #  IMPORTANT — they are @triton.language `@builtin`s: they must be called
@@ -128,7 +128,7 @@ def _mm1_qkt(
                                  (BLOCK_N, DIM), (1, 0))
         k_block = tl.load(k_bp)
 
-        # Both operands are plain tensors: no tile_to_tensor, no 4D cbuf issue.
+        # Both operands are plain tensors: no tle.dsa.to_tensor, no 4D cbuf issue.
         attn_score_l0c = tl.dot(q_l1, tl.trans(k_block), tl.zeros((BLOCK_M, BLOCK_N), tl.float32))
 
         score_store_bp = tl.make_block_ptr(
@@ -167,7 +167,7 @@ def _mm2_pv(
     """MM2: compute O_part = P * V for CB blocks and store into workspace_pv.
 
     Both P and V are loaded via tl.load (plain register tensors), mirroring
-    fa_4func.py.  Using tile_copy+tile_to_tensor for either operand causes
+    fa_4func.py.  Using tle.dsa.copy+tle.dsa.to_tensor for either operand causes
     bishengir-compile to see a 4D cbuf memref for operand 0 of the lowered
     func.call, which the matmul intrinsic rejects (expects 2D).
     """
@@ -191,7 +191,7 @@ def _mm2_pv(
             (1, 0))
         p_block = tl.load(prob_load_bp)
 
-        # Both operands are plain tensors: no tile_to_tensor, no 4D cbuf issue.
+        # Both operands are plain tensors: no tle.dsa.to_tensor, no 4D cbuf issue.
         pv_part_l0c = tl.dot(p_block, v_block, tl.zeros((BLOCK_M, DIM), tl.float32))
 
         pv_store_bp = tl.make_block_ptr(
@@ -213,8 +213,8 @@ def _vec1_softmax(
     cid,
     idx_in_conbine,
     ring_slot,
-    neg_max_even,
-    neg_max_odd,
+    nmax_even_buf,
+    nmax_odd_buf,
     sm_scale,
     # causal mask inputs
     IS_CAUSAL: tl.constexpr,
@@ -232,17 +232,20 @@ def _vec1_softmax(
     stabilised softmax probabilities, and stores P, rescale, and block_expsum
     to their respective GM ring-buffers for MM2 and Vec2.
 
-    Returns updated (neg_max_even, neg_max_odd).
+    Mutates nmax_even_buf / nmax_odd_buf in-place; no return value.
     """
     # wait workspace_s[ring_slot] (all CB score blocks) ready from MM1
     sync_block_wait("cube", "vector", SEM_S_READY + ring_slot, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
     # wait workspace_p[ring_slot] slot free (MM2 released after reading P)
     sync_block_wait("cube", "vector", SEM_P_FREE + ring_slot, PIPE.PIPE_MTE2, PIPE.PIPE_MTE3)
 
-    # reset running max at the first task of each output tile
-    if idx_in_conbine == 0:
-        neg_max_even = tl.full((BLOCK_M, ), 2**30, tl.float32)
-        neg_max_odd = tl.full((BLOCK_M, ), 2**30, tl.float32)
+    # read current running max from UB buffers.
+    # Sentinel resets via tle.dsa.to_buffer(tl.full(...)) are gone — tl.full materialises
+    # in default (cbuf) address space, producing an illegal cbuf->UB copy.
+    # Instead, the first cb of the first task of each tile uses tl.where to
+    # bootstrap from n_cand (delta=0, rescale=1), identical numerics.
+    neg_max_even = tle.dsa.to_tensor(nmax_even_buf, writable=False)
+    neg_max_odd = tle.dsa.to_tensor(nmax_odd_buf, writable=False)
 
     for cb_idx in range(CB):
         kv_idx = idx_in_conbine * CB + cb_idx
@@ -266,7 +269,12 @@ def _vec1_softmax(
         # online softmax: compute new running -max*scale (ping-pong)
         block_row_max = tl.max(attn_score_block, axis=-1, keep_dims=False)
         n_cand = -block_row_max * sm_scale
-        neg_max_prv = tl.minimum(neg_max_even, neg_max_odd)
+        # First block of each output tile: bootstrap from n_cand (no prior max).
+        # cb_idx is a constexpr loop var so this if is static.
+        if cb_idx == 0:
+            neg_max_prv = tl.where(idx_in_conbine == 0, n_cand, tl.minimum(neg_max_even, neg_max_odd))
+        else:
+            neg_max_prv = tl.minimum(neg_max_even, neg_max_odd)
         neg_max_new = tl.minimum(n_cand, neg_max_prv)
 
         # softmax_p = exp(sm_scale * score + neg_max_new)
@@ -287,12 +295,34 @@ def _vec1_softmax(
                                             (BLOCK_M, 1), (1, 0))
         tl.store(expsum_store_bp, block_expsum[:, None])
 
-        # update running max ping-pong
-        neg_max_new = tl.minimum(n_cand, tl.where(cur_parity == 0, neg_max_even, neg_max_odd))
-        if cur_parity == 0:
-            neg_max_even = neg_max_new
+        # update running max ping-pong (in-place store into UB buffer)
+        prev_slot = tl.where(cur_parity == 0, neg_max_even, neg_max_odd)
+        if cb_idx == 0:
+            neg_max_new = tl.where(idx_in_conbine == 0, n_cand, tl.minimum(n_cand, prev_slot))
         else:
-            neg_max_odd = neg_max_new
+            neg_max_new = tl.minimum(n_cand, prev_slot)
+        if cur_parity == 0:
+            tle.dsa.to_buffer(neg_max_new, tle.dsa.ascend.UB, bind_buffer=nmax_even_buf)
+        else:
+            tle.dsa.to_buffer(neg_max_new, tle.dsa.ascend.UB, bind_buffer=nmax_odd_buf)
+        # On the first KV block of each call, the other-parity slot is not
+        # written by the ping-pong above.  It must be seeded ONLY for the very
+        # first task of the tile (idx_in_conbine == 0), where it is still
+        # uninitialised UB.  For continuation tasks that slot carries the
+        # running max from previous tasks and must be preserved -- so we write
+        # it back unchanged via tl.where (a no-op).  Overwriting it there would
+        # drop the earlier tasks' contribution to the running max.
+        # cb_idx is constexpr, so this outer branch is static.
+        if cb_idx == 0:
+            if cur_parity == 0:
+                seed_odd = tl.where(idx_in_conbine == 0, neg_max_new, neg_max_odd)
+                tle.dsa.to_buffer(seed_odd, tle.dsa.ascend.UB, bind_buffer=nmax_odd_buf)
+            else:
+                seed_even = tl.where(idx_in_conbine == 0, neg_max_new, neg_max_even)
+                tle.dsa.to_buffer(seed_even, tle.dsa.ascend.UB, bind_buffer=nmax_even_buf)
+        # refresh local views so subsequent cb iterations see the update
+        neg_max_even = tle.dsa.to_tensor(nmax_even_buf, writable=False)
+        neg_max_odd = tle.dsa.to_tensor(nmax_odd_buf, writable=False)
 
         # softmax_p -> workspace_p GM (MTE3): vector core owns full BLOCK_M rows
         prob_store_bp = tl.make_block_ptr(
@@ -303,8 +333,6 @@ def _vec1_softmax(
     # all CB P-blocks written -> release workspace_s[ring_slot]; notify MM2
     sync_block_set("vector", "cube", SEM_S_FREE + ring_slot, PIPE.PIPE_MTE2, PIPE.PIPE_FIX)
     sync_block_set("vector", "cube", SEM_P_READY + ring_slot, PIPE.PIPE_MTE3, PIPE.PIPE_MTE2)
-
-    return neg_max_even, neg_max_odd
 
 
 @triton.jit
@@ -319,8 +347,8 @@ def _vec2_accumulate(
     prev_batch_idx,
     prev_head_idx,
     prev_ring_slot,
-    acc_o,
-    softmax_denom,
+    acc_o_buf,
+    denom_buf,
     sOb,
     sOh,
     sOs,
@@ -337,7 +365,7 @@ def _vec2_accumulate(
     workspace_rescale/expsum (both written by Vec1), accumulates into acc_o
     and softmax_denom, and writes the final output row on the last KV block.
 
-    Returns updated (acc_o, softmax_denom).
+    Mutates acc_o_buf / denom_buf in-place; no return value.
     """
     # wait workspace_pv[prev_ring_slot] (all CB P*V blocks) ready from MM2
     sync_block_wait("cube", "vector", SEM_PV_READY + prev_ring_slot, PIPE.PIPE_FIX, PIPE.PIPE_MTE2)
@@ -360,18 +388,24 @@ def _vec2_accumulate(
                                            (BLOCK_M, 1), (1, 0))
         block_expsum = tl.reshape(tl.load(expsum_load_bp).to(tl.float32), (BLOCK_M, ))
 
+        # read current accumulators from UB buffers
+        acc_o = tle.dsa.to_tensor(acc_o_buf, writable=False)
+        softmax_denom = tle.dsa.to_tensor(denom_buf, writable=False)
+
         if prev_idx_in_conbine == 0 and cb_idx == 0:
-            # first KV block: init acc_o and softmax_denom directly
-            acc_o = pv_acc
-            softmax_denom = block_expsum
+            # first KV block: init acc_o and softmax_denom directly (in-place)
+            tle.dsa.to_buffer(pv_acc, tle.dsa.ascend.UB, bind_buffer=acc_o_buf)
+            tle.dsa.to_buffer(block_expsum, tle.dsa.ascend.UB, bind_buffer=denom_buf)
         else:
-            # rescale acc_o and accumulate
+            # rescale acc_o and accumulate (in-place)
             rescale_bc = tl.broadcast_to(rescale[:, None], (BLOCK_M, DIM))
-            acc_o = acc_o * rescale_bc + pv_acc
-            softmax_denom = softmax_denom * rescale + block_expsum
+            tle.dsa.to_buffer(acc_o * rescale_bc + pv_acc, tle.dsa.ascend.UB, bind_buffer=acc_o_buf)
+            tle.dsa.to_buffer(softmax_denom * rescale + block_expsum, tle.dsa.ascend.UB, bind_buffer=denom_buf)
 
         if prev_kv_idx == NUM_KV_BLOCKS - 1:
             # last KV block: divide by softmax denominator and write output
+            acc_o = tle.dsa.to_tensor(acc_o_buf, writable=False)
+            softmax_denom = tle.dsa.to_tensor(denom_buf, writable=False)
             denom_bc = tl.broadcast_to(softmax_denom[:, None], (BLOCK_M, DIM))
             output_block = (acc_o / denom_bc).to(Out.dtype.element_ty)
             o_bp = tl.make_block_ptr(Out + prev_batch_idx * sOb + prev_head_idx * sOh, (S, DIM), (sOs, sOd),
@@ -380,8 +414,6 @@ def _vec2_accumulate(
 
     # all CB blocks consumed -> release workspace_pv[prev_ring_slot]
     sync_block_set("vector", "cube", SEM_PV_FREE + prev_ring_slot, PIPE.PIPE_MTE2, PIPE.PIPE_FIX)
-
-    return acc_o, softmax_denom
 
 
 # =============================================================================
@@ -443,15 +475,14 @@ def flash_attention_fwd_3task_kernel(
     num_global_tasks = block_num * conbined_block_num  # total pipelined tasks on this core
 
     # -- Vector side (UB registers): full online-softmax state ---------------
-    # acc_o and running max span the full BLOCK_M rows; state per (ring_slot, cb_idx)
-    # stored as flat GM-backed workspaces; running max uses a ping-pong register
-    # pair (one per kv parity).
-    acc_o = tl.zeros((BLOCK_M, DIM), tl.float32)
-    softmax_denom = tl.zeros((BLOCK_M, ), tl.float32)  # running denominator l
-    # neg_max_even/odd: running -max*scale for even/odd kv index, reset each tile
-    neg_max_even = tl.full((BLOCK_M, ), 2**30, tl.float32)
-    neg_max_odd = tl.full((BLOCK_M, ), 2**30, tl.float32)
-
+    # All four accumulators live in persistent UB buffers allocated once here,
+    # before the pipeline loop.  Using tle.dsa.alloc + tle.dsa.to_buffer instead of
+    # plain tensors means these never become scf.for iter_args, which
+    # eliminates the OneShotBufferize copy-back pairs (root cause 1).
+    acc_o_buf = tle.dsa.alloc([BLOCK_M, DIM], tl.float32, tle.dsa.ascend.UB)
+    denom_buf = tle.dsa.alloc([BLOCK_M], tl.float32, tle.dsa.ascend.UB)
+    nmax_even_buf = tle.dsa.alloc([BLOCK_M], tl.float32, tle.dsa.ascend.UB)
+    nmax_odd_buf = tle.dsa.alloc([BLOCK_M], tl.float32, tle.dsa.ascend.UB)
     # =========================================================================
     #  3-task pipeline: Cube (MM1/MM2) and Vector (Vec1/Vec2) scopes
     #  run tick-by-tick inside a single outer loop.
@@ -553,7 +584,7 @@ def flash_attention_fwd_3task_kernel(
             if g < num_global_tasks:
                 idx_in_conbine = g % conbined_block_num
                 ring_slot = g % RING
-                neg_max_even, neg_max_odd = _vec1_softmax(
+                _vec1_softmax(
                     workspace_s,
                     workspace_p,
                     workspace_rescale,
@@ -561,8 +592,8 @@ def flash_attention_fwd_3task_kernel(
                     cid,
                     idx_in_conbine,
                     ring_slot,
-                    neg_max_even,
-                    neg_max_odd,
+                    nmax_even_buf,
+                    nmax_odd_buf,
                     sm_scale,
                     IS_CAUSAL,
                     block_start,
@@ -585,7 +616,7 @@ def flash_attention_fwd_3task_kernel(
                 prev_batch_idx = prev_output_block_id // (num_seq_blocks * heads_q)
                 prev_ring_slot = prev_g % RING
 
-                acc_o, softmax_denom = _vec2_accumulate(
+                _vec2_accumulate(
                     Out,
                     workspace_pv,
                     workspace_rescale,
@@ -596,8 +627,8 @@ def flash_attention_fwd_3task_kernel(
                     prev_batch_idx,
                     prev_head_idx,
                     prev_ring_slot,
-                    acc_o,
-                    softmax_denom,
+                    acc_o_buf,
+                    denom_buf,
                     sOb,
                     sOh,
                     sOs,
