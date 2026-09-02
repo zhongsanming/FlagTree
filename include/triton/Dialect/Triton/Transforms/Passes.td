@@ -90,4 +90,15 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def TritonVectorizeLanePack : Pass<"triton-vectorize-lane-pack", "mlir::ModuleOp"> {
+  let summary = "Vectorize lane-isomorphic Triton tensor regions";
+  let description = [{
+    Packs same-shaped Triton tensor values into a higher-rank tensor when the
+    whole region is lane-isomorphic and side-effect free. Loops are only
+    rewritten atomically.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
 #endif
