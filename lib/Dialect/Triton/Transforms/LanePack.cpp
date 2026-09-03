@@ -128,53 +128,46 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
 static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
                                  Value &eps) {
   SmallVector<Value> worklist{root};
+  bool sawEps = false;
   while (!worklist.empty()) {
     Value current = worklist.pop_back_val();
     auto add = current.getDefiningOp<arith::AddFOp>();
     if (!add) {
-      if (isScalar(current)) {
-        if (!eps)
-          eps = current;
-        if (eps != current) {
-          llvm::errs() << "[lane-pack] reject: multiple scalar leaves in add tree\n";
-          return false;
-        }
+      if (sawEps) {
+        leaves.push_back(current);
+        continue;
+      }
+      if (isScalar(current) || !current.getType().isa<RankedTensorType>()) {
+        eps = current;
+        sawEps = true;
         continue;
       }
       leaves.push_back(current);
       continue;
     }
 
-    bool lhsScalar = isScalar(add.getLhs());
-    bool rhsScalar = isScalar(add.getRhs());
-    if (lhsScalar && rhsScalar) {
-      llvm::errs() << "[lane-pack] reject: add tree has two scalar leaves\n";
+    bool lhsEps = !sawEps && (isScalar(add.getLhs()) || !add.getLhs().getType().isa<RankedTensorType>());
+    bool rhsEps = !sawEps && (isScalar(add.getRhs()) || !add.getRhs().getType().isa<RankedTensorType>());
+    if (lhsEps && rhsEps) {
+      llvm::errs() << "[lane-pack] reject: add tree has two epsilon-like leaves\n";
       return false;
     }
-    if (lhsScalar) {
-      if (!eps)
-        eps = add.getLhs();
-      if (eps != add.getLhs()) {
-        llvm::errs() << "[lane-pack] reject: epsilon mismatch in add tree\n";
-        return false;
-      }
+    if (lhsEps) {
+      eps = add.getLhs();
+      sawEps = true;
       worklist.push_back(add.getRhs());
       continue;
     }
-    if (rhsScalar) {
-      if (!eps)
-        eps = add.getRhs();
-      if (eps != add.getRhs()) {
-        llvm::errs() << "[lane-pack] reject: epsilon mismatch in add tree\n";
-        return false;
-      }
+    if (rhsEps) {
+      eps = add.getRhs();
+      sawEps = true;
       worklist.push_back(add.getLhs());
       continue;
     }
     worklist.push_back(add.getLhs());
     worklist.push_back(add.getRhs());
   }
-  return true;
+  return sawEps;
 }
 
 struct LanePackMatch {
