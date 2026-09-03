@@ -68,6 +68,7 @@ def make_ttir(mod, metadata, options):
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
+    passes.ttir.add_lane_pack(pm)
     passes.common.add_cse(pm)
     passes.common.add_licm(pm)
     passes.common.add_symbol_dce(pm)

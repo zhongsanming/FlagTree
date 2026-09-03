@@ -193,6 +193,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
+        passes.ttir.add_lane_pack(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
