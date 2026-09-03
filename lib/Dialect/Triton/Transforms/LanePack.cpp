@@ -1,13 +1,13 @@
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
@@ -37,67 +37,63 @@ static bool isSameLaneTensorGroup(ArrayRef<Value> vals) {
 }
 
 static bool hasSingleAddCombiner(triton::ReduceOp reduceOp) {
-  Region &combine = reduceOp.getCombineOp();
-  if (!combine.hasOneBlock())
-    return false;
-  if (combine.front().getOperations().size() != 2)
-    return false;
-  return isa<arith::AddFOp>(combine.front().front());
+  auto *combiner = reduceOp.getSingleCombiner();
+  return combiner && isa<arith::AddFOp>(combiner);
 }
 
-static Value matchScalarWithAddEps(Value v, Value &eps) {
-  auto add = v.getDefiningOp<arith::AddFOp>();
-  if (!add)
-    return {};
-  if (!eps) {
-    if (isa<OpResult>(add.getLhs()) && !isa<OpResult>(add.getRhs())) {
-      eps = add.getRhs();
-      return add.getLhs();
-    }
-    if (isa<OpResult>(add.getRhs()) && !isa<OpResult>(add.getLhs())) {
-      eps = add.getLhs();
-      return add.getRhs();
-    }
-    return {};
-  }
-  if (add.getLhs() == eps)
-    return add.getRhs();
-  if (add.getRhs() == eps)
-    return add.getLhs();
-  return {};
-}
-
-static bool matchPerLaneRowNorm(ArrayRef<BlockArgument> laneArgs,
-                                SmallVectorImpl<Value> &rowNorms,
-                                Value &eps) {
-  rowNorms.clear();
-  rowNorms.reserve(laneArgs.size());
-  for (BlockArgument laneArg : laneArgs) {
-    auto div = dyn_cast_or_null<arith::DivFOp>(*laneArg.getUsers().begin());
-    (void)div;
-    bool matchedLane = false;
-    for (Operation *user : laneArg.getUsers()) {
-      auto divOp = dyn_cast<arith::DivFOp>(user);
-      if (!divOp || divOp.getLhs() != laneArg)
-        continue;
-      auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>();
-      if (!splat)
-        continue;
-      Value reduceScalar = matchScalarWithAddEps(splat.getSrc(), eps);
-      if (!reduceScalar)
-        continue;
-      auto reduce = reduceScalar.getDefiningOp<triton::ReduceOp>();
-      if (!reduce || reduce.getAxis() != 0 || reduce.getSrcs().size() != 1 ||
-          reduce.getSrcs().front() != laneArg || !hasSingleAddCombiner(reduce))
-        continue;
-      rowNorms.push_back(divOp.getResult());
-      matchedLane = true;
-      break;
-    }
-    if (!matchedLane)
+template <typename OpTy>
+static bool hasOneUseOfType(Value v, Operation *&user) {
+  user = nullptr;
+  for (Operation *candidate : v.getUsers()) {
+    if (!isa<OpTy>(candidate))
+      continue;
+    if (user)
       return false;
+    user = candidate;
   }
-  return rowNorms.size() == laneArgs.size();
+  return user != nullptr;
+}
+
+static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
+                                      triton::ReduceOp &reduceOp,
+                                      arith::DivFOp &divOp) {
+  Operation *user = nullptr;
+  if (!hasOneUseOfType<arith::DivFOp>(laneArg, user))
+    return false;
+
+  divOp = cast<arith::DivFOp>(user);
+  if (divOp.getLhs() != laneArg)
+    return false;
+
+  auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>();
+  if (!splat)
+    return false;
+  auto add = splat.getSrc().getDefiningOp<arith::AddFOp>();
+  if (!add)
+    return false;
+
+  Value reduceScalar;
+  Value candidateEps;
+  if (isa<OpResult>(add.getLhs()) && !isa<OpResult>(add.getRhs())) {
+    reduceScalar = add.getLhs();
+    candidateEps = add.getRhs();
+  } else if (isa<OpResult>(add.getRhs()) && !isa<OpResult>(add.getLhs())) {
+    reduceScalar = add.getRhs();
+    candidateEps = add.getLhs();
+  } else {
+    return false;
+  }
+
+  if (!eps)
+    eps = candidateEps;
+  else if (eps != candidateEps)
+    return false;
+
+  reduceOp = reduceScalar.getDefiningOp<triton::ReduceOp>();
+  if (!reduceOp || reduceOp.getAxis() != 0 || reduceOp.getNumOperands() != 1 ||
+      reduceOp.getOperand(0) != laneArg || !hasSingleAddCombiner(reduceOp))
+    return false;
+  return true;
 }
 
 static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
@@ -110,23 +106,21 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
       leaves.push_back(current);
       continue;
     }
-    if (!eps && (!isa<OpResult>(add.getLhs()) || !isa<OpResult>(add.getRhs()))) {
-      if (!isa<OpResult>(add.getLhs())) {
+    if (!isa<OpResult>(add.getLhs())) {
+      if (!eps)
         eps = add.getLhs();
+      if (eps == add.getLhs()) {
         worklist.push_back(add.getRhs());
-      } else {
-        eps = add.getRhs();
-        worklist.push_back(add.getLhs());
+        continue;
       }
-      continue;
     }
-    if (eps && add.getLhs() == eps) {
-      worklist.push_back(add.getRhs());
-      continue;
-    }
-    if (eps && add.getRhs() == eps) {
-      worklist.push_back(add.getLhs());
-      continue;
+    if (!isa<OpResult>(add.getRhs())) {
+      if (!eps)
+        eps = add.getRhs();
+      if (eps == add.getRhs()) {
+        worklist.push_back(add.getLhs());
+        continue;
+      }
     }
     worklist.push_back(add.getLhs());
     worklist.push_back(add.getRhs());
@@ -134,77 +128,246 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
   return true;
 }
 
-static bool matchSharedColumnNorm(ArrayRef<Value> rowNorms,
-                                  ArrayRef<Value> yieldedLanes, Value &eps) {
-  if (rowNorms.size() != yieldedLanes.size())
-    return false;
+struct LanePackMatch {
+  SmallVector<Value> initLanes;
+  SmallVector<BlockArgument> laneArgs;
+  SmallVector<arith::DivFOp> rowDivs;
+  SmallVector<Value> rowNorms;
+  SmallVector<arith::DivFOp> yieldDivs;
+  Value eps;
+  scf::YieldOp yieldOp;
+};
+
+static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
+  LanePackMatch match;
+  match.initLanes.assign(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
+  if (!isSameLaneTensorGroup(match.initLanes))
+    return failure();
+
+  match.yieldOp = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (!match.yieldOp)
+    return failure();
+  if (match.yieldOp.getNumOperands() != match.initLanes.size())
+    return failure();
+
+  SmallVector<Value> yielded(match.yieldOp.getOperands().begin(),
+                             match.yieldOp.getOperands().end());
+  if (!isSameLaneTensorGroup(yielded))
+    return failure();
+
+  match.laneArgs.assign(forOp.getRegionIterArgs().begin(),
+                        forOp.getRegionIterArgs().end());
+  match.rowDivs.reserve(match.laneArgs.size());
+  match.rowNorms.reserve(match.laneArgs.size());
+  for (BlockArgument laneArg : match.laneArgs) {
+    triton::ReduceOp reduceOp;
+    arith::DivFOp divOp;
+    if (!matchLaneReduceToSplatDiv(laneArg, match.eps, reduceOp, divOp))
+      return failure();
+    match.rowDivs.push_back(divOp);
+    match.rowNorms.push_back(divOp.getResult());
+  }
 
   Value sharedDenom;
-  for (auto [rowNorm, yielded] : llvm::zip(rowNorms, yieldedLanes)) {
-    auto div = yielded.getDefiningOp<arith::DivFOp>();
-    if (!div || div.getLhs() != rowNorm)
-      return false;
+  match.yieldDivs.reserve(yielded.size());
+  for (auto [rowNorm, yieldedLane] : llvm::zip(match.rowNorms, yielded)) {
+    auto divOp = yieldedLane.getDefiningOp<arith::DivFOp>();
+    if (!divOp || divOp.getLhs() != rowNorm)
+      return failure();
+    match.yieldDivs.push_back(divOp);
     if (!sharedDenom)
-      sharedDenom = div.getRhs();
-    else if (sharedDenom != div.getRhs())
-      return false;
+      sharedDenom = divOp.getRhs();
+    else if (sharedDenom != divOp.getRhs())
+      return failure();
   }
 
-  SmallVector<Value> leaves;
-  if (!collectAddTreeLeaves(sharedDenom, leaves, eps))
-    return false;
-  if (leaves.size() != rowNorms.size())
-    return false;
+  SmallVector<Value> addLeaves;
+  Value treeEps = match.eps;
+  if (!collectAddTreeLeaves(sharedDenom, addLeaves, treeEps))
+    return failure();
+  if (treeEps != match.eps || addLeaves.size() != match.rowNorms.size())
+    return failure();
 
   llvm::SmallPtrSet<void *, 8> leafSet;
-  for (Value leaf : leaves)
+  for (Value leaf : addLeaves)
     leafSet.insert(leaf.getAsOpaquePointer());
-  for (Value rowNorm : rowNorms) {
+  for (Value rowNorm : match.rowNorms) {
     if (!leafSet.contains(rowNorm.getAsOpaquePointer()))
-      return false;
+      return failure();
   }
-  return true;
+
+  return match;
 }
 
-static bool isLanePackCandidate(scf::ForOp forOp) {
-  SmallVector<Value> iterArgs(forOp.getInitArgs().begin(),
-                              forOp.getInitArgs().end());
-  if (!isSameLaneTensorGroup(iterArgs))
-    return false;
+static Value buildPackedLanes(OpBuilder &builder, Location loc,
+                              ArrayRef<Value> lanes) {
+  assert(lanes.size() >= 2 && "expected at least two lanes");
+  Value packed = builder.create<triton::JoinOp>(loc, lanes[0], lanes[1]);
+  for (Value lane : lanes.drop_front(2)) {
+    auto laneTy = cast<RankedTensorType>(lane.getType());
+    auto packedTy = cast<RankedTensorType>(packed.getType());
+    SmallVector<int64_t> expandedShape(laneTy.getShape().begin(),
+                                       laneTy.getShape().end());
+    expandedShape.push_back(1);
+    auto expandedTy = RankedTensorType::get(expandedShape,
+                                            laneTy.getElementType(),
+                                            packedTy.getEncoding());
+    Value expandedLane =
+        builder.create<triton::ExpandDimsOp>(loc, expandedTy, lane, -1);
+    packed = builder.create<triton::CatOp>(loc, packedTy, packed, expandedLane);
+  }
+  return packed;
+}
 
-  auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  if (!yield)
-    return false;
-  if (yield.getNumOperands() != iterArgs.size())
-    return false;
+static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
+                                            Value packed,
+                                            unsigned laneCount) {
+  SmallVector<Value> lanes;
+  lanes.reserve(laneCount);
 
-  SmallVector<Value> yielded(yield.getOperands().begin(),
-                             yield.getOperands().end());
-  if (!isSameLaneTensorGroup(yielded))
-    return false;
+  std::function<void(Value)> splitRec = [&](Value v) {
+    if (lanes.size() + 1 == laneCount) {
+      lanes.push_back(v);
+      return;
+    }
+    auto shape = cast<RankedTensorType>(v.getType()).getShape();
+    if (shape.empty() || shape.back() != 2)
+      return;
+    auto split = builder.create<triton::SplitOp>(loc, v);
+    splitRec(split.getOutLHS());
+    splitRec(split.getOutRHS());
+  };
 
-  SmallVector<BlockArgument> laneArgs(forOp.getRegionIterArgs().begin(),
-                                      forOp.getRegionIterArgs().end());
-  Value eps;
-  SmallVector<Value> rowNorms;
-  if (!matchPerLaneRowNorm(laneArgs, rowNorms, eps))
-    return false;
-  return matchSharedColumnNorm(rowNorms, yielded, eps);
+  splitRec(packed);
+  return lanes;
+}
+
+static Value buildSumReduce(OpBuilder &builder, Location loc, Value src,
+                            int axis) {
+  auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    Region &region = reduce.getCombineOp();
+    Block *block = builder.createBlock(&region);
+    auto elemTy = cast<RankedTensorType>(src.getType()).getElementType();
+    block->addArgument(elemTy, loc);
+    block->addArgument(elemTy, loc);
+    builder.setInsertionPointToStart(block);
+    Value sum = builder.create<arith::AddFOp>(loc, block->getArgument(0),
+                                              block->getArgument(1));
+    builder.create<triton::ReduceReturnOp>(loc, sum);
+  }
+  return *reduce.getResult().begin();
+}
+
+static Value broadcastScalarTo(OpBuilder &builder, Location loc, Value scalar,
+                               RankedTensorType dstTy) {
+  SmallVector<int64_t> splatShape(dstTy.getRank(), 1);
+  auto splatTy = RankedTensorType::get(splatShape, dstTy.getElementType(),
+                                       dstTy.getEncoding());
+  Value splat = builder.create<triton::SplatOp>(loc, splatTy, scalar);
+  return builder.create<triton::BroadcastOp>(loc, dstTy, splat);
+}
+
+static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
+                                         const LanePackMatch &match) {
+  Location loc = forOp.getLoc();
+  OpBuilder builder(forOp);
+
+  Value packedInit = buildPackedLanes(builder, loc, match.initLanes);
+  auto packedInitTy = cast<RankedTensorType>(packedInit.getType());
+  SmallVector<int64_t> transposedShape(packedInitTy.getShape().begin(),
+                                       packedInitTy.getShape().end());
+  std::rotate(transposedShape.rbegin(), transposedShape.rbegin() + 1,
+              transposedShape.rend());
+  auto packedLaneMajorTy = RankedTensorType::get(
+      transposedShape, packedInitTy.getElementType(), packedInitTy.getEncoding());
+  Value laneMajorInit = builder.create<triton::TransOp>(
+      loc, packedLaneMajorTy, packedInit,
+      DenseI32ArrayAttr::get(builder.getContext(),
+                             SmallVector<int32_t>{1, 0}));
+
+  auto newFor = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
+                                           forOp.getUpperBound(),
+                                           forOp.getStep(), ValueRange{laneMajorInit});
+
+  Block *oldBody = forOp.getBody();
+  Block *newBody = newFor.getBody();
+  builder.setInsertionPointToStart(newBody);
+  Value packedArg = newBody->getArgument(newBody->getNumArguments() - 1);
+  auto packedArgTy = cast<RankedTensorType>(packedArg.getType());
+
+  Value rowSums = buildSumReduce(builder, loc, packedArg, 1);
+  auto rowSumsTy = cast<RankedTensorType>(rowSums.getType());
+  Value epsVec = broadcastScalarTo(builder, loc, match.eps, rowSumsTy);
+  Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
+  auto expandRowTy = RankedTensorType::get(packedArgTy.getShape(),
+                                           packedArgTy.getElementType(),
+                                           packedArgTy.getEncoding());
+  Value rowDenomExpanded =
+      builder.create<triton::ExpandDimsOp>(loc, expandRowTy, rowDenom, 1);
+  Value rowDenomBroadcast =
+      builder.create<triton::BroadcastOp>(loc, packedArgTy, rowDenomExpanded);
+  Value rowNormalized =
+      builder.create<arith::DivFOp>(loc, packedArg, rowDenomBroadcast);
+
+  Value colSums = buildSumReduce(builder, loc, rowNormalized, 0);
+  auto colSumsTy = cast<RankedTensorType>(colSums.getType());
+  Value epsCols = broadcastScalarTo(builder, loc, match.eps, colSumsTy);
+  Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
+  auto expandColTy = RankedTensorType::get(packedArgTy.getShape(),
+                                           packedArgTy.getElementType(),
+                                           packedArgTy.getEncoding());
+  Value colDenomExpanded =
+      builder.create<triton::ExpandDimsOp>(loc, expandColTy, colDenom, 0);
+  Value colDenomBroadcast =
+      builder.create<triton::BroadcastOp>(loc, packedArgTy, colDenomExpanded);
+  Value packedYield =
+      builder.create<arith::DivFOp>(loc, rowNormalized, colDenomBroadcast);
+  builder.create<scf::YieldOp>(loc, packedYield);
+
+  builder.setInsertionPointAfter(newFor);
+  Value packedResult = newFor.getResult(0);
+  auto packedResultTy = cast<RankedTensorType>(packedResult.getType());
+  SmallVector<int64_t> unpackShape(packedResultTy.getShape().begin(),
+                                   packedResultTy.getShape().end());
+  std::rotate(unpackShape.begin(), unpackShape.begin() + 1, unpackShape.end());
+  auto unpackTy = RankedTensorType::get(unpackShape, packedResultTy.getElementType(),
+                                        packedResultTy.getEncoding());
+  Value unpackInput = builder.create<triton::TransOp>(
+      loc, unpackTy, packedResult,
+      DenseI32ArrayAttr::get(builder.getContext(), SmallVector<int32_t>{1, 0}));
+
+  SmallVector<Value> unpacked = unpackPackedLanes(builder, loc, unpackInput,
+                                                  match.initLanes.size());
+  if (unpacked.size() != match.initLanes.size())
+    return failure();
+
+  for (auto [oldResult, newResult] : llvm::zip(forOp.getResults(), unpacked))
+    oldResult.replaceAllUsesWith(newResult);
+  forOp.erase();
+  return success();
 }
 
 struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
   using TritonLanePackBase::TritonLanePackBase;
 
   void runOnOperation() override {
-    bool foundCandidate = false;
+    SmallVector<scf::ForOp> candidates;
     getOperation().walk([&](scf::ForOp forOp) {
-      if (!isLanePackCandidate(forOp))
-        return;
-      foundCandidate = true;
-      (void)forOp;
+      if (succeeded(matchLanePackLoop(forOp)))
+        candidates.push_back(forOp);
     });
 
-    (void)foundCandidate;
+    for (scf::ForOp forOp : candidates) {
+      FailureOr<LanePackMatch> match = matchLanePackLoop(forOp);
+      if (failed(match))
+        continue;
+      if (failed(rewriteLanePackLoop(forOp, *match))) {
+        signalPassFailure();
+        return;
+      }
+    }
   }
 };
 
