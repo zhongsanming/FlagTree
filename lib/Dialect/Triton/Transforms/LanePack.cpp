@@ -66,6 +66,10 @@ static bool hasOneUseOfType(Value v, Operation *&user) {
   return user != nullptr;
 }
 
+static bool isScalar(Value v) {
+  return v.getType() && !isa<ShapedType>(v.getType());
+}
+
 static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
                                       triton::ReduceOp &reduceOp,
                                       arith::DivFOp &divOp) {
@@ -92,14 +96,16 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
 
   Value reduceScalar;
   Value candidateEps;
-  if (isa<OpResult>(add.getLhs()) && !isa<OpResult>(add.getRhs())) {
+  auto lhsReduce = add.getLhs().getDefiningOp<triton::ReduceOp>();
+  auto rhsReduce = add.getRhs().getDefiningOp<triton::ReduceOp>();
+  if (lhsReduce && isScalar(add.getRhs())) {
     reduceScalar = add.getLhs();
     candidateEps = add.getRhs();
-  } else if (isa<OpResult>(add.getRhs()) && !isa<OpResult>(add.getLhs())) {
+  } else if (rhsReduce && isScalar(add.getLhs())) {
     reduceScalar = add.getRhs();
     candidateEps = add.getLhs();
   } else {
-    llvm::errs() << "[lane-pack] reject: add tree around row norm is not binary addf with scalar eps\n";
+    llvm::errs() << "[lane-pack] reject: row denominator is not reduce + scalar eps\n";
     return false;
   }
 
@@ -126,24 +132,44 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
     Value current = worklist.pop_back_val();
     auto add = current.getDefiningOp<arith::AddFOp>();
     if (!add) {
+      if (isScalar(current)) {
+        if (!eps)
+          eps = current;
+        if (eps != current) {
+          llvm::errs() << "[lane-pack] reject: multiple scalar leaves in add tree\n";
+          return false;
+        }
+        continue;
+      }
       leaves.push_back(current);
       continue;
     }
-    if (!isa<OpResult>(add.getLhs())) {
+
+    bool lhsScalar = isScalar(add.getLhs());
+    bool rhsScalar = isScalar(add.getRhs());
+    if (lhsScalar && rhsScalar) {
+      llvm::errs() << "[lane-pack] reject: add tree has two scalar leaves\n";
+      return false;
+    }
+    if (lhsScalar) {
       if (!eps)
         eps = add.getLhs();
-      if (eps == add.getLhs()) {
-        worklist.push_back(add.getRhs());
-        continue;
+      if (eps != add.getLhs()) {
+        llvm::errs() << "[lane-pack] reject: epsilon mismatch in add tree\n";
+        return false;
       }
+      worklist.push_back(add.getRhs());
+      continue;
     }
-    if (!isa<OpResult>(add.getRhs())) {
+    if (rhsScalar) {
       if (!eps)
         eps = add.getRhs();
-      if (eps == add.getRhs()) {
-        worklist.push_back(add.getLhs());
-        continue;
+      if (eps != add.getRhs()) {
+        llvm::errs() << "[lane-pack] reject: epsilon mismatch in add tree\n";
+        return false;
       }
+      worklist.push_back(add.getLhs());
+      continue;
     }
     worklist.push_back(add.getLhs());
     worklist.push_back(add.getRhs());
