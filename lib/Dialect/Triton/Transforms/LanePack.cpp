@@ -8,6 +8,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/raw_ostream.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
@@ -23,22 +24,33 @@ static RankedTensorType getRankedTensorType(Value v) {
 }
 
 static bool isSameLaneTensorGroup(ArrayRef<Value> vals) {
-  if (vals.size() < 2)
+  if (vals.size() < 2) {
+    llvm::errs() << "[lane-pack] reject: need >= 2 lane values, got "
+                 << vals.size() << "\n";
     return false;
+  }
   auto ty = getRankedTensorType(vals.front());
-  if (!ty)
+  if (!ty) {
+    llvm::errs() << "[lane-pack] reject: first lane is not ranked tensor\n";
     return false;
+  }
   for (Value v : vals.drop_front()) {
     auto otherTy = getRankedTensorType(v);
-    if (!otherTy || otherTy != ty)
+    if (!otherTy || otherTy != ty) {
+      llvm::errs() << "[lane-pack] reject: lane tensor type mismatch\n";
       return false;
+    }
   }
   return true;
 }
 
 static bool hasSingleAddCombiner(triton::ReduceOp reduceOp) {
   auto *combiner = reduceOp.getSingleCombiner();
-  return combiner && isa<arith::AddFOp>(combiner);
+  if (!combiner || !isa<arith::AddFOp>(combiner)) {
+    llvm::errs() << "[lane-pack] reject: reduce combiner is not addf\n";
+    return false;
+  }
+  return true;
 }
 
 template <typename OpTy>
@@ -58,19 +70,25 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
                                       triton::ReduceOp &reduceOp,
                                       arith::DivFOp &divOp) {
   Operation *user = nullptr;
-  if (!hasOneUseOfType<arith::DivFOp>(laneArg, user))
+  if (!hasOneUseOfType<arith::DivFOp>(laneArg, user)) {
+    llvm::errs() << "[lane-pack] reject: lane arg has no unique divf user\n";
     return false;
+  }
 
   divOp = cast<arith::DivFOp>(user);
   if (divOp.getLhs() != laneArg)
     return false;
 
   auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>();
-  if (!splat)
+  if (!splat) {
+    llvm::errs() << "[lane-pack] reject: div rhs is not triton.splat\n";
     return false;
+  }
   auto add = splat.getSrc().getDefiningOp<arith::AddFOp>();
-  if (!add)
+  if (!add) {
+    llvm::errs() << "[lane-pack] reject: splat src is not addf\n";
     return false;
+  }
 
   Value reduceScalar;
   Value candidateEps;
@@ -81,18 +99,23 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
     reduceScalar = add.getRhs();
     candidateEps = add.getLhs();
   } else {
+    llvm::errs() << "[lane-pack] reject: add tree around row norm is not binary addf with scalar eps\n";
     return false;
   }
 
   if (!eps)
     eps = candidateEps;
-  else if (eps != candidateEps)
+  else if (eps != candidateEps) {
+    llvm::errs() << "[lane-pack] reject: epsilon mismatch across lanes\n";
     return false;
+  }
 
   reduceOp = reduceScalar.getDefiningOp<triton::ReduceOp>();
   if (!reduceOp || reduceOp.getAxis() != 0 || reduceOp.getNumOperands() != 1 ||
-      reduceOp.getOperand(0) != laneArg || !hasSingleAddCombiner(reduceOp))
+      reduceOp.getOperand(0) != laneArg || !hasSingleAddCombiner(reduceOp)) {
+    llvm::errs() << "[lane-pack] reject: reduce op shape does not match lane sum\n";
     return false;
+  }
   return true;
 }
 
@@ -139,21 +162,32 @@ struct LanePackMatch {
 };
 
 static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
+  llvm::errs() << "[lane-pack] inspect loop: ";
+  forOp->print(llvm::errs());
+  llvm::errs() << "\n";
   LanePackMatch match;
   match.initLanes.assign(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
-  if (!isSameLaneTensorGroup(match.initLanes))
+  if (!isSameLaneTensorGroup(match.initLanes)) {
+    llvm::errs() << "[lane-pack] reject: init args not same lane tensor group\n";
     return failure();
+  }
 
   match.yieldOp = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  if (!match.yieldOp)
+  if (!match.yieldOp) {
+    llvm::errs() << "[lane-pack] reject: loop terminator is not scf.yield\n";
     return failure();
-  if (match.yieldOp.getNumOperands() != match.initLanes.size())
+  }
+  if (match.yieldOp.getNumOperands() != match.initLanes.size()) {
+    llvm::errs() << "[lane-pack] reject: yield arity mismatch\n";
     return failure();
+  }
 
   SmallVector<Value> yielded(match.yieldOp.getOperands().begin(),
                              match.yieldOp.getOperands().end());
-  if (!isSameLaneTensorGroup(yielded))
+  if (!isSameLaneTensorGroup(yielded)) {
+    llvm::errs() << "[lane-pack] reject: yielded values not same lane tensor group\n";
     return failure();
+  }
 
   match.laneArgs.assign(forOp.getRegionIterArgs().begin(),
                         forOp.getRegionIterArgs().end());
@@ -162,8 +196,10 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   for (BlockArgument laneArg : match.laneArgs) {
     triton::ReduceOp reduceOp;
     arith::DivFOp divOp;
-    if (!matchLaneReduceToSplatDiv(laneArg, match.eps, reduceOp, divOp))
+    if (!matchLaneReduceToSplatDiv(laneArg, match.eps, reduceOp, divOp)) {
+      llvm::errs() << "[lane-pack] reject: lane arg failed reduce/div match\n";
       return failure();
+    }
     match.rowDivs.push_back(divOp);
     match.rowNorms.push_back(divOp.getResult());
   }
@@ -172,8 +208,10 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   match.yieldDivs.reserve(yielded.size());
   for (auto [rowNorm, yieldedLane] : llvm::zip(match.rowNorms, yielded)) {
     auto divOp = yieldedLane.getDefiningOp<arith::DivFOp>();
-    if (!divOp || divOp.getLhs() != rowNorm)
+    if (!divOp || divOp.getLhs() != rowNorm) {
+      llvm::errs() << "[lane-pack] reject: yield div does not consume row norm\n";
       return failure();
+    }
     match.yieldDivs.push_back(divOp);
     if (!sharedDenom)
       sharedDenom = divOp.getRhs();
@@ -183,10 +221,14 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
 
   SmallVector<Value> addLeaves;
   Value treeEps = match.eps;
-  if (!collectAddTreeLeaves(sharedDenom, addLeaves, treeEps))
+  if (!collectAddTreeLeaves(sharedDenom, addLeaves, treeEps)) {
+    llvm::errs() << "[lane-pack] reject: failed to collect add tree leaves\n";
     return failure();
-  if (treeEps != match.eps || addLeaves.size() != match.rowNorms.size())
+  }
+  if (treeEps != match.eps || addLeaves.size() != match.rowNorms.size()) {
+    llvm::errs() << "[lane-pack] reject: add tree leaf count or epsilon mismatch\n";
     return failure();
+  }
 
   llvm::SmallPtrSet<void *, 8> leafSet;
   for (Value leaf : addLeaves)
@@ -196,6 +238,8 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
       return failure();
   }
 
+  llvm::errs() << "[lane-pack] match success: lanes=" << match.initLanes.size()
+               << "\n";
   return match;
 }
 
@@ -364,9 +408,11 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       if (failed(match))
         continue;
       if (failed(rewriteLanePackLoop(forOp, *match))) {
+        llvm::errs() << "[lane-pack] rewrite failed\n";
         signalPassFailure();
         return;
       }
+      llvm::errs() << "[lane-pack] rewrite applied\n";
     }
   }
 };
