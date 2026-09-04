@@ -230,18 +230,25 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
 static Value buildPackedLanes(OpBuilder &builder, Location loc,
                               ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
-  Value packed = builder.create<triton::JoinOp>(loc, lanes[0], lanes[1]);
-  for (Value lane : lanes.drop_front(2)) {
-    auto laneTy = cast<RankedTensorType>(lane.getType());
-    auto packedTy = cast<RankedTensorType>(packed.getType());
-    SmallVector<int64_t> expandedShape(laneTy.getShape().begin(),
-                                       laneTy.getShape().end());
-    expandedShape.push_back(1);
-    auto expandedTy = RankedTensorType::get(expandedShape,
-                                            laneTy.getElementType(),
-                                            packedTy.getEncoding());
+  auto laneTy = cast<RankedTensorType>(lanes.front().getType());
+  SmallVector<int64_t> laneShape(laneTy.getShape().begin(),
+                                 laneTy.getShape().end());
+  SmallVector<int64_t> packedShape;
+  packedShape.push_back(lanes.size());
+  packedShape.append(laneShape.begin(), laneShape.end());
+  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType(),
+                                        laneTy.getEncoding());
+
+  SmallVector<int64_t> expandedShape;
+  expandedShape.push_back(1);
+  expandedShape.append(laneShape.begin(), laneShape.end());
+  auto expandedTy = RankedTensorType::get(expandedShape, laneTy.getElementType(),
+                                          laneTy.getEncoding());
+
+  Value packed = builder.create<triton::ExpandDimsOp>(loc, expandedTy, lanes[0], 0);
+  for (Value lane : lanes.drop_front()) {
     Value expandedLane =
-        builder.create<triton::ExpandDimsOp>(loc, expandedTy, lane, -1);
+        builder.create<triton::ExpandDimsOp>(loc, expandedTy, lane, 0);
     packed = builder.create<triton::CatOp>(loc, packedTy, packed, expandedLane);
   }
   return packed;
@@ -253,20 +260,24 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
   SmallVector<Value> lanes;
   lanes.reserve(laneCount);
 
-  std::function<void(Value)> splitRec = [&](Value v) {
-    if (lanes.size() + 1 == laneCount) {
-      lanes.push_back(v);
-      return;
-    }
-    auto shape = cast<RankedTensorType>(v.getType()).getShape();
-    if (shape.empty() || shape.back() != 2)
-      return;
-    auto split = builder.create<triton::SplitOp>(loc, v);
-    splitRec(split.getOutLHS());
-    splitRec(split.getOutRHS());
-  };
+  auto packedTy = cast<RankedTensorType>(packed.getType());
+  if (packedTy.getRank() == 0 || packedTy.getShape().front() != laneCount) {
+    llvm::errs() << "[lane-pack] reject: packed result lane axis mismatch, got "
+                 << packedTy << ", expected leading lane count "
+                 << laneCount << "\n";
+    return lanes;
+  }
 
-  splitRec(packed);
+  SmallVector<int64_t> laneShape(packedTy.getShape().begin() + 1,
+                                 packedTy.getShape().end());
+  auto laneTy = RankedTensorType::get(laneShape, packedTy.getElementType(),
+                                      packedTy.getEncoding());
+
+  for (unsigned i = 0; i < laneCount; ++i) {
+    Value lane = builder.create<triton::ExtractSliceOp>(
+        loc, laneTy, packed, SmallVector<int64_t>{static_cast<int64_t>(i)});
+    lanes.push_back(lane);
+  }
   return lanes;
 }
 
