@@ -307,8 +307,13 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
                                          const LanePackMatch &match) {
   Location loc = forOp.getLoc();
   OpBuilder builder(forOp);
+  llvm::errs() << "[lane-pack] rewrite begin: lanes="
+               << match.initLanes.size() << ", epsilon type="
+               << match.eps.getType() << "\n";
 
   Value packedInit = buildPackedLanes(builder, loc, match.initLanes);
+  llvm::errs() << "[lane-pack] packed init type: " << packedInit.getType()
+               << "\n";
   auto packedInitTy = cast<RankedTensorType>(packedInit.getType());
   SmallVector<int64_t> transposedShape(packedInitTy.getShape().begin(),
                                        packedInitTy.getShape().end());
@@ -316,6 +321,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
               transposedShape.rend());
   auto packedLaneMajorTy = RankedTensorType::get(
       transposedShape, packedInitTy.getElementType(), packedInitTy.getEncoding());
+  llvm::errs() << "[lane-pack] lane-major init type: " << packedLaneMajorTy
+               << "\n";
   Value laneMajorInit = builder.create<triton::TransOp>(
       loc, packedLaneMajorTy, packedInit,
       DenseI32ArrayAttr::get(builder.getContext(),
@@ -324,16 +331,21 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   auto newFor = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
                                            forOp.getUpperBound(),
                                            forOp.getStep(), ValueRange{laneMajorInit});
+  llvm::errs() << "[lane-pack] created packed loop\n";
 
   Block *oldBody = forOp.getBody();
   Block *newBody = newFor.getBody();
   builder.setInsertionPointToStart(newBody);
   Value packedArg = newBody->getArgument(newBody->getNumArguments() - 1);
   auto packedArgTy = cast<RankedTensorType>(packedArg.getType());
+  llvm::errs() << "[lane-pack] packed loop argument type: " << packedArgTy
+               << "\n";
 
   Value rowSums = buildSumReduce(builder, loc, packedArg, 1);
   auto rowSumsTy = cast<RankedTensorType>(rowSums.getType());
   Value epsVec = broadcastEpsilonTo(builder, loc, match.eps, rowSumsTy);
+  llvm::errs() << "[lane-pack] row sums/epsilon types: " << rowSumsTy << " / "
+               << epsVec.getType() << "\n";
   Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
   auto expandRowTy = RankedTensorType::get(packedArgTy.getShape(),
                                            packedArgTy.getElementType(),
@@ -344,10 +356,13 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
       builder.create<triton::BroadcastOp>(loc, packedArgTy, rowDenomExpanded);
   Value rowNormalized =
       builder.create<arith::DivFOp>(loc, packedArg, rowDenomBroadcast);
+  llvm::errs() << "[lane-pack] created row normalization\n";
 
   Value colSums = buildSumReduce(builder, loc, rowNormalized, 0);
   auto colSumsTy = cast<RankedTensorType>(colSums.getType());
   Value epsCols = broadcastEpsilonTo(builder, loc, match.eps, colSumsTy);
+  llvm::errs() << "[lane-pack] column sums/epsilon types: " << colSumsTy
+               << " / " << epsCols.getType() << "\n";
   Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
   auto expandColTy = RankedTensorType::get(packedArgTy.getShape(),
                                            packedArgTy.getElementType(),
@@ -359,6 +374,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   Value packedYield =
       builder.create<arith::DivFOp>(loc, rowNormalized, colDenomBroadcast);
   builder.create<scf::YieldOp>(loc, packedYield);
+  llvm::errs() << "[lane-pack] created column normalization and loop yield\n";
 
   builder.setInsertionPointAfter(newFor);
   Value packedResult = newFor.getResult(0);
@@ -368,18 +384,25 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   std::rotate(unpackShape.begin(), unpackShape.begin() + 1, unpackShape.end());
   auto unpackTy = RankedTensorType::get(unpackShape, packedResultTy.getElementType(),
                                         packedResultTy.getEncoding());
+  llvm::errs() << "[lane-pack] unpack input type: " << unpackTy << "\n";
   Value unpackInput = builder.create<triton::TransOp>(
       loc, unpackTy, packedResult,
       DenseI32ArrayAttr::get(builder.getContext(), SmallVector<int32_t>{1, 0}));
 
   SmallVector<Value> unpacked = unpackPackedLanes(builder, loc, unpackInput,
                                                   match.initLanes.size());
-  if (unpacked.size() != match.initLanes.size())
+  if (unpacked.size() != match.initLanes.size()) {
+    llvm::errs() << "[lane-pack] rewrite reject: unpack produced "
+                 << unpacked.size() << " lanes; expected "
+                 << match.initLanes.size() << "\n";
     return failure();
+  }
+  llvm::errs() << "[lane-pack] unpacked " << unpacked.size() << " lanes\n";
 
   for (auto [oldResult, newResult] : llvm::zip(forOp.getResults(), unpacked))
     oldResult.replaceAllUsesWith(newResult);
   forOp.erase();
+  llvm::errs() << "[lane-pack] rewrite complete\n";
   return success();
 }
 
