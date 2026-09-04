@@ -251,8 +251,13 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
     llvm::errs() << "[lane-pack] reject: failed to collect add tree leaves\n";
     return failure();
   }
-  if (treeEps != match.eps || addLeaves.size() != match.rowNorms.size()) {
-    llvm::errs() << "[lane-pack] reject: add tree leaf count or epsilon mismatch\n";
+  if (treeEps != match.eps) {
+    llvm::errs() << "[lane-pack] reject: epsilon mismatch\n";
+    return failure();
+  }
+
+  if (addLeaves.size() != match.rowNorms.size()) {
+    llvm::errs() << "[lane-pack] reject: add tree leaf count mismatch\n";
     return failure();
   }
 
