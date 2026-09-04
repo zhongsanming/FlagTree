@@ -9,6 +9,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
@@ -231,34 +232,11 @@ static Value buildPackedLanes(OpBuilder &builder, Location loc,
                               ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
-  SmallVector<int64_t> laneShape(laneTy.getShape().begin(),
-                                 laneTy.getShape().end());
   SmallVector<int64_t> packedShape;
   packedShape.push_back(lanes.size());
-  packedShape.append(laneShape.begin(), laneShape.end());
-  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType(),
-                                        laneTy.getEncoding());
-
-  SmallVector<int64_t> expandedShape;
-  expandedShape.push_back(1);
-  expandedShape.append(laneShape.begin(), laneShape.end());
-  auto expandedTy = RankedTensorType::get(expandedShape, laneTy.getElementType(),
-                                          laneTy.getEncoding());
-
-  Value packed = builder.create<triton::ExpandDimsOp>(loc, expandedTy, lanes[0], 0);
-  for (Value lane : lanes.drop_front()) {
-    Value expandedLane =
-        builder.create<triton::ExpandDimsOp>(loc, expandedTy, lane, 0);
-    SmallVector<int64_t> currentShape(
-        cast<RankedTensorType>(packed.getType()).getShape().begin(),
-        cast<RankedTensorType>(packed.getType()).getShape().end());
-    ++currentShape.front();
-    auto currentPackedTy = RankedTensorType::get(
-        currentShape, laneTy.getElementType(), laneTy.getEncoding());
-    packed = builder.create<triton::CatOp>(loc, currentPackedTy, packed,
-                                           expandedLane);
-  }
-  return packed;
+  packedShape.append(laneTy.getShape().begin(), laneTy.getShape().end());
+  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType());
+  return builder.create<mlir::triton::tile::PackOp>(loc, packedTy, lanes);
 }
 
 static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
@@ -266,34 +244,20 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
                                             unsigned laneCount) {
   SmallVector<Value> lanes;
   lanes.reserve(laneCount);
-
   auto packedTy = cast<RankedTensorType>(packed.getType());
-  if (packedTy.getRank() != 2 ||
-      packedTy.getShape().front() != static_cast<int64_t>(laneCount) ||
-      packedTy.getShape().back() != 4) {
-    llvm::errs() << "[lane-pack] reject: expected packed tensor tensor<"
-                 << laneCount << "x4>, got " << packedTy << "\n";
+  if (!packedTy || packedTy.getRank() < 1 ||
+      packedTy.getShape().front() != static_cast<int64_t>(laneCount)) {
+    llvm::errs() << "[lane-pack] reject: packed tensor shape mismatch: "
+                 << packed.getType() << "\n";
     return lanes;
   }
-
-  std::function<void(Value)> splitRec = [&](Value value) {
-    auto valueTy = cast<RankedTensorType>(value.getType());
-    if (valueTy.getShape().back() == 1) {
-      SmallVector<int64_t> laneShape(valueTy.getShape().begin(),
-                                     valueTy.getShape().end() - 1);
-      auto laneTy = RankedTensorType::get(laneShape, valueTy.getElementType(),
-                                          valueTy.getEncoding());
-      Value reshaped = builder.create<triton::ReshapeOp>(loc, laneTy, value);
-      lanes.push_back(reshaped);
-      return;
-    }
-
-    auto split = builder.create<triton::SplitOp>(loc, value);
-    splitRec(split.getOutLHS());
-    splitRec(split.getOutRHS());
-  };
-
-  splitRec(packed);
+  SmallVector<Type> resultTypes;
+  auto laneShape = packedTy.getShape().drop_front();
+  auto laneTy = RankedTensorType::get(laneShape, packedTy.getElementType());
+  resultTypes.assign(laneCount, laneTy);
+  auto unpack = builder.create<mlir::triton::tile::UnpackOp>(loc, resultTypes,
+                                                             packed);
+  lanes.append(unpack.getResults().begin(), unpack.getResults().end());
   return lanes;
 }
 
@@ -347,7 +311,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   std::rotate(transposedShape.rbegin(), transposedShape.rbegin() + 1,
               transposedShape.rend());
   auto packedLaneMajorTy = RankedTensorType::get(
-      transposedShape, packedInitTy.getElementType(), packedInitTy.getEncoding());
+      transposedShape, packedInitTy.getElementType());
   llvm::errs() << "[lane-pack] lane-major init type: " << packedLaneMajorTy
                << "\n";
   Value laneMajorInit = builder.create<triton::TransOp>(
@@ -375,8 +339,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
                << epsVec.getType() << "\n";
   Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
   auto expandRowTy = RankedTensorType::get(packedArgTy.getShape(),
-                                           packedArgTy.getElementType(),
-                                           packedArgTy.getEncoding());
+                                           packedArgTy.getElementType());
   Value rowDenomExpanded =
       builder.create<triton::ExpandDimsOp>(loc, expandRowTy, rowDenom, 1);
   Value rowDenomBroadcast =
@@ -392,8 +355,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
                << " / " << epsCols.getType() << "\n";
   Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
   auto expandColTy = RankedTensorType::get(packedArgTy.getShape(),
-                                           packedArgTy.getElementType(),
-                                           packedArgTy.getEncoding());
+                                           packedArgTy.getElementType());
   Value colDenomExpanded =
       builder.create<triton::ExpandDimsOp>(loc, expandColTy, colDenom, 0);
   Value colDenomBroadcast =
@@ -409,8 +371,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   SmallVector<int64_t> unpackShape(packedResultTy.getShape().begin(),
                                    packedResultTy.getShape().end());
   std::rotate(unpackShape.begin(), unpackShape.begin() + 1, unpackShape.end());
-  auto unpackTy = RankedTensorType::get(unpackShape, packedResultTy.getElementType(),
-                                        packedResultTy.getEncoding());
+  auto unpackTy = RankedTensorType::get(unpackShape, packedResultTy.getElementType());
   llvm::errs() << "[lane-pack] unpack input type: " << unpackTy << "\n";
   Value unpackInput = builder.create<triton::TransOp>(
       loc, unpackTy, packedResult,
