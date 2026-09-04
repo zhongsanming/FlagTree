@@ -137,7 +137,7 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
         leaves.push_back(current);
         continue;
       }
-      if (isScalar(current) || !current.getType().isa<RankedTensorType>()) {
+      if (isScalar(current) || !isa<RankedTensorType>(current.getType())) {
         eps = current;
         sawEps = true;
         continue;
@@ -146,8 +146,8 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
       continue;
     }
 
-    bool lhsEps = !sawEps && (isScalar(add.getLhs()) || !add.getLhs().getType().isa<RankedTensorType>());
-    bool rhsEps = !sawEps && (isScalar(add.getRhs()) || !add.getRhs().getType().isa<RankedTensorType>());
+    bool lhsEps = !sawEps && (isScalar(add.getLhs()) || !isa<RankedTensorType>(add.getLhs().getType()));
+    bool rhsEps = !sawEps && (isScalar(add.getRhs()) || !isa<RankedTensorType>(add.getRhs().getType()));
     if (lhsEps && rhsEps) {
       llvm::errs() << "[lane-pack] reject: add tree has two epsilon-like leaves\n";
       return false;
