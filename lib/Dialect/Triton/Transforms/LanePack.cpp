@@ -184,6 +184,7 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   llvm::errs() << "[lane-pack] inspect loop: ";
   forOp->print(llvm::errs());
   llvm::errs() << "\n";
+
   LanePackMatch match;
   match.initLanes.assign(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
   if (!isSameLaneTensorGroup(match.initLanes)) {
@@ -416,23 +417,17 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
   using TritonLanePackBase::TritonLanePackBase;
 
   void runOnOperation() override {
-    SmallVector<scf::ForOp> candidates;
     getOperation().walk([&](scf::ForOp forOp) {
-      if (succeeded(matchLanePackLoop(forOp)))
-        candidates.push_back(forOp);
-    });
-
-    for (scf::ForOp forOp : candidates) {
       FailureOr<LanePackMatch> match = matchLanePackLoop(forOp);
       if (failed(match))
-        continue;
+        return;
       if (failed(rewriteLanePackLoop(forOp, *match))) {
         llvm::errs() << "[lane-pack] rewrite failed\n";
         signalPassFailure();
         return;
       }
       llvm::errs() << "[lane-pack] rewrite applied\n";
-    }
+    });
   }
 };
 
