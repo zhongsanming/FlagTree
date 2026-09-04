@@ -70,6 +70,12 @@ static bool isScalar(Value v) {
   return v.getType() && !isa<ShapedType>(v.getType());
 }
 
+static bool isEpsilonValue(Value v) {
+  if (v.getDefiningOp<arith::ConstantOp>())
+    return true;
+  return isScalar(v);
+}
+
 static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
                                       triton::ReduceOp &reduceOp,
                                       arith::DivFOp &divOp) {
@@ -137,7 +143,7 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
         leaves.push_back(current);
         continue;
       }
-      if (isScalar(current) || !isa<RankedTensorType>(current.getType())) {
+      if (isEpsilonValue(current) || !isa<RankedTensorType>(current.getType())) {
         eps = current;
         sawEps = true;
         continue;
@@ -146,8 +152,8 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
       continue;
     }
 
-    bool lhsEps = !sawEps && (isScalar(add.getLhs()) || !isa<RankedTensorType>(add.getLhs().getType()));
-    bool rhsEps = !sawEps && (isScalar(add.getRhs()) || !isa<RankedTensorType>(add.getRhs().getType()));
+    bool lhsEps = !sawEps && (isEpsilonValue(add.getLhs()) || !isa<RankedTensorType>(add.getLhs().getType()));
+    bool rhsEps = !sawEps && (isEpsilonValue(add.getRhs()) || !isa<RankedTensorType>(add.getRhs().getType()));
     if (lhsEps && rhsEps) {
       llvm::errs() << "[lane-pack] reject: add tree has two epsilon-like leaves\n";
       return false;
