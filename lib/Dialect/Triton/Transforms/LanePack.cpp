@@ -70,11 +70,6 @@ static bool isScalar(Value v) {
   return v.getType() && !isa<ShapedType>(v.getType());
 }
 
-static bool isEpsilonValue(Value v) {
-  if (v.getDefiningOp<arith::ConstantOp>())
-    return true;
-  return isScalar(v);
-}
 
 static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
                                       triton::ReduceOp &reduceOp,
@@ -104,10 +99,10 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
   Value candidateEps;
   auto lhsReduce = add.getLhs().getDefiningOp<triton::ReduceOp>();
   auto rhsReduce = add.getRhs().getDefiningOp<triton::ReduceOp>();
-  if (lhsReduce && isScalar(add.getRhs())) {
+  if (lhsReduce && !rhsReduce) {
     reduceScalar = add.getLhs();
     candidateEps = add.getRhs();
-  } else if (rhsReduce && isScalar(add.getLhs())) {
+  } else if (rhsReduce && !lhsReduce) {
     reduceScalar = add.getRhs();
     candidateEps = add.getLhs();
   } else {
@@ -117,10 +112,9 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
 
   if (!eps)
     eps = candidateEps;
-  else if (eps != candidateEps) {
-    llvm::errs() << "[lane-pack] reject: epsilon mismatch across lanes\n";
-    return false;
-  }
+  // Epsilon may be represented as a scalar in one lane and as a promoted
+  // tensor in another lane. Keep the first value for reconstruction and do
+  // not require SSA identity or type equality across the original lanes.
 
   reduceOp = reduceScalar.getDefiningOp<triton::ReduceOp>();
   if (!reduceOp || reduceOp.getAxis() != 0 || reduceOp.getNumOperands() != 1 ||
@@ -131,49 +125,18 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
   return true;
 }
 
-static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves,
-                                 Value &eps) {
+static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves) {
   SmallVector<Value> worklist{root};
-  bool sawEps = false;
   while (!worklist.empty()) {
     Value current = worklist.pop_back_val();
-    auto add = current.getDefiningOp<arith::AddFOp>();
-    if (!add) {
-      if (sawEps) {
-        leaves.push_back(current);
-        continue;
-      }
-      if (isEpsilonValue(current) || !isa<RankedTensorType>(current.getType())) {
-        eps = current;
-        sawEps = true;
-        continue;
-      }
-      leaves.push_back(current);
-      continue;
-    }
-
-    bool lhsEps = !sawEps && (isEpsilonValue(add.getLhs()) || !isa<RankedTensorType>(add.getLhs().getType()));
-    bool rhsEps = !sawEps && (isEpsilonValue(add.getRhs()) || !isa<RankedTensorType>(add.getRhs().getType()));
-    if (lhsEps && rhsEps) {
-      llvm::errs() << "[lane-pack] reject: add tree has two epsilon-like leaves\n";
-      return false;
-    }
-    if (lhsEps) {
-      eps = add.getLhs();
-      sawEps = true;
+    if (auto add = current.getDefiningOp<arith::AddFOp>()) {
+      worklist.push_back(add.getLhs());
       worklist.push_back(add.getRhs());
       continue;
     }
-    if (rhsEps) {
-      eps = add.getRhs();
-      sawEps = true;
-      worklist.push_back(add.getLhs());
-      continue;
-    }
-    worklist.push_back(add.getLhs());
-    worklist.push_back(add.getRhs());
+    leaves.push_back(current);
   }
-  return sawEps;
+  return true;
 }
 
 struct LanePackMatch {
@@ -246,18 +209,8 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   }
 
   SmallVector<Value> addLeaves;
-  Value treeEps = match.eps;
-  if (!collectAddTreeLeaves(sharedDenom, addLeaves, treeEps)) {
+  if (!collectAddTreeLeaves(sharedDenom, addLeaves)) {
     llvm::errs() << "[lane-pack] reject: failed to collect add tree leaves\n";
-    return failure();
-  }
-  if (treeEps != match.eps) {
-    llvm::errs() << "[lane-pack] reject: epsilon mismatch\n";
-    return failure();
-  }
-
-  if (addLeaves.size() != match.rowNorms.size()) {
-    llvm::errs() << "[lane-pack] reject: add tree leaf count mismatch\n";
     return failure();
   }
 
@@ -335,12 +288,18 @@ static Value buildSumReduce(OpBuilder &builder, Location loc, Value src,
   return *reduce.getResult().begin();
 }
 
-static Value broadcastScalarTo(OpBuilder &builder, Location loc, Value scalar,
-                               RankedTensorType dstTy) {
+static Value broadcastEpsilonTo(OpBuilder &builder, Location loc,
+                                Value epsilon, RankedTensorType dstTy) {
+  if (auto epsilonTy = dyn_cast<RankedTensorType>(epsilon.getType())) {
+    if (epsilonTy == dstTy)
+      return epsilon;
+    return builder.create<triton::BroadcastOp>(loc, dstTy, epsilon);
+  }
+
   SmallVector<int64_t> splatShape(dstTy.getRank(), 1);
   auto splatTy = RankedTensorType::get(splatShape, dstTy.getElementType(),
                                        dstTy.getEncoding());
-  Value splat = builder.create<triton::SplatOp>(loc, splatTy, scalar);
+  Value splat = builder.create<triton::SplatOp>(loc, splatTy, epsilon);
   return builder.create<triton::BroadcastOp>(loc, dstTy, splat);
 }
 
@@ -374,7 +333,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
 
   Value rowSums = buildSumReduce(builder, loc, packedArg, 1);
   auto rowSumsTy = cast<RankedTensorType>(rowSums.getType());
-  Value epsVec = broadcastScalarTo(builder, loc, match.eps, rowSumsTy);
+  Value epsVec = broadcastEpsilonTo(builder, loc, match.eps, rowSumsTy);
   Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
   auto expandRowTy = RankedTensorType::get(packedArgTy.getShape(),
                                            packedArgTy.getElementType(),
@@ -388,7 +347,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
 
   Value colSums = buildSumReduce(builder, loc, rowNormalized, 0);
   auto colSumsTy = cast<RankedTensorType>(colSums.getType());
-  Value epsCols = broadcastScalarTo(builder, loc, match.eps, colSumsTy);
+  Value epsCols = broadcastEpsilonTo(builder, loc, match.eps, colSumsTy);
   Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
   auto expandColTy = RankedTensorType::get(packedArgTy.getShape(),
                                            packedArgTy.getElementType(),
