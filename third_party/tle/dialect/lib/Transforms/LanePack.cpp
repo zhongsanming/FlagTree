@@ -148,6 +148,7 @@ struct LanePackMatch {
   SmallVector<arith::DivFOp> yieldDivs;
   Value eps;
   scf::YieldOp yieldOp;
+  int64_t laneReduceAxis = 0;
 };
 
 static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
@@ -190,6 +191,10 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
       llvm::errs() << "[lane-pack] reject: lane arg failed reduce/div match\n";
       return failure();
     }
+    if (match.rowDivs.empty())
+      match.laneReduceAxis = reduceOp.getAxis();
+    else if (match.laneReduceAxis != reduceOp.getAxis())
+      return failure();
     match.rowDivs.push_back(divOp);
     match.rowNorms.push_back(divOp.getResult());
   }
@@ -305,23 +310,10 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   Value packedInit = buildPackedLanes(builder, loc, match.initLanes);
   llvm::errs() << "[lane-pack] packed init type: " << packedInit.getType()
                << "\n";
-  auto packedInitTy = cast<RankedTensorType>(packedInit.getType());
-  SmallVector<int64_t> transposedShape(packedInitTy.getShape().begin(),
-                                       packedInitTy.getShape().end());
-  std::rotate(transposedShape.rbegin(), transposedShape.rbegin() + 1,
-              transposedShape.rend());
-  auto packedLaneMajorTy = RankedTensorType::get(
-      transposedShape, packedInitTy.getElementType());
-  llvm::errs() << "[lane-pack] lane-major init type: " << packedLaneMajorTy
-               << "\n";
-  Value laneMajorInit = builder.create<triton::TransOp>(
-      loc, packedLaneMajorTy, packedInit,
-      DenseI32ArrayAttr::get(builder.getContext(),
-                             SmallVector<int32_t>{1, 0}));
 
   auto newFor = builder.create<scf::ForOp>(
       loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      ValueRange{laneMajorInit});
+      ValueRange{packedInit});
   llvm::errs() << "[lane-pack] created packed loop\n";
 
   Block *oldBody = forOp.getBody();
@@ -332,32 +324,43 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   llvm::errs() << "[lane-pack] packed loop argument type: " << packedArgTy
                << "\n";
 
-  Value rowSums = buildSumReduce(builder, loc, packedArg, 1);
+  constexpr int packedLaneAxis = 0;
+  const int64_t packedOriginalReduceAxis = match.laneReduceAxis + 1;
+
+  Value rowSums =
+      buildSumReduce(builder, loc, packedArg, packedOriginalReduceAxis);
   auto rowSumsTy = cast<RankedTensorType>(rowSums.getType());
   Value epsVec = broadcastEpsilonTo(builder, loc, match.eps, rowSumsTy);
   llvm::errs() << "[lane-pack] row sums/epsilon types: " << rowSumsTy << " / "
                << epsVec.getType() << "\n";
   Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
-  auto expandRowTy = RankedTensorType::get(packedArgTy.getShape(),
-                                           packedArgTy.getElementType());
-  Value rowDenomExpanded =
-      builder.create<triton::ExpandDimsOp>(loc, expandRowTy, rowDenom, 1);
+  SmallVector<int64_t> rowExpandedShape(rowSumsTy.getShape().begin(),
+                                        rowSumsTy.getShape().end());
+  rowExpandedShape.insert(rowExpandedShape.begin() + packedOriginalReduceAxis,
+                          1);
+  auto expandRowTy = RankedTensorType::get(
+      rowExpandedShape, packedArgTy.getElementType(), packedArgTy.getEncoding());
+  Value rowDenomExpanded = builder.create<triton::ExpandDimsOp>(
+      loc, expandRowTy, rowDenom, packedOriginalReduceAxis);
   Value rowDenomBroadcast =
       builder.create<triton::BroadcastOp>(loc, packedArgTy, rowDenomExpanded);
   Value rowNormalized =
       builder.create<arith::DivFOp>(loc, packedArg, rowDenomBroadcast);
   llvm::errs() << "[lane-pack] created row normalization\n";
 
-  Value colSums = buildSumReduce(builder, loc, rowNormalized, 0);
+  Value colSums = buildSumReduce(builder, loc, rowNormalized, packedLaneAxis);
   auto colSumsTy = cast<RankedTensorType>(colSums.getType());
   Value epsCols = broadcastEpsilonTo(builder, loc, match.eps, colSumsTy);
   llvm::errs() << "[lane-pack] column sums/epsilon types: " << colSumsTy
                << " / " << epsCols.getType() << "\n";
   Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
-  auto expandColTy = RankedTensorType::get(packedArgTy.getShape(),
-                                           packedArgTy.getElementType());
-  Value colDenomExpanded =
-      builder.create<triton::ExpandDimsOp>(loc, expandColTy, colDenom, 0);
+  SmallVector<int64_t> colExpandedShape(colSumsTy.getShape().begin(),
+                                        colSumsTy.getShape().end());
+  colExpandedShape.insert(colExpandedShape.begin() + packedLaneAxis, 1);
+  auto expandColTy = RankedTensorType::get(
+      colExpandedShape, packedArgTy.getElementType(), packedArgTy.getEncoding());
+  Value colDenomExpanded = builder.create<triton::ExpandDimsOp>(
+      loc, expandColTy, colDenom, packedLaneAxis);
   Value colDenomBroadcast =
       builder.create<triton::BroadcastOp>(loc, packedArgTy, colDenomExpanded);
   Value packedYield =
@@ -367,18 +370,10 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
 
   builder.setInsertionPointAfter(newFor);
   Value packedResult = newFor.getResult(0);
-  auto packedResultTy = cast<RankedTensorType>(packedResult.getType());
-  SmallVector<int64_t> unpackShape(packedResultTy.getShape().begin(),
-                                   packedResultTy.getShape().end());
-  std::rotate(unpackShape.begin(), unpackShape.begin() + 1, unpackShape.end());
-  auto unpackTy =
-      RankedTensorType::get(unpackShape, packedResultTy.getElementType());
-  llvm::errs() << "[lane-pack] unpack input type: " << unpackTy << "\n";
-  Value unpackInput = builder.create<triton::TransOp>(
-      loc, unpackTy, packedResult,
-      DenseI32ArrayAttr::get(builder.getContext(), SmallVector<int32_t>{1, 0}));
+  llvm::errs() << "[lane-pack] unpack input type: " << packedResult.getType()
+               << "\n";
 
-  SmallVector<Value> unpacked = unpackPackedLanes(builder, loc, unpackInput,
+  SmallVector<Value> unpacked = unpackPackedLanes(builder, loc, packedResult,
                                                   match.initLanes.size());
   if (unpacked.size() != match.initLanes.size()) {
     llvm::errs() << "[lane-pack] rewrite reject: unpack produced "
