@@ -60,6 +60,21 @@ def TritonTleLowerAsyncLoad : Pass<"triton-tle-lower-async-load", "mlir::ModuleO
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonTleLanePack : Pass<"triton-tle-lane-pack", "mlir::ModuleOp"> {
+  let summary = "Recognize lane-parallel tensor update patterns";
+  let description = [{
+    This pass recognizes groups of loop-carried Triton tensors that represent
+    independent lanes of the same computation. The first implementation keeps
+    matching strict: all candidate lane values must have the same ranked tensor
+    type, and the pass only targets repeated lane-parallel reduction and
+    normalization structures that can later be rewritten into a packed form.
+  }];
+
+  let dependentDialects = ["mlir::scf::SCFDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::tle::TleDialect"];
+}
+
 def TritonTleLowerTmaCopy : Pass</*cli-arg*/"triton-tle-lower-tma-copy", /*Op*/"mlir::ModuleOp"> {
 
   let summary = "Lower TLE TMA copy operations";
