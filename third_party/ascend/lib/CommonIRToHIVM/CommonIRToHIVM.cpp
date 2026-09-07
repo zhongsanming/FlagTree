@@ -532,10 +532,99 @@ struct TileGmOffsetToHIVM : OpRewritePattern<tile::GmOffsetOp> {
 };
 
 // =============================================================================
-// tile.concat
-//     - 1D: tensor.empty + a sequence of tensor.insert_slice
-//     - 2D+: tensor.concat
+// tile.pack / tile.unpack
+//
+// CommonIR pack and unpack are encoding-free tensor transforms. Lower pack to
+// tensor.empty plus tensor.insert_slice operations, and unpack to a sequence
+// of tensor.extract_slice operations. Since the leading dimension and all
+// operand shapes are static, no runtime shape or loop operation is required.
 // =============================================================================
+struct TilePackToTensor : OpRewritePattern<tile::PackOp> {
+  using OpRewritePattern<tile::PackOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tile::PackOp op,
+                                PatternRewriter &rewriter) const final {
+    auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "expected ranked tensor result");
+
+    auto inputs = op.getInputs();
+    if (inputs.empty())
+      return rewriter.notifyMatchFailure(op, "expected tensor inputs");
+
+    auto inputTy = dyn_cast<RankedTensorType>(inputs.front().getType());
+    if (!inputTy || inputTy.getShape() != resultTy.getShape().drop_front() ||
+        inputTy.getElementType() != resultTy.getElementType())
+      return rewriter.notifyMatchFailure(
+          op, "expected inputs to match the result trailing shape");
+
+    SmallVector<OpFoldResult> strides(resultTy.getRank(),
+                                      rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes;
+    sizes.reserve(resultTy.getRank());
+    sizes.push_back(rewriter.getIndexAttr(1));
+    for (int64_t dim : inputTy.getShape())
+      sizes.push_back(rewriter.getIndexAttr(dim));
+
+    auto empty = rewriter.create<tensor::EmptyOp>(
+        op.getLoc(), resultTy.getShape(), resultTy.getElementType());
+    Value packed = empty.getResult();
+    for (auto it : llvm::enumerate(inputs)) {
+      SmallVector<OpFoldResult> offsets(resultTy.getRank(),
+                                        rewriter.getIndexAttr(0));
+      offsets.front() = rewriter.getIndexAttr(static_cast<int64_t>(it.index()));
+      packed = rewriter.create<tensor::InsertSliceOp>(
+                    op.getLoc(), it.value(), packed, offsets, sizes, strides)
+                    .getResult();
+    }
+    rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct TileUnpackToTensor : OpRewritePattern<tile::UnpackOp> {
+  using OpRewritePattern<tile::UnpackOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tile::UnpackOp op,
+                                PatternRewriter &rewriter) const final {
+    auto sourceTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
+    if (!sourceTy || sourceTy.getRank() < 1)
+      return rewriter.notifyMatchFailure(op,
+                                         "expected ranked tensor with a leading dimension");
+
+    auto results = op.getResults();
+    if (results.size() != static_cast<size_t>(sourceTy.getShape().front()))
+      return rewriter.notifyMatchFailure(
+          op, "result count must equal the static leading dimension");
+
+    SmallVector<OpFoldResult> offsets(sourceTy.getRank(),
+                                      rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes;
+    sizes.reserve(sourceTy.getRank());
+    sizes.push_back(rewriter.getIndexAttr(1));
+    for (int64_t dim : sourceTy.getShape().drop_front())
+      sizes.push_back(rewriter.getIndexAttr(dim));
+    SmallVector<OpFoldResult> strides(sourceTy.getRank(),
+                                      rewriter.getIndexAttr(1));
+
+    SmallVector<Value> unpacked;
+    unpacked.reserve(results.size());
+    for (auto it : llvm::enumerate(results)) {
+      offsets.front() = rewriter.getIndexAttr(static_cast<int64_t>(it.index()));
+      auto resultTy = dyn_cast<RankedTensorType>(it.value().getType());
+      if (!resultTy || resultTy.getShape() != sourceTy.getShape().drop_front() ||
+          resultTy.getElementType() != sourceTy.getElementType())
+        return rewriter.notifyMatchFailure(
+            op, "expected results to match the source trailing shape");
+      unpacked.push_back(rewriter.create<tensor::ExtractSliceOp>(
+                                      op.getLoc(), resultTy, op.getSrc(), offsets,
+                                      sizes, strides));
+    }
+    rewriter.replaceOp(op, unpacked);
+    return success();
+  }
+};
+
 struct TileConcatToHIVM : OpRewritePattern<tile::ConcatOp> {
   using OpRewritePattern<tile::ConcatOp>::OpRewritePattern;
 
@@ -870,6 +959,8 @@ void CommonIRToHIVMPass::runOnOperation() {
   APPLY_REWRITE_PATTERN(TilePipeBarrierToHIVM);
   APPLY_REWRITE_PATTERN(TileCubeWaitToHIVM);
   APPLY_REWRITE_PATTERN(TileGmOffsetToHIVM);
+  APPLY_REWRITE_PATTERN(TilePackToTensor);
+  APPLY_REWRITE_PATTERN(TileUnpackToTensor);
   APPLY_REWRITE_PATTERN(TileConcatToHIVM);
 
   // Step N: After all tile ops are lowered, convert !tile.buf types remaining
