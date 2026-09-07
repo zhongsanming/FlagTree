@@ -4,6 +4,14 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR}/dialect/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/utils/include)
 
 if(FLAGTREE_BACKEND STREQUAL "ascend")
+  # LanePack in TLE depends on CommonIR headers provided by FLIR.
+  if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/flir/include)
+    include_directories(${CMAKE_SOURCE_DIR}/third_party/flir/include)
+  endif()
+  if(EXISTS ${CMAKE_BINARY_DIR}/third_party/flir/include)
+    include_directories(${CMAKE_BINARY_DIR}/third_party/flir/include)
+  endif()
+
   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/dsa/dialect/include)
   include_directories(${CMAKE_CURRENT_BINARY_DIR}/dsa/dialect/include)
 endif()
