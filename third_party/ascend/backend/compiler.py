@@ -33,7 +33,7 @@ from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, Union
 
 from flagtree import _flagprism  # FlagPrism
-from triton._C.libtriton import ir, passes, ascend
+from triton._C.libtriton import ir, passes, ascend, tle
 from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
@@ -89,7 +89,7 @@ def make_ttir(mod, metadata, opt):
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
-    passes.ttir.add_lane_pack(pm)
+    tle.passes.add_lane_pack(pm)
     passes.common.add_cse(pm)
     # commonir: NOTE: LICM is intentionally omitted — it hoists tile.to_tensor above
     # tile.copy in loops, breaking the read-after-write ordering required by
