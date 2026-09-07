@@ -242,6 +242,7 @@ void init_triton_tle_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_async_load",
                      tle::createTritonTleLowerAsyncLoad);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);
+  ADD_PASS_WRAPPER_0("add_lane_pack", tle::createTritonTleLanePack);
 }
 
 void init_tle_raw_ir(py::module &&m) {
