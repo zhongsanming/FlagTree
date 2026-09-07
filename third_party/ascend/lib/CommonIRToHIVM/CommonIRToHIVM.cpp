@@ -569,10 +569,11 @@ struct TilePackToTensor : OpRewritePattern<tile::PackOp> {
     auto empty = rewriter.create<tensor::EmptyOp>(
         op.getLoc(), resultTy.getShape(), resultTy.getElementType());
     Value packed = empty.getResult();
-    SmallVector<ReassociationIndices> expandReassoc(resultTy.getRank());
+    SmallVector<ReassociationIndices> expandReassoc(inputTy.getRank());
     expandReassoc.front().push_back(0);
-    for (int64_t i = 0, e = inputTy.getRank(); i < e; ++i)
-      expandReassoc[i + 1].push_back(i);
+    expandReassoc.front().push_back(1);
+    for (int64_t i = 1, e = inputTy.getRank(); i < e; ++i)
+      expandReassoc[i].push_back(i + 1);
     SmallVector<int64_t> expandedInputShape;
     expandedInputShape.push_back(1);
     expandedInputShape.append(inputTy.getShape().begin(), inputTy.getShape().end());
