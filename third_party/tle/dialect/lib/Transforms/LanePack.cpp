@@ -10,13 +10,13 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
+#include "tle/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/Triton/Transforms/Passes.h"
 
-namespace mlir::triton {
+namespace mlir::triton::tle {
 
-#define GEN_PASS_DEF_TRITONLANEPACK
-#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
+#define GEN_PASS_DEF_TRITONTLELANEPACK
+#include "tle/dialect/include/Transforms/Passes.h.inc"
 
 namespace {
 
@@ -71,7 +71,6 @@ static bool isScalar(Value v) {
   return v.getType() && !isa<ShapedType>(v.getType());
 }
 
-
 static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
                                       triton::ReduceOp &reduceOp,
                                       arith::DivFOp &divOp) {
@@ -107,7 +106,8 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
     reduceScalar = add.getRhs();
     candidateEps = add.getLhs();
   } else {
-    llvm::errs() << "[lane-pack] reject: row denominator is not reduce + scalar eps\n";
+    llvm::errs()
+        << "[lane-pack] reject: row denominator is not reduce + scalar eps\n";
     return false;
   }
 
@@ -319,9 +319,9 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
       DenseI32ArrayAttr::get(builder.getContext(),
                              SmallVector<int32_t>{1, 0}));
 
-  auto newFor = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
-                                           forOp.getUpperBound(),
-                                           forOp.getStep(), ValueRange{laneMajorInit});
+  auto newFor = builder.create<scf::ForOp>(
+      loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+      ValueRange{laneMajorInit});
   llvm::errs() << "[lane-pack] created packed loop\n";
 
   Block *oldBody = forOp.getBody();
@@ -371,7 +371,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   SmallVector<int64_t> unpackShape(packedResultTy.getShape().begin(),
                                    packedResultTy.getShape().end());
   std::rotate(unpackShape.begin(), unpackShape.begin() + 1, unpackShape.end());
-  auto unpackTy = RankedTensorType::get(unpackShape, packedResultTy.getElementType());
+  auto unpackTy =
+      RankedTensorType::get(unpackShape, packedResultTy.getElementType());
   llvm::errs() << "[lane-pack] unpack input type: " << unpackTy << "\n";
   Value unpackInput = builder.create<triton::TransOp>(
       loc, unpackTy, packedResult,
@@ -394,8 +395,9 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   return success();
 }
 
-struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
-  using TritonLanePackBase::TritonLanePackBase;
+struct TritonTleLanePackPass
+    : public impl::TritonTleLanePackBase<TritonTleLanePackPass> {
+  using TritonTleLanePackBase::TritonTleLanePackBase;
 
   void runOnOperation() override {
     getOperation().walk([&](scf::ForOp forOp) {
@@ -414,4 +416,4 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
 
 } // namespace
 
-} // namespace mlir::triton
+} // namespace mlir::triton::tle
