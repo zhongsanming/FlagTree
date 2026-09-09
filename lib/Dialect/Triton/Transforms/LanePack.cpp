@@ -166,7 +166,7 @@ static void addSupportOpIfPresent(Value value,
 struct LanePackMatch {
   SmallVector<Value> initLanes;
   SmallVector<BlockArgument> laneArgs;
-  SmallVector<NormStepMatch> steps;
+  SmallVector<NormStepMatch, 4> steps;
   scf::YieldOp yieldOp;
 };
 
@@ -589,7 +589,7 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       FailureOr<LanePackMatch> match = matchLanePackLoop(forOp);
       if (failed(match))
         return;
-      if (failed(rewriteLanePackLoop(forOp, *match))) {
+      if (failed(rewriteLanePackLoop(forOp, match.value()))) {
         llvm::errs() << "[lane-pack] rewrite failed\n";
         signalPassFailure();
         return;
