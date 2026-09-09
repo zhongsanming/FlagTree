@@ -66,11 +66,25 @@ static bool hasOneUseOfType(Value v, Operation *&user) {
   return user != nullptr;
 }
 
+struct ProbeLogger {
+  bool emit = false;
+
+  template <typename... Args>
+  void reject(Args &&...args) const {
+    if (!emit)
+      return;
+    llvm::errs() << "[lane-pack] reject: ";
+    (llvm::errs() << ... << std::forward<Args>(args));
+    llvm::errs() << "\n";
+  }
+};
+
 static bool matchReducePlusEpsilon(Value value, Value &epsilon,
-                                   triton::ReduceOp &reduceOp) {
+                                   triton::ReduceOp &reduceOp,
+                                   ProbeLogger log = {}) {
   auto add = value.getDefiningOp<arith::AddFOp>();
   if (!add) {
-    llvm::errs() << "[lane-pack] reject: denominator is not addf\n";
+    log.reject("denominator is not addf");
     return false;
   }
 
@@ -84,8 +98,7 @@ static bool matchReducePlusEpsilon(Value value, Value &epsilon,
     reduceOp = rhsReduce;
     candidateEps = add.getLhs();
   } else {
-    llvm::errs()
-        << "[lane-pack] reject: denominator is not reduce + epsilon\n";
+    log.reject("denominator is not reduce + epsilon");
     return false;
   }
 
@@ -96,20 +109,20 @@ static bool matchReducePlusEpsilon(Value value, Value &epsilon,
 
 static bool matchBroadcastedDenominator(Value denominator, Value src,
                                         Value &epsilon,
-                                        triton::ReduceOp &reduceOp) {
+                                        triton::ReduceOp &reduceOp,
+                                        ProbeLogger log = {}) {
   auto splat = denominator.getDefiningOp<triton::SplatOp>();
   if (!splat) {
-    llvm::errs() << "[lane-pack] reject: row denominator is not triton.splat\n";
+    log.reject("row denominator is not triton.splat");
     return false;
   }
 
-  if (!matchReducePlusEpsilon(splat.getSrc(), epsilon, reduceOp))
+  if (!matchReducePlusEpsilon(splat.getSrc(), epsilon, reduceOp, log))
     return false;
 
   if (reduceOp.getNumOperands() != 1 || reduceOp.getOperand(0) != src ||
       !hasSingleAddCombiner(reduceOp)) {
-    llvm::errs()
-        << "[lane-pack] reject: row reduce op shape does not match source\n";
+    log.reject("row reduce op shape does not match source");
     return false;
   }
   return true;
@@ -151,7 +164,7 @@ struct LanePackMatch {
 };
 
 static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
-                             NormStepMatch &step) {
+                             NormStepMatch &step, ProbeLogger log = {}) {
   if (inputs.size() != outputs.size() || inputs.empty())
     return false;
 
@@ -165,21 +178,21 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   for (auto [input, output] : llvm::zip(inputs, outputs)) {
     auto divOp = output.getDefiningOp<arith::DivFOp>();
     if (!divOp || divOp.getLhs() != input) {
-      llvm::errs() << "[lane-pack] reject: row step output is not input/div\n";
+      log.reject("row step output is not input/div");
       return false;
     }
 
     triton::ReduceOp reduceOp;
     if (!matchBroadcastedDenominator(divOp.getRhs(), input, step.epsilon,
-                                     reduceOp)) {
-      llvm::errs() << "[lane-pack] reject: row step denominator mismatch\n";
+                                     reduceOp, log)) {
+      log.reject("row step denominator mismatch");
       return false;
     }
 
     if (step.reduceAxis < 0)
       step.reduceAxis = reduceOp.getAxis();
     else if (step.reduceAxis != reduceOp.getAxis()) {
-      llvm::errs() << "[lane-pack] reject: row step axis mismatch\n";
+      log.reject("row step axis mismatch");
       return false;
     }
 
@@ -190,7 +203,7 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
 }
 
 static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
-                             NormStepMatch &step) {
+                             NormStepMatch &step, ProbeLogger log = {}) {
   if (inputs.size() != outputs.size() || inputs.empty())
     return false;
 
@@ -205,21 +218,21 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   for (auto [input, output] : llvm::zip(inputs, outputs)) {
     auto divOp = output.getDefiningOp<arith::DivFOp>();
     if (!divOp || divOp.getLhs() != input) {
-      llvm::errs() << "[lane-pack] reject: col step output is not input/div\n";
+      log.reject("col step output is not input/div");
       return false;
     }
     step.divs.push_back(divOp);
     if (!sharedDenom)
       sharedDenom = divOp.getRhs();
     else if (sharedDenom != divOp.getRhs()) {
-      llvm::errs() << "[lane-pack] reject: col step denominators differ\n";
+      log.reject("col step denominators differ");
       return false;
     }
   }
 
   SmallVector<Value> addLeaves;
   if (!collectAddTreeLeaves(sharedDenom, addLeaves)) {
-    llvm::errs() << "[lane-pack] reject: failed to collect col add tree\n";
+    log.reject("failed to collect col add tree");
     return false;
   }
 
@@ -233,7 +246,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
       ++matchedInputs;
   }
   if (matchedInputs != inputs.size()) {
-    llvm::errs() << "[lane-pack] reject: col denominator does not use all inputs\n";
+    log.reject("col denominator does not use all inputs");
     return false;
   }
 
@@ -243,7 +256,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
       nonInputLeaves.push_back(leaf);
   }
   if (nonInputLeaves.size() != 1) {
-    llvm::errs() << "[lane-pack] reject: col denominator must have one epsilon leaf\n";
+    log.reject("col denominator must have one epsilon leaf");
     return false;
   }
   step.epsilon = nonInputLeaves.front();
@@ -305,6 +318,10 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
     NormStepMatch step;
     if (!matchRowNormStep(current, candidateOutputs, step) &&
         !matchColNormStep(current, candidateOutputs, step)) {
+      ProbeLogger log{true};
+      NormStepMatch debugStep;
+      (void)matchRowNormStep(current, candidateOutputs, debugStep, log);
+      (void)matchColNormStep(current, candidateOutputs, debugStep, log);
       llvm::errs() << "[lane-pack] reject: failed to extend step chain\n";
       return failure();
     }
