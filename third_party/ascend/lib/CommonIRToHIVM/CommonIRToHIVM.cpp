@@ -569,25 +569,13 @@ struct TilePackToTensor : OpRewritePattern<tile::PackOp> {
     auto empty = rewriter.create<tensor::EmptyOp>(
         op.getLoc(), resultTy.getShape(), resultTy.getElementType());
     Value packed = empty.getResult();
-    SmallVector<ReassociationIndices> expandReassoc(resultTy.getRank());
-    expandReassoc.front().push_back(0);
-    for (int64_t i = 0, e = inputTy.getRank(); i < e; ++i)
-      expandReassoc[i + 1].push_back(i);
-    auto expandedInputTy = RankedTensorType::get(
-        sizes | llvm::map_to_vector([](OpFoldResult ofr) {
-          return cast<IntegerAttr>(cast<Attribute>(ofr)).getInt();
-        }),
-        inputTy.getElementType());
     for (auto it : llvm::enumerate(inputs)) {
       SmallVector<OpFoldResult> offsets(resultTy.getRank(),
                                         rewriter.getIndexAttr(0));
       offsets.front() = rewriter.getIndexAttr(static_cast<int64_t>(it.index()));
-      Value expandedInput = rewriter.create<tensor::ExpandShapeOp>(
-          op.getLoc(), expandedInputTy, it.value(), expandReassoc);
-      packed = rewriter.create<tensor::InsertSliceOp>(op.getLoc(), expandedInput,
-                                                      packed, offsets, sizes,
-                                                      strides)
-                   .getResult();
+      packed = rewriter.create<tensor::InsertSliceOp>(
+                    op.getLoc(), it.value(), packed, offsets, sizes, strides)
+                    .getResult();
     }
     rewriter.replaceOp(op, packed);
     return success();
