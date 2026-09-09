@@ -233,6 +233,12 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   return true;
 }
 
+static Value canonicalizeNormalizationEpsilon(Value epsilon) {
+  if (auto splat = epsilon.getDefiningOp<triton::SplatOp>())
+    return splat.getSrc();
+  return epsilon;
+}
+
 static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
                              NormStepMatch &step, ProbeLogger log = {}) {
   if (inputs.size() != outputs.size() || inputs.empty())
@@ -291,7 +297,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     log.reject("col denominator must have one epsilon leaf");
     return false;
   }
-  step.epsilon = nonInputLeaves.front();
+  step.epsilon = canonicalizeNormalizationEpsilon(nonInputLeaves.front());
   collectDefTreeOps(sharedDenom, step.supportOps);
   return true;
 }
