@@ -150,11 +150,18 @@ enum class NormStepKind {
 struct NormStepMatch {
   NormStepKind kind;
   SmallVector<Value> inputs;
+  SmallVector<Operation *> supportOps;
   SmallVector<arith::DivFOp> divs;
   SmallVector<Value> outputs;
   Value epsilon;
   int64_t reduceAxis = -1;
 };
+
+static void addSupportOpIfPresent(Value value,
+                                  SmallVectorImpl<Operation *> &supportOps) {
+  if (Operation *def = value.getDefiningOp())
+    supportOps.push_back(def);
+}
 
 struct LanePackMatch {
   SmallVector<Value> initLanes;
@@ -171,6 +178,7 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   step.kind = NormStepKind::Row;
   step.inputs.assign(inputs.begin(), inputs.end());
   step.outputs.assign(outputs.begin(), outputs.end());
+  step.supportOps.clear();
   step.divs.clear();
   step.epsilon = Value();
   step.reduceAxis = -1;
@@ -197,6 +205,14 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     }
 
     step.divs.push_back(divOp);
+    addSupportOpIfPresent(divOp.getRhs(), step.supportOps);
+    if (auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>()) {
+      addSupportOpIfPresent(splat.getSrc(), step.supportOps);
+      if (auto add = splat.getSrc().getDefiningOp<arith::AddFOp>()) {
+        addSupportOpIfPresent(add.getLhs(), step.supportOps);
+        addSupportOpIfPresent(add.getRhs(), step.supportOps);
+      }
+    }
   }
 
   return true;
@@ -210,6 +226,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   step.kind = NormStepKind::Col;
   step.inputs.assign(inputs.begin(), inputs.end());
   step.outputs.assign(outputs.begin(), outputs.end());
+  step.supportOps.clear();
   step.divs.clear();
   step.epsilon = Value();
   step.reduceAxis = 0;
@@ -260,6 +277,9 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     return false;
   }
   step.epsilon = nonInputLeaves.front();
+  addSupportOpIfPresent(sharedDenom, step.supportOps);
+  for (Value leaf : addLeaves)
+    addSupportOpIfPresent(leaf, step.supportOps);
   return true;
 }
 
@@ -326,6 +346,9 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
       return failure();
     }
 
+    for (Operation *op : step.supportOps)
+      if (op)
+        matchedOps.insert(op);
     for (arith::DivFOp div : step.divs)
       matchedOps.insert(div);
     match.steps.push_back(step);
@@ -345,9 +368,9 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (matchedOps.contains(&op))
       continue;
-    if (isa<triton::ReduceOp, triton::SplatOp, arith::AddFOp>(op))
-      continue;
-    llvm::errs() << "[lane-pack] reject: unsupported non-normalization op in loop body\n";
+    llvm::errs() << "[lane-pack] reject: unsupported or unmatched op in loop body: ";
+    op.print(llvm::errs());
+    llvm::errs() << "\n";
     return failure();
   }
 
