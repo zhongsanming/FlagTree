@@ -257,7 +257,6 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
       log.reject("col step output is not input/div");
       return false;
     }
-    step.divs.push_back(divOp);
     if (!sharedDenom)
       sharedDenom = divOp.getRhs();
     else if (sharedDenom != divOp.getRhs()) {
