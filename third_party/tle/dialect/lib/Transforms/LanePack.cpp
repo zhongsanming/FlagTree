@@ -234,13 +234,9 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   return match;
 }
 
-static DenseIntElementsAttr buildReassociationAttr(OpBuilder &builder,
-                                                    ArrayRef<int64_t> shape) {
-  SmallVector<int64_t> reassociation(shape.begin(), shape.end());
-  auto reassociationTy =
-      RankedTensorType::get({static_cast<int64_t>(reassociation.size())},
-                            builder.getI64Type());
-  return DenseIntElementsAttr::get(reassociationTy, reassociation);
+static Value buildShapeConst(OpBuilder &builder, Location loc,
+                            ArrayRef<int64_t> shape) {
+  return builder.create<arith::ConstantOp>(loc, builder.getI64TensorAttr(shape));
 }
 
 static Value buildPackedLanes(OpBuilder &builder, Location loc,
@@ -258,7 +254,7 @@ static Value buildPackedLanes(OpBuilder &builder, Location loc,
   auto reshapeLane = [&](Value lane) -> Value {
     return builder.create<tensor::ReshapeOp>(
         loc, singletonLaneTy, lane,
-        buildReassociationAttr(builder, singletonLaneShape));
+        buildShapeConst(builder, loc, singletonLaneShape));
   };
 
   SmallVector<Value> concatOperands;
@@ -311,8 +307,7 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
     Value slice = builder.create<tensor::ExtractSliceOp>(
         loc, singletonLaneTy, packed, offsets, sizes, strides);
     Value lane = builder.create<tensor::ReshapeOp>(
-        loc, laneTy, slice,
-        buildReassociationAttr(builder, singletonLaneShape));
+        loc, laneTy, slice, buildShapeConst(builder, loc, laneShape));
     lanes.push_back(lane);
   }
   return lanes;
