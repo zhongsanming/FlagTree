@@ -90,6 +90,7 @@ def TritonLanePack : Pass<"triton-lane-pack", "mlir::ModuleOp"> {
   }];
 
   let dependentDialects = ["mlir::scf::SCFDialect",
+                           "mlir::tensor::TensorDialect",
                            "mlir::triton::TritonDialect"];
 }
 
