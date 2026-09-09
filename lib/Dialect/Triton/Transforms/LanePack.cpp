@@ -128,7 +128,7 @@ static bool matchBroadcastedDenominator(Value denominator, Value src,
   return true;
 }
 
-static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves) {
+static void collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves) {
   SmallVector<Value> worklist{root};
   while (!worklist.empty()) {
     Value current = worklist.pop_back_val();
@@ -139,7 +139,6 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves) {
     }
     leaves.push_back(current);
   }
-  return true;
 }
 
 enum class NormStepKind {
@@ -149,18 +148,16 @@ enum class NormStepKind {
 
 struct NormStepMatch {
   NormStepKind kind;
-  SmallVector<Value> inputs;
-  SmallVector<Operation *> supportOps;
-  SmallVector<arith::DivFOp> divs;
   SmallVector<Value> outputs;
+  SmallVector<Operation *> supportOps;
   Value epsilon;
   int64_t reduceAxis = -1;
 };
 
-static void addSupportOpIfPresent(Value value,
-                                  SmallVectorImpl<Operation *> &supportOps) {
-  if (Operation *def = value.getDefiningOp())
-    supportOps.push_back(def);
+static void addSupportOp(SmallVectorImpl<Operation *> &supportOps,
+                         Operation *op) {
+  if (op)
+    supportOps.push_back(op);
 }
 
 static void collectDefTreeOps(Value value,
@@ -178,6 +175,19 @@ static void collectDefTreeOps(Value value,
   }
 }
 
+static void collectRowSupportOps(arith::DivFOp divOp,
+                                 SmallVectorImpl<Operation *> &supportOps) {
+  addSupportOp(supportOps, divOp);
+  if (auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>()) {
+    addSupportOp(supportOps, splat);
+    if (auto add = splat.getSrc().getDefiningOp<arith::AddFOp>()) {
+      addSupportOp(supportOps, add);
+      addSupportOp(supportOps, add.getLhs().getDefiningOp());
+      addSupportOp(supportOps, add.getRhs().getDefiningOp());
+    }
+  }
+}
+
 struct LanePackMatch {
   SmallVector<Value> initLanes;
   SmallVector<BlockArgument> laneArgs;
@@ -191,10 +201,8 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     return false;
 
   step.kind = NormStepKind::Row;
-  step.inputs.assign(inputs.begin(), inputs.end());
   step.outputs.assign(outputs.begin(), outputs.end());
   step.supportOps.clear();
-  step.divs.clear();
   step.epsilon = Value();
   step.reduceAxis = -1;
 
@@ -219,15 +227,7 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
       return false;
     }
 
-    step.divs.push_back(divOp);
-    addSupportOpIfPresent(divOp.getRhs(), step.supportOps);
-    if (auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>()) {
-      addSupportOpIfPresent(splat.getSrc(), step.supportOps);
-      if (auto add = splat.getSrc().getDefiningOp<arith::AddFOp>()) {
-        addSupportOpIfPresent(add.getLhs(), step.supportOps);
-        addSupportOpIfPresent(add.getRhs(), step.supportOps);
-      }
-    }
+    collectRowSupportOps(divOp, step.supportOps);
   }
 
   return true;
@@ -245,10 +245,8 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     return false;
 
   step.kind = NormStepKind::Col;
-  step.inputs.assign(inputs.begin(), inputs.end());
   step.outputs.assign(outputs.begin(), outputs.end());
   step.supportOps.clear();
-  step.divs.clear();
   step.epsilon = Value();
   step.reduceAxis = 0;
 
@@ -269,10 +267,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   }
 
   SmallVector<Value> addLeaves;
-  if (!collectAddTreeLeaves(sharedDenom, addLeaves)) {
-    log.reject("failed to collect col add tree");
-    return false;
-  }
+  collectAddTreeLeaves(sharedDenom, addLeaves);
 
   llvm::SmallPtrSet<void *, 8> inputSet;
   for (Value input : inputs)
@@ -365,11 +360,7 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
       return failure();
     }
 
-    for (Operation *op : step.supportOps)
-      if (op)
-        matchedOps.insert(op);
-    for (arith::DivFOp div : step.divs)
-      matchedOps.insert(div);
+    matchedOps.insert(step.supportOps.begin(), step.supportOps.end());
     match.steps.push_back(step);
 
     if (!isSameLaneTensorGroup(step.outputs)) {
@@ -511,44 +502,22 @@ static Value broadcastEpsilonTo(OpBuilder &builder, Location loc,
   return builder.create<triton::BroadcastOp>(loc, dstTy, splat);
 }
 
-static Value buildPackedRowNorm(OpBuilder &builder, Location loc, Value input,
-                                Value epsilon, int64_t originalReduceAxis) {
+static Value buildPackedNorm(OpBuilder &builder, Location loc, Value input,
+                             Value epsilon, int64_t reduceAxis) {
   auto inputTy = cast<RankedTensorType>(input.getType());
-  const int64_t packedReduceAxis = originalReduceAxis + 1;
-  Value sums = buildSumReduce(builder, loc, input, packedReduceAxis);
+  Value sums = buildSumReduce(builder, loc, input, reduceAxis);
   auto sumsTy = cast<RankedTensorType>(sums.getType());
   Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
   Value denom = builder.create<arith::AddFOp>(loc, sums, eps);
 
   SmallVector<int64_t> expandedShape(sumsTy.getShape().begin(),
                                      sumsTy.getShape().end());
-  expandedShape.insert(expandedShape.begin() + packedReduceAxis, 1);
+  expandedShape.insert(expandedShape.begin() + reduceAxis, 1);
   auto expandedTy = RankedTensorType::get(expandedShape,
                                           inputTy.getElementType(),
                                           inputTy.getEncoding());
   Value expanded =
-      builder.create<triton::ExpandDimsOp>(loc, expandedTy, denom, packedReduceAxis);
-  Value broadcast = builder.create<triton::BroadcastOp>(loc, inputTy, expanded);
-  return builder.create<arith::DivFOp>(loc, input, broadcast);
-}
-
-static Value buildPackedColNorm(OpBuilder &builder, Location loc, Value input,
-                                Value epsilon) {
-  auto inputTy = cast<RankedTensorType>(input.getType());
-  constexpr int64_t packedLaneAxis = 0;
-  Value sums = buildSumReduce(builder, loc, input, packedLaneAxis);
-  auto sumsTy = cast<RankedTensorType>(sums.getType());
-  Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
-  Value denom = builder.create<arith::AddFOp>(loc, sums, eps);
-
-  SmallVector<int64_t> expandedShape(sumsTy.getShape().begin(),
-                                     sumsTy.getShape().end());
-  expandedShape.insert(expandedShape.begin() + packedLaneAxis, 1);
-  auto expandedTy = RankedTensorType::get(expandedShape,
-                                          inputTy.getElementType(),
-                                          inputTy.getEncoding());
-  Value expanded =
-      builder.create<triton::ExpandDimsOp>(loc, expandedTy, denom, packedLaneAxis);
+      builder.create<triton::ExpandDimsOp>(loc, expandedTy, denom, reduceAxis);
   Value broadcast = builder.create<triton::BroadcastOp>(loc, inputTy, expanded);
   return builder.create<arith::DivFOp>(loc, input, broadcast);
 }
@@ -571,14 +540,10 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   Value packedCurrent = newBody->getArgument(newBody->getNumArguments() - 1);
 
   for (const NormStepMatch &step : match.steps) {
-    if (step.kind == NormStepKind::Row) {
-      packedCurrent =
-          buildPackedRowNorm(builder, loc, packedCurrent, step.epsilon,
-                             step.reduceAxis);
-    } else {
-      packedCurrent = buildPackedColNorm(builder, loc, packedCurrent,
-                                         step.epsilon);
-    }
+    int64_t packedAxis =
+        step.kind == NormStepKind::Row ? step.reduceAxis + 1 : 0;
+    packedCurrent =
+        buildPackedNorm(builder, loc, packedCurrent, step.epsilon, packedAxis);
   }
   builder.create<scf::YieldOp>(loc, packedCurrent);
 
