@@ -8,16 +8,14 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
-#include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
-#include "tle/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/Transforms/Passes.h"
 
-namespace mlir::triton::tle {
+namespace mlir::triton {
 
-#define GEN_PASS_DEF_TRITONTLELANEPACK
-#include "tle/dialect/include/Transforms/Passes.h.inc"
+#define GEN_PASS_DEF_TRITONLANEPACK
+#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
 
 namespace {
 
@@ -66,10 +64,6 @@ static bool hasOneUseOfType(Value v, Operation *&user) {
     user = candidate;
   }
   return user != nullptr;
-}
-
-static bool isScalar(Value v) {
-  return v.getType() && !isa<ShapedType>(v.getType());
 }
 
 static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
@@ -121,7 +115,8 @@ static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
   reduceOp = reduceScalar.getDefiningOp<triton::ReduceOp>();
   if (!reduceOp || reduceOp.getAxis() != 0 || reduceOp.getNumOperands() != 1 ||
       reduceOp.getOperand(0) != laneArg || !hasSingleAddCombiner(reduceOp)) {
-    llvm::errs() << "[lane-pack] reject: reduce op shape does not match lane sum\n";
+    llvm::errs()
+        << "[lane-pack] reject: reduce op shape does not match lane sum\n";
     return false;
   }
   return true;
@@ -177,7 +172,8 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   SmallVector<Value> yielded(match.yieldOp.getOperands().begin(),
                              match.yieldOp.getOperands().end());
   if (!isSameLaneTensorGroup(yielded)) {
-    llvm::errs() << "[lane-pack] reject: yielded values not same lane tensor group\n";
+    llvm::errs()
+        << "[lane-pack] reject: yielded values not same lane tensor group\n";
     return failure();
   }
 
@@ -235,7 +231,7 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
 }
 
 static Value buildShapeConst(OpBuilder &builder, Location loc,
-                            ArrayRef<int64_t> shape) {
+                             ArrayRef<int64_t> shape) {
   return builder.create<arith::ConstantOp>(loc, builder.getI64TensorAttr(shape));
 }
 
@@ -302,7 +298,8 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
   SmallVector<OpFoldResult> strides(packedTy.getRank(), builder.getIndexAttr(1));
 
   for (unsigned laneIdx = 0; laneIdx < laneCount; ++laneIdx) {
-    SmallVector<OpFoldResult> offsets(packedTy.getRank(), builder.getIndexAttr(0));
+    SmallVector<OpFoldResult> offsets(packedTy.getRank(),
+                                      builder.getIndexAttr(0));
     offsets[0] = builder.getIndexAttr(laneIdx);
     Value slice = builder.create<tensor::ExtractSliceOp>(
         loc, singletonLaneTy, packed, offsets, sizes, strides);
@@ -363,7 +360,6 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
       ValueRange{packedInit});
   llvm::errs() << "[lane-pack] created packed loop\n";
 
-  Block *oldBody = forOp.getBody();
   Block *newBody = newFor.getBody();
   builder.setInsertionPointToStart(newBody);
   Value packedArg = newBody->getArgument(newBody->getNumArguments() - 1);
@@ -437,9 +433,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   return success();
 }
 
-struct TritonTleLanePackPass
-    : public impl::TritonTleLanePackBase<TritonTleLanePackPass> {
-  using TritonTleLanePackBase::TritonTleLanePackBase;
+struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
+  using TritonLanePackBase::TritonLanePackBase;
 
   void runOnOperation() override {
     getOperation().walk([&](scf::ForOp forOp) {
@@ -458,4 +453,4 @@ struct TritonTleLanePackPass
 
 } // namespace
 
-} // namespace mlir::triton::tle
+} // namespace mlir::triton
