@@ -573,11 +573,11 @@ struct TilePackToTensor : OpRewritePattern<tile::PackOp> {
     expandReassoc.front().push_back(0);
     for (int64_t i = 0, e = inputTy.getRank(); i < e; ++i)
       expandReassoc[i + 1].push_back(i);
-    SmallVector<int64_t> expandedInputShape;
-    expandedInputShape.push_back(1);
-    expandedInputShape.append(inputTy.getShape().begin(), inputTy.getShape().end());
-    auto expandedInputTy = RankedTensorType::get(expandedInputShape,
-                                                 inputTy.getElementType());
+    auto expandedInputTy = RankedTensorType::get(
+        sizes | llvm::map_to_vector([](OpFoldResult ofr) {
+          return cast<IntegerAttr>(cast<Attribute>(ofr)).getInt();
+        }),
+        inputTy.getElementType());
     for (auto it : llvm::enumerate(inputs)) {
       SmallVector<OpFoldResult> offsets(resultTy.getRank(),
                                         rewriter.getIndexAttr(0));
