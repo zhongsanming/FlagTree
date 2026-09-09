@@ -46,7 +46,7 @@ module {
       %row3 = arith.divf %col1, %den3 : tensor<4xf32>
       scf.yield %row2, %row3 : tensor<4xf32>, tensor<4xf32>
     }
-    return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
   }
 
   // CHECK-LABEL: tt.func @row_col_row(
@@ -83,7 +83,7 @@ module {
       %row1 = arith.divf %col1, %rowden1 : tensor<4xf32>
       scf.yield %row0, %row1 : tensor<4xf32>, tensor<4xf32>
     }
-    return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
   }
 
   // CHECK-LABEL: tt.func @col_row(
