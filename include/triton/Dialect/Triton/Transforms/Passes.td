@@ -79,6 +79,20 @@ def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
+def TritonLanePack : Pass<"triton-lane-pack", "mlir::ModuleOp"> {
+  let summary = "Recognize lane-parallel tensor update patterns";
+  let description = [{
+    This pass recognizes groups of loop-carried Triton tensors that represent
+    independent lanes of the same computation. The first implementation keeps
+    matching strict: all candidate lane values must have the same ranked tensor
+    type, and the pass only targets repeated lane-parallel reduction and
+    normalization structures that can later be rewritten into a packed form.
+  }];
+
+  let dependentDialects = ["mlir::scf::SCFDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   let summary = "CSE within loop bodies";
 
