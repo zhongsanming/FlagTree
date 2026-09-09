@@ -253,32 +253,50 @@ def _heads_sinkhorn_kernel_tle(mixes_ptr,  # (T, 24) fp32
         r2 = e2 / s2
         r3 = e3 / s3
 
+        r01 = tle.dsa.tile_concat(tl.reshape(r0, [1, 4]),
+                          tl.reshape(r1, [1, 4]), dim=0)  # (2,4)
+        r23 = tle.dsa.tile_concat(tl.reshape(r2, [1, 4]),
+                                  tl.reshape(r3, [1, 4]), dim=0)  # (2,4)
+        r = tle.dsa.tile_concat(r01, r23, dim=0)                  # (4,4)
+
         # ---- iter 0 col-norm: M = softmax + hc_eps; M /= (colsum + hc_eps) ----
-        r0 = r0 + HC_EPS
-        r1 = r1 + HC_EPS
-        r2 = r2 + HC_EPS
-        r3 = r3 + HC_EPS
-        col_sum = r0 + r1 + r2 + r3 + HC_EPS
-        r0 = r0 / col_sum
-        r1 = r1 / col_sum
-        r2 = r2 / col_sum
-        r3 = r3 / col_sum
+        # r0 = r0 + HC_EPS
+        # r1 = r1 + HC_EPS
+        # r2 = r2 + HC_EPS
+        # r3 = r3 + HC_EPS
+        r = r + HC_EPS
+        # col_sum = r0 + r1 + r2 + r3 + HC_EPS
+        col_sum = tl.sum(r, axis=0) + HC_EPS
+        # r0 = r0 / col_sum
+        # r1 = r1 / col_sum
+        # r2 = r2 / col_sum
+        # r3 = r3 / col_sum
+        r = r / col_sum
 
         # ---- remaining (ITERS-1) Sinkhorn iterations ----
         for _ in tl.range(ITERS - 1):
-            rs0 = tl.sum(r0, axis=0) + HC_EPS
-            rs1 = tl.sum(r1, axis=0) + HC_EPS
-            rs2 = tl.sum(r2, axis=0) + HC_EPS
-            rs3 = tl.sum(r3, axis=0) + HC_EPS
-            r0 = r0 / rs0
-            r1 = r1 / rs1
-            r2 = r2 / rs2
-            r3 = r3 / rs3
-            cs = r0 + r1 + r2 + r3 + HC_EPS
-            r0 = r0 / cs
-            r1 = r1 / cs
-            r2 = r2 / cs
-            r3 = r3 / cs
+            # rs0 = tl.sum(r0, axis=0) + HC_EPS
+            # rs1 = tl.sum(r1, axis=0) + HC_EPS
+            # rs2 = tl.sum(r2, axis=0) + HC_EPS
+            # rs3 = tl.sum(r3, axis=0) + HC_EPS
+            rs = tl.sum(r, axis=1) + HC_EPS
+            # r0 = r0 / rs0
+            # r1 = r1 / rs1
+            # r2 = r2 / rs2
+            # r3 = r3 / rs3
+            r = r / rs
+            # cs = r0 + r1 + r2 + r3 + HC_EPS
+            cs = tl.sum(r, axis=0) + HC_EPS
+            # r0 = r0 / cs
+            # r1 = r1 / cs
+            # r2 = r2 / cs
+            # r3 = r3 / cs
+            r = r / cs
+
+        r0 = tl.reshape(tle.dsa.extract_slice(r, (0, 0), (1, 4), (1, 1)), [4])
+        r1 = tl.reshape(tle.dsa.extract_slice(r, (1, 0), (1, 4), (1, 1)), [4])
+        r2 = tl.reshape(tle.dsa.extract_slice(r, (2, 0), (1, 4), (1, 1)), [4])
+        r3 = tl.reshape(tle.dsa.extract_slice(r, (3, 0), (1, 4), (1, 1)), [4])
 
         # ---- store results via vectorized store ----
         offs4 = tl.arange(0, 4)
