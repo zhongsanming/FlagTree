@@ -163,6 +163,21 @@ static void addSupportOpIfPresent(Value value,
     supportOps.push_back(def);
 }
 
+static void collectDefTreeOps(Value value,
+                              SmallVectorImpl<Operation *> &supportOps) {
+  SmallVector<Value> worklist{value};
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    Operation *def = current.getDefiningOp();
+    if (!def || !visited.insert(def).second)
+      continue;
+    supportOps.push_back(def);
+    for (Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+}
+
 struct LanePackMatch {
   SmallVector<Value> initLanes;
   SmallVector<BlockArgument> laneArgs;
@@ -277,9 +292,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     return false;
   }
   step.epsilon = nonInputLeaves.front();
-  addSupportOpIfPresent(sharedDenom, step.supportOps);
-  for (Value leaf : addLeaves)
-    addSupportOpIfPresent(leaf, step.supportOps);
+  collectDefTreeOps(sharedDenom, step.supportOps);
   return true;
 }
 
