@@ -66,57 +66,50 @@ static bool hasOneUseOfType(Value v, Operation *&user) {
   return user != nullptr;
 }
 
-static bool matchLaneReduceToSplatDiv(BlockArgument laneArg, Value &eps,
-                                      triton::ReduceOp &reduceOp,
-                                      arith::DivFOp &divOp) {
-  Operation *user = nullptr;
-  if (!hasOneUseOfType<arith::DivFOp>(laneArg, user)) {
-    llvm::errs() << "[lane-pack] reject: lane arg has no unique divf user\n";
-    return false;
-  }
-
-  divOp = cast<arith::DivFOp>(user);
-  if (divOp.getLhs() != laneArg)
-    return false;
-
-  auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>();
-  if (!splat) {
-    llvm::errs() << "[lane-pack] reject: div rhs is not triton.splat\n";
-    return false;
-  }
-  auto add = splat.getSrc().getDefiningOp<arith::AddFOp>();
+static bool matchReducePlusEpsilon(Value value, Value &epsilon,
+                                   triton::ReduceOp &reduceOp) {
+  auto add = value.getDefiningOp<arith::AddFOp>();
   if (!add) {
-    llvm::errs() << "[lane-pack] reject: splat src is not addf\n";
+    llvm::errs() << "[lane-pack] reject: denominator is not addf\n";
     return false;
   }
 
-  Value reduceScalar;
-  Value candidateEps;
   auto lhsReduce = add.getLhs().getDefiningOp<triton::ReduceOp>();
   auto rhsReduce = add.getRhs().getDefiningOp<triton::ReduceOp>();
+  Value candidateEps;
   if (lhsReduce && !rhsReduce) {
-    reduceScalar = add.getLhs();
+    reduceOp = lhsReduce;
     candidateEps = add.getRhs();
   } else if (rhsReduce && !lhsReduce) {
-    reduceScalar = add.getRhs();
+    reduceOp = rhsReduce;
     candidateEps = add.getLhs();
   } else {
     llvm::errs()
-        << "[lane-pack] reject: row denominator is not reduce + scalar eps\n";
+        << "[lane-pack] reject: denominator is not reduce + epsilon\n";
     return false;
   }
 
-  if (!eps)
-    eps = candidateEps;
-  // Epsilon may be represented as a scalar in one lane and as a promoted
-  // tensor in another lane. Keep the first value for reconstruction and do
-  // not require SSA identity or type equality across the original lanes.
+  if (!epsilon)
+    epsilon = candidateEps;
+  return true;
+}
 
-  reduceOp = reduceScalar.getDefiningOp<triton::ReduceOp>();
-  if (!reduceOp || reduceOp.getAxis() != 0 || reduceOp.getNumOperands() != 1 ||
-      reduceOp.getOperand(0) != laneArg || !hasSingleAddCombiner(reduceOp)) {
+static bool matchBroadcastedDenominator(Value denominator, Value src,
+                                        Value &epsilon,
+                                        triton::ReduceOp &reduceOp) {
+  auto splat = denominator.getDefiningOp<triton::SplatOp>();
+  if (!splat) {
+    llvm::errs() << "[lane-pack] reject: row denominator is not triton.splat\n";
+    return false;
+  }
+
+  if (!matchReducePlusEpsilon(splat.getSrc(), epsilon, reduceOp))
+    return false;
+
+  if (reduceOp.getNumOperands() != 1 || reduceOp.getOperand(0) != src ||
+      !hasSingleAddCombiner(reduceOp)) {
     llvm::errs()
-        << "[lane-pack] reject: reduce op shape does not match lane sum\n";
+        << "[lane-pack] reject: row reduce op shape does not match source\n";
     return false;
   }
   return true;
@@ -136,16 +129,126 @@ static bool collectAddTreeLeaves(Value root, SmallVectorImpl<Value> &leaves) {
   return true;
 }
 
+enum class NormStepKind {
+  Row,
+  Col,
+};
+
+struct NormStepMatch {
+  NormStepKind kind;
+  SmallVector<Value> inputs;
+  SmallVector<arith::DivFOp> divs;
+  SmallVector<Value> outputs;
+  Value epsilon;
+  int64_t reduceAxis = -1;
+};
+
 struct LanePackMatch {
   SmallVector<Value> initLanes;
   SmallVector<BlockArgument> laneArgs;
-  SmallVector<arith::DivFOp> rowDivs;
-  SmallVector<Value> rowNorms;
-  SmallVector<arith::DivFOp> yieldDivs;
-  Value eps;
+  SmallVector<NormStepMatch> steps;
   scf::YieldOp yieldOp;
-  int64_t laneReduceAxis = 0;
 };
+
+static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
+                             NormStepMatch &step) {
+  if (inputs.size() != outputs.size() || inputs.empty())
+    return false;
+
+  step.kind = NormStepKind::Row;
+  step.inputs.assign(inputs.begin(), inputs.end());
+  step.outputs.assign(outputs.begin(), outputs.end());
+  step.divs.clear();
+  step.epsilon = Value();
+  step.reduceAxis = -1;
+
+  for (auto [input, output] : llvm::zip(inputs, outputs)) {
+    auto divOp = output.getDefiningOp<arith::DivFOp>();
+    if (!divOp || divOp.getLhs() != input) {
+      llvm::errs() << "[lane-pack] reject: row step output is not input/div\n";
+      return false;
+    }
+
+    triton::ReduceOp reduceOp;
+    if (!matchBroadcastedDenominator(divOp.getRhs(), input, step.epsilon,
+                                     reduceOp)) {
+      llvm::errs() << "[lane-pack] reject: row step denominator mismatch\n";
+      return false;
+    }
+
+    if (step.reduceAxis < 0)
+      step.reduceAxis = reduceOp.getAxis();
+    else if (step.reduceAxis != reduceOp.getAxis()) {
+      llvm::errs() << "[lane-pack] reject: row step axis mismatch\n";
+      return false;
+    }
+
+    step.divs.push_back(divOp);
+  }
+
+  return true;
+}
+
+static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
+                             NormStepMatch &step) {
+  if (inputs.size() != outputs.size() || inputs.empty())
+    return false;
+
+  step.kind = NormStepKind::Col;
+  step.inputs.assign(inputs.begin(), inputs.end());
+  step.outputs.assign(outputs.begin(), outputs.end());
+  step.divs.clear();
+  step.epsilon = Value();
+  step.reduceAxis = 0;
+
+  Value sharedDenom;
+  for (auto [input, output] : llvm::zip(inputs, outputs)) {
+    auto divOp = output.getDefiningOp<arith::DivFOp>();
+    if (!divOp || divOp.getLhs() != input) {
+      llvm::errs() << "[lane-pack] reject: col step output is not input/div\n";
+      return false;
+    }
+    step.divs.push_back(divOp);
+    if (!sharedDenom)
+      sharedDenom = divOp.getRhs();
+    else if (sharedDenom != divOp.getRhs()) {
+      llvm::errs() << "[lane-pack] reject: col step denominators differ\n";
+      return false;
+    }
+  }
+
+  SmallVector<Value> addLeaves;
+  if (!collectAddTreeLeaves(sharedDenom, addLeaves)) {
+    llvm::errs() << "[lane-pack] reject: failed to collect col add tree\n";
+    return false;
+  }
+
+  llvm::SmallPtrSet<void *, 8> inputSet;
+  for (Value input : inputs)
+    inputSet.insert(input.getAsOpaquePointer());
+
+  unsigned matchedInputs = 0;
+  for (Value leaf : addLeaves) {
+    if (inputSet.contains(leaf.getAsOpaquePointer()))
+      ++matchedInputs;
+  }
+  if (matchedInputs != inputs.size()) {
+    llvm::errs() << "[lane-pack] reject: col denominator does not use all inputs\n";
+    return false;
+  }
+
+  SmallVector<Value> nonInputLeaves;
+  for (Value leaf : addLeaves) {
+    if (!inputSet.contains(leaf.getAsOpaquePointer()))
+      nonInputLeaves.push_back(leaf);
+  }
+  if (nonInputLeaves.size() != 1) {
+    llvm::errs() << "[lane-pack] reject: col denominator must have one epsilon leaf\n";
+    return false;
+  }
+  step.epsilon = nonInputLeaves.front();
+  return true;
+}
 
 static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   llvm::errs() << "[lane-pack] inspect loop: ";
@@ -179,54 +282,60 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
 
   match.laneArgs.assign(forOp.getRegionIterArgs().begin(),
                         forOp.getRegionIterArgs().end());
-  match.rowDivs.reserve(match.laneArgs.size());
-  match.rowNorms.reserve(match.laneArgs.size());
-  for (BlockArgument laneArg : match.laneArgs) {
-    triton::ReduceOp reduceOp;
-    arith::DivFOp divOp;
-    if (!matchLaneReduceToSplatDiv(laneArg, match.eps, reduceOp, divOp)) {
-      llvm::errs() << "[lane-pack] reject: lane arg failed reduce/div match\n";
+
+  SmallVector<Value> current(match.laneArgs.begin(), match.laneArgs.end());
+  SmallPtrSet<Operation *, 32> matchedOps;
+  while (current != yielded) {
+    SmallVector<Value> candidateOutputs;
+    candidateOutputs.reserve(current.size());
+    for (Value input : current) {
+      Operation *user = nullptr;
+      if (!hasOneUseOfType<arith::DivFOp>(input, user)) {
+        llvm::errs() << "[lane-pack] reject: expected unique div user for step input\n";
+        return failure();
+      }
+      auto divOp = cast<arith::DivFOp>(user);
+      if (divOp.getLhs() != input) {
+        llvm::errs() << "[lane-pack] reject: div user does not consume input as lhs\n";
+        return failure();
+      }
+      candidateOutputs.push_back(divOp.getResult());
+    }
+
+    NormStepMatch step;
+    if (!matchRowNormStep(current, candidateOutputs, step) &&
+        !matchColNormStep(current, candidateOutputs, step)) {
+      llvm::errs() << "[lane-pack] reject: failed to extend step chain\n";
       return failure();
     }
-    if (match.rowDivs.empty())
-      match.laneReduceAxis = reduceOp.getAxis();
-    else if (match.laneReduceAxis != reduceOp.getAxis())
-      return failure();
-    match.rowDivs.push_back(divOp);
-    match.rowNorms.push_back(divOp.getResult());
-  }
 
-  Value sharedDenom;
-  match.yieldDivs.reserve(yielded.size());
-  for (auto [rowNorm, yieldedLane] : llvm::zip(match.rowNorms, yielded)) {
-    auto divOp = yieldedLane.getDefiningOp<arith::DivFOp>();
-    if (!divOp || divOp.getLhs() != rowNorm) {
-      llvm::errs() << "[lane-pack] reject: yield div does not consume row norm\n";
+    for (arith::DivFOp div : step.divs)
+      matchedOps.insert(div);
+    match.steps.push_back(step);
+
+    if (!isSameLaneTensorGroup(step.outputs)) {
+      llvm::errs() << "[lane-pack] reject: step outputs are not lane group\n";
       return failure();
     }
-    match.yieldDivs.push_back(divOp);
-    if (!sharedDenom)
-      sharedDenom = divOp.getRhs();
-    else if (sharedDenom != divOp.getRhs())
-      return failure();
+    current.assign(step.outputs.begin(), step.outputs.end());
   }
 
-  SmallVector<Value> addLeaves;
-  if (!collectAddTreeLeaves(sharedDenom, addLeaves)) {
-    llvm::errs() << "[lane-pack] reject: failed to collect add tree leaves\n";
+  if (match.steps.empty()) {
+    llvm::errs() << "[lane-pack] reject: no normalization steps found\n";
     return failure();
   }
 
-  llvm::SmallPtrSet<void *, 8> leafSet;
-  for (Value leaf : addLeaves)
-    leafSet.insert(leaf.getAsOpaquePointer());
-  for (Value rowNorm : match.rowNorms) {
-    if (!leafSet.contains(rowNorm.getAsOpaquePointer()))
-      return failure();
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (matchedOps.contains(&op))
+      continue;
+    if (isa<triton::ReduceOp, triton::SplatOp, arith::AddFOp>(op))
+      continue;
+    llvm::errs() << "[lane-pack] reject: unsupported non-normalization op in loop body\n";
+    return failure();
   }
 
   llvm::errs() << "[lane-pack] match success: lanes=" << match.initLanes.size()
-               << "\n";
+               << ", steps=" << match.steps.size() << "\n";
   return match;
 }
 
@@ -343,79 +452,79 @@ static Value broadcastEpsilonTo(OpBuilder &builder, Location loc,
   return builder.create<triton::BroadcastOp>(loc, dstTy, splat);
 }
 
+static Value buildPackedRowNorm(OpBuilder &builder, Location loc, Value input,
+                                Value epsilon, int64_t originalReduceAxis) {
+  auto inputTy = cast<RankedTensorType>(input.getType());
+  const int64_t packedReduceAxis = originalReduceAxis + 1;
+  Value sums = buildSumReduce(builder, loc, input, packedReduceAxis);
+  auto sumsTy = cast<RankedTensorType>(sums.getType());
+  Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
+  Value denom = builder.create<arith::AddFOp>(loc, sums, eps);
+
+  SmallVector<int64_t> expandedShape(sumsTy.getShape().begin(),
+                                     sumsTy.getShape().end());
+  expandedShape.insert(expandedShape.begin() + packedReduceAxis, 1);
+  auto expandedTy = RankedTensorType::get(expandedShape,
+                                          inputTy.getElementType(),
+                                          inputTy.getEncoding());
+  Value expanded =
+      builder.create<triton::ExpandDimsOp>(loc, expandedTy, denom, packedReduceAxis);
+  Value broadcast = builder.create<triton::BroadcastOp>(loc, inputTy, expanded);
+  return builder.create<arith::DivFOp>(loc, input, broadcast);
+}
+
+static Value buildPackedColNorm(OpBuilder &builder, Location loc, Value input,
+                                Value epsilon) {
+  auto inputTy = cast<RankedTensorType>(input.getType());
+  constexpr int64_t packedLaneAxis = 0;
+  Value sums = buildSumReduce(builder, loc, input, packedLaneAxis);
+  auto sumsTy = cast<RankedTensorType>(sums.getType());
+  Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
+  Value denom = builder.create<arith::AddFOp>(loc, sums, eps);
+
+  SmallVector<int64_t> expandedShape(sumsTy.getShape().begin(),
+                                     sumsTy.getShape().end());
+  expandedShape.insert(expandedShape.begin() + packedLaneAxis, 1);
+  auto expandedTy = RankedTensorType::get(expandedShape,
+                                          inputTy.getElementType(),
+                                          inputTy.getEncoding());
+  Value expanded =
+      builder.create<triton::ExpandDimsOp>(loc, expandedTy, denom, packedLaneAxis);
+  Value broadcast = builder.create<triton::BroadcastOp>(loc, inputTy, expanded);
+  return builder.create<arith::DivFOp>(loc, input, broadcast);
+}
+
 static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
                                          const LanePackMatch &match) {
   Location loc = forOp.getLoc();
   OpBuilder builder(forOp);
   llvm::errs() << "[lane-pack] rewrite begin: lanes="
-               << match.initLanes.size() << ", epsilon type="
-               << match.eps.getType() << "\n";
-
-  Value packedInit = buildPackedLanes(builder, loc, match.initLanes);
-  llvm::errs() << "[lane-pack] packed init type: " << packedInit.getType()
+               << match.initLanes.size() << ", steps=" << match.steps.size()
                << "\n";
 
+  Value packedInit = buildPackedLanes(builder, loc, match.initLanes);
   auto newFor = builder.create<scf::ForOp>(
       loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
       ValueRange{packedInit});
-  llvm::errs() << "[lane-pack] created packed loop\n";
 
   Block *newBody = newFor.getBody();
   builder.setInsertionPointToStart(newBody);
-  Value packedArg = newBody->getArgument(newBody->getNumArguments() - 1);
-  auto packedArgTy = cast<RankedTensorType>(packedArg.getType());
-  llvm::errs() << "[lane-pack] packed loop argument type: " << packedArgTy
-               << "\n";
+  Value packedCurrent = newBody->getArgument(newBody->getNumArguments() - 1);
 
-  constexpr int packedLaneAxis = 0;
-  const int64_t packedOriginalReduceAxis = match.laneReduceAxis + 1;
-
-  Value rowSums =
-      buildSumReduce(builder, loc, packedArg, packedOriginalReduceAxis);
-  auto rowSumsTy = cast<RankedTensorType>(rowSums.getType());
-  Value epsVec = broadcastEpsilonTo(builder, loc, match.eps, rowSumsTy);
-  llvm::errs() << "[lane-pack] row sums/epsilon types: " << rowSumsTy << " / "
-               << epsVec.getType() << "\n";
-  Value rowDenom = builder.create<arith::AddFOp>(loc, rowSums, epsVec);
-  SmallVector<int64_t> rowExpandedShape(rowSumsTy.getShape().begin(),
-                                        rowSumsTy.getShape().end());
-  rowExpandedShape.insert(rowExpandedShape.begin() + packedOriginalReduceAxis,
-                          1);
-  auto expandRowTy = RankedTensorType::get(
-      rowExpandedShape, packedArgTy.getElementType(), packedArgTy.getEncoding());
-  Value rowDenomExpanded = builder.create<triton::ExpandDimsOp>(
-      loc, expandRowTy, rowDenom, packedOriginalReduceAxis);
-  Value rowDenomBroadcast =
-      builder.create<triton::BroadcastOp>(loc, packedArgTy, rowDenomExpanded);
-  Value rowNormalized =
-      builder.create<arith::DivFOp>(loc, packedArg, rowDenomBroadcast);
-  llvm::errs() << "[lane-pack] created row normalization\n";
-
-  Value colSums = buildSumReduce(builder, loc, rowNormalized, packedLaneAxis);
-  auto colSumsTy = cast<RankedTensorType>(colSums.getType());
-  Value epsCols = broadcastEpsilonTo(builder, loc, match.eps, colSumsTy);
-  llvm::errs() << "[lane-pack] column sums/epsilon types: " << colSumsTy
-               << " / " << epsCols.getType() << "\n";
-  Value colDenom = builder.create<arith::AddFOp>(loc, colSums, epsCols);
-  SmallVector<int64_t> colExpandedShape(colSumsTy.getShape().begin(),
-                                        colSumsTy.getShape().end());
-  colExpandedShape.insert(colExpandedShape.begin() + packedLaneAxis, 1);
-  auto expandColTy = RankedTensorType::get(
-      colExpandedShape, packedArgTy.getElementType(), packedArgTy.getEncoding());
-  Value colDenomExpanded = builder.create<triton::ExpandDimsOp>(
-      loc, expandColTy, colDenom, packedLaneAxis);
-  Value colDenomBroadcast =
-      builder.create<triton::BroadcastOp>(loc, packedArgTy, colDenomExpanded);
-  Value packedYield =
-      builder.create<arith::DivFOp>(loc, rowNormalized, colDenomBroadcast);
-  builder.create<scf::YieldOp>(loc, packedYield);
-  llvm::errs() << "[lane-pack] created column normalization and loop yield\n";
+  for (const NormStepMatch &step : match.steps) {
+    if (step.kind == NormStepKind::Row) {
+      packedCurrent =
+          buildPackedRowNorm(builder, loc, packedCurrent, step.epsilon,
+                             step.reduceAxis);
+    } else {
+      packedCurrent = buildPackedColNorm(builder, loc, packedCurrent,
+                                         step.epsilon);
+    }
+  }
+  builder.create<scf::YieldOp>(loc, packedCurrent);
 
   builder.setInsertionPointAfter(newFor);
   Value packedResult = newFor.getResult(0);
-  llvm::errs() << "[lane-pack] unpack input type: " << packedResult.getType()
-               << "\n";
-
   SmallVector<Value> unpacked = unpackPackedLanes(builder, loc, packedResult,
                                                   match.initLanes.size());
   if (unpacked.size() != match.initLanes.size()) {
@@ -424,7 +533,6 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
                  << match.initLanes.size() << "\n";
     return failure();
   }
-  llvm::errs() << "[lane-pack] unpacked " << unpacked.size() << " lanes\n";
 
   for (auto [oldResult, newResult] : llvm::zip(forOp.getResults(), unpacked))
     oldResult.replaceAllUsesWith(newResult);
