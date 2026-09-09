@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
@@ -233,15 +234,44 @@ static FailureOr<LanePackMatch> matchLanePackLoop(scf::ForOp forOp) {
   return match;
 }
 
+static DenseIntElementsAttr buildReassociationAttr(OpBuilder &builder,
+                                                    ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> reassociation(shape.begin(), shape.end());
+  auto reassociationTy =
+      RankedTensorType::get({static_cast<int64_t>(reassociation.size())},
+                            builder.getI64Type());
+  return DenseIntElementsAttr::get(reassociationTy, reassociation);
+}
+
 static Value buildPackedLanes(OpBuilder &builder, Location loc,
                               ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
+
+  SmallVector<int64_t> singletonLaneShape;
+  singletonLaneShape.push_back(1);
+  singletonLaneShape.append(laneTy.getShape().begin(), laneTy.getShape().end());
+  auto singletonLaneTy = RankedTensorType::get(singletonLaneShape,
+                                               laneTy.getElementType(),
+                                               laneTy.getEncoding());
+
+  auto reshapeLane = [&](Value lane) -> Value {
+    return builder.create<tensor::ReshapeOp>(
+        loc, singletonLaneTy, lane,
+        buildReassociationAttr(builder, singletonLaneShape));
+  };
+
+  SmallVector<Value> concatOperands;
+  concatOperands.reserve(lanes.size());
+  for (Value lane : lanes)
+    concatOperands.push_back(reshapeLane(lane));
+
   SmallVector<int64_t> packedShape;
   packedShape.push_back(lanes.size());
   packedShape.append(laneTy.getShape().begin(), laneTy.getShape().end());
-  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType());
-  return builder.create<mlir::triton::tile::PackOp>(loc, packedTy, lanes);
+  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType(),
+                                        laneTy.getEncoding());
+  return builder.create<tensor::ConcatOp>(loc, packedTy, 0, concatOperands);
 }
 
 static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
@@ -249,20 +279,42 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
                                             unsigned laneCount) {
   SmallVector<Value> lanes;
   lanes.reserve(laneCount);
-  auto packedTy = cast<RankedTensorType>(packed.getType());
+  auto packedTy = dyn_cast<RankedTensorType>(packed.getType());
   if (!packedTy || packedTy.getRank() < 1 ||
       packedTy.getShape().front() != static_cast<int64_t>(laneCount)) {
     llvm::errs() << "[lane-pack] reject: packed tensor shape mismatch: "
                  << packed.getType() << "\n";
     return lanes;
   }
-  SmallVector<Type> resultTypes;
-  auto laneShape = packedTy.getShape().drop_front();
-  auto laneTy = RankedTensorType::get(laneShape, packedTy.getElementType());
-  resultTypes.assign(laneCount, laneTy);
-  auto unpack = builder.create<mlir::triton::tile::UnpackOp>(loc, resultTypes,
-                                                             packed);
-  lanes.append(unpack.getResults().begin(), unpack.getResults().end());
+
+  SmallVector<int64_t> laneShape(packedTy.getShape().drop_front().begin(),
+                                 packedTy.getShape().drop_front().end());
+  auto laneTy = RankedTensorType::get(laneShape, packedTy.getElementType(),
+                                      packedTy.getEncoding());
+
+  SmallVector<int64_t> singletonLaneShape;
+  singletonLaneShape.push_back(1);
+  singletonLaneShape.append(laneShape.begin(), laneShape.end());
+  auto singletonLaneTy = RankedTensorType::get(
+      singletonLaneShape, packedTy.getElementType(), packedTy.getEncoding());
+
+  SmallVector<OpFoldResult> sizes;
+  sizes.reserve(packedTy.getRank());
+  sizes.push_back(builder.getIndexAttr(1));
+  for (int64_t dim : laneShape)
+    sizes.push_back(builder.getIndexAttr(dim));
+  SmallVector<OpFoldResult> strides(packedTy.getRank(), builder.getIndexAttr(1));
+
+  for (unsigned laneIdx = 0; laneIdx < laneCount; ++laneIdx) {
+    SmallVector<OpFoldResult> offsets(packedTy.getRank(), builder.getIndexAttr(0));
+    offsets[0] = builder.getIndexAttr(laneIdx);
+    Value slice = builder.create<tensor::ExtractSliceOp>(
+        loc, singletonLaneTy, packed, offsets, sizes, strides);
+    Value lane = builder.create<tensor::ReshapeOp>(
+        loc, laneTy, slice,
+        buildReassociationAttr(builder, singletonLaneShape));
+    lanes.push_back(lane);
+  }
   return lanes;
 }
 
