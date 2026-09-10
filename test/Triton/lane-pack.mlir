@@ -159,6 +159,97 @@ module {
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
 
+  tt.func @row_row_no_eps(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %r0 = "tt.reduce"(%lane0) <{axis = 0 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum0 = arith.addf %a, %b : f32
+        tt.reduce.return %sum0 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den0 = tt.splat %r0 : f32 -> tensor<4xf32>
+      %row0 = arith.divf %lane0, %den0 : tensor<4xf32>
+
+      %r1 = "tt.reduce"(%lane1) <{axis = 0 : i32}> ({
+      ^bb0(%a0: f32, %b0: f32):
+        %sum1 = arith.addf %a0, %b0 : f32
+        tt.reduce.return %sum1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den1 = tt.splat %r1 : f32 -> tensor<4xf32>
+      %row1 = arith.divf %lane1, %den1 : tensor<4xf32>
+
+      %r2 = "tt.reduce"(%row0) <{axis = 0 : i32}> ({
+      ^bb0(%a1: f32, %b1: f32):
+        %sum2 = arith.addf %a1, %b1 : f32
+        tt.reduce.return %sum2 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den2 = tt.splat %r2 : f32 -> tensor<4xf32>
+      %row2 = arith.divf %row0, %den2 : tensor<4xf32>
+
+      %r3 = "tt.reduce"(%row1) <{axis = 0 : i32}> ({
+      ^bb0(%a2: f32, %b2: f32):
+        %sum3 = arith.addf %a2, %b2 : f32
+        tt.reduce.return %sum3 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den3 = tt.splat %r3 : f32 -> tensor<4xf32>
+      %row3 = arith.divf %row1, %den3 : tensor<4xf32>
+      scf.yield %row2, %row3 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @row_row_no_eps(
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+  tt.func @col_col_no_eps(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %sum0 = arith.addf %lane0, %lane1 : tensor<4xf32>
+      %col0 = arith.divf %lane0, %sum0 : tensor<4xf32>
+      %col1 = arith.divf %lane1, %sum0 : tensor<4xf32>
+
+      %sum1 = arith.addf %col0, %col1 : tensor<4xf32>
+      %col2 = arith.divf %col0, %sum1 : tensor<4xf32>
+      %col3 = arith.divf %col1, %sum1 : tensor<4xf32>
+      scf.yield %col2, %col3 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @col_col_no_eps(
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
+
+  tt.func @col_row_no_eps(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %sum = arith.addf %lane0, %lane1 : tensor<4xf32>
+      %col0 = arith.divf %lane0, %sum : tensor<4xf32>
+      %col1 = arith.divf %lane1, %sum : tensor<4xf32>
+
+      %r0 = "tt.reduce"(%col0) <{axis = 0 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum0 = arith.addf %a, %b : f32
+        tt.reduce.return %sum0 : f32
+      }) : (tensor<4xf32>) -> f32
+      %rowden0 = tt.splat %r0 : f32 -> tensor<4xf32>
+      %row0 = arith.divf %col0, %rowden0 : tensor<4xf32>
+
+      %r1 = "tt.reduce"(%col1) <{axis = 0 : i32}> ({
+      ^bb0(%a0: f32, %b0: f32):
+        %sum1 = arith.addf %a0, %b0 : f32
+        tt.reduce.return %sum1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %rowden1 = tt.splat %r1 : f32 -> tensor<4xf32>
+      %row1 = arith.divf %col1, %rowden1 : tensor<4xf32>
+      scf.yield %row0, %row1 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @col_row_no_eps(
+  // CHECK: scf.for
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
   tt.func @col_row_four_lane(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %arg2: tensor<4xf32>, %arg3: tensor<4xf32>, %eps_t: tensor<4xf32>, %eps: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
     %0:4 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1, %lane2 = %arg2, %lane3 = %arg3) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
       %sum0 = arith.addf %lane0, %lane1 : tensor<4xf32>

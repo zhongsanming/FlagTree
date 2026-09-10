@@ -79,12 +79,18 @@ struct ProbeLogger {
   }
 };
 
-static bool matchReducePlusEpsilon(Value value, Value &epsilon,
-                                   triton::ReduceOp &reduceOp,
-                                   ProbeLogger log = {}) {
+static bool matchReduceOptionalEpsilon(Value value, Value &epsilon,
+                                       triton::ReduceOp &reduceOp,
+                                       ProbeLogger log = {}) {
+  if (auto directReduce = value.getDefiningOp<triton::ReduceOp>()) {
+    epsilon = Value();
+    reduceOp = directReduce;
+    return true;
+  }
+
   auto add = value.getDefiningOp<arith::AddFOp>();
   if (!add) {
-    log.reject("denominator is not addf");
+    log.reject("denominator is not reduce or reduce + epsilon");
     return false;
   }
 
@@ -102,8 +108,7 @@ static bool matchReducePlusEpsilon(Value value, Value &epsilon,
     return false;
   }
 
-  if (!epsilon)
-    epsilon = candidateEps;
+  epsilon = candidateEps;
   return true;
 }
 
@@ -117,7 +122,7 @@ static bool matchBroadcastedDenominator(Value denominator, Value src,
     return false;
   }
 
-  if (!matchReducePlusEpsilon(splat.getSrc(), epsilon, reduceOp, log))
+  if (!matchReduceOptionalEpsilon(splat.getSrc(), epsilon, reduceOp, log))
     return false;
 
   if (reduceOp.getNumOperands() != 1 || reduceOp.getOperand(0) != src ||
@@ -151,6 +156,7 @@ struct NormStepMatch {
   SmallVector<Value> outputs;
   SmallVector<Operation *> supportOps;
   Value epsilon;
+  bool hasEpsilon = false;
   int64_t reduceAxis = -1;
 };
 
@@ -180,10 +186,13 @@ static void collectRowSupportOps(arith::DivFOp divOp,
   addSupportOp(supportOps, divOp);
   if (auto splat = divOp.getRhs().getDefiningOp<triton::SplatOp>()) {
     addSupportOp(supportOps, splat);
-    if (auto add = splat.getSrc().getDefiningOp<arith::AddFOp>()) {
+    Value src = splat.getSrc();
+    if (auto add = src.getDefiningOp<arith::AddFOp>()) {
       addSupportOp(supportOps, add);
       addSupportOp(supportOps, add.getLhs().getDefiningOp());
       addSupportOp(supportOps, add.getRhs().getDefiningOp());
+    } else {
+      addSupportOp(supportOps, src.getDefiningOp());
     }
   }
 }
@@ -204,8 +213,11 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   step.outputs.assign(outputs.begin(), outputs.end());
   step.supportOps.clear();
   step.epsilon = Value();
+  step.hasEpsilon = false;
   step.reduceAxis = -1;
 
+  // -1 = undecided, 0 = no epsilon, 1 = has epsilon.
+  int epsilonPresence = -1;
   for (auto [input, output] : llvm::zip(inputs, outputs)) {
     auto divOp = output.getDefiningOp<arith::DivFOp>();
     if (!divOp || divOp.getLhs() != input) {
@@ -214,9 +226,22 @@ static bool matchRowNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     }
 
     triton::ReduceOp reduceOp;
-    if (!matchBroadcastedDenominator(divOp.getRhs(), input, step.epsilon,
+    Value laneEpsilon;
+    if (!matchBroadcastedDenominator(divOp.getRhs(), input, laneEpsilon,
                                      reduceOp, log)) {
       log.reject("row step denominator mismatch");
+      return false;
+    }
+
+    int laneEpsilonPresence = laneEpsilon ? 1 : 0;
+    if (epsilonPresence < 0) {
+      epsilonPresence = laneEpsilonPresence;
+      if (laneEpsilon) {
+        step.epsilon = laneEpsilon;
+        step.hasEpsilon = true;
+      }
+    } else if (epsilonPresence != laneEpsilonPresence) {
+      log.reject("row step mixes epsilon and epsilon-free reductions");
       return false;
     }
 
@@ -248,6 +273,7 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
   step.outputs.assign(outputs.begin(), outputs.end());
   step.supportOps.clear();
   step.epsilon = Value();
+  step.hasEpsilon = false;
   step.reduceAxis = 0;
 
   Value sharedDenom;
@@ -288,11 +314,14 @@ static bool matchColNormStep(ArrayRef<Value> inputs, ArrayRef<Value> outputs,
     if (!inputSet.contains(leaf.getAsOpaquePointer()))
       nonInputLeaves.push_back(leaf);
   }
-  if (nonInputLeaves.size() != 1) {
-    log.reject("col denominator must have one epsilon leaf");
+  if (nonInputLeaves.size() > 1) {
+    log.reject("col denominator must have at most one epsilon leaf");
     return false;
   }
-  step.epsilon = canonicalizeNormalizationEpsilon(nonInputLeaves.front());
+  if (nonInputLeaves.size() == 1) {
+    step.epsilon = canonicalizeNormalizationEpsilon(nonInputLeaves.front());
+    step.hasEpsilon = true;
+  }
   collectDefTreeOps(sharedDenom, step.supportOps);
   return true;
 }
@@ -503,12 +532,16 @@ static Value broadcastEpsilonTo(OpBuilder &builder, Location loc,
 }
 
 static Value buildPackedNorm(OpBuilder &builder, Location loc, Value input,
-                             Value epsilon, int64_t reduceAxis) {
+                             Value epsilon, bool hasEpsilon,
+                             int64_t reduceAxis) {
   auto inputTy = cast<RankedTensorType>(input.getType());
   Value sums = buildSumReduce(builder, loc, input, reduceAxis);
   auto sumsTy = cast<RankedTensorType>(sums.getType());
-  Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
-  Value denom = builder.create<arith::AddFOp>(loc, sums, eps);
+  Value denom = sums;
+  if (hasEpsilon) {
+    Value eps = broadcastEpsilonTo(builder, loc, epsilon, sumsTy);
+    denom = builder.create<arith::AddFOp>(loc, sums, eps);
+  }
 
   SmallVector<int64_t> expandedShape(sumsTy.getShape().begin(),
                                      sumsTy.getShape().end());
@@ -542,8 +575,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   for (const NormStepMatch &step : match.steps) {
     int64_t packedAxis =
         step.kind == NormStepKind::Row ? step.reduceAxis + 1 : 0;
-    packedCurrent =
-        buildPackedNorm(builder, loc, packedCurrent, step.epsilon, packedAxis);
+    packedCurrent = buildPackedNorm(builder, loc, packedCurrent, step.epsilon,
+                                    step.hasEpsilon, packedAxis);
   }
   builder.create<scf::YieldOp>(loc, packedCurrent);
 
