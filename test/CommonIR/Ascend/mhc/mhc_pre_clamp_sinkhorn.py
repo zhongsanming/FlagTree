@@ -570,8 +570,8 @@ def mhc_pre_clamp_sinkhorn_ref(
     M = M / M.sum(dim=-1, keepdim=True) + hc_eps
     M = M / (M.sum(dim=-2, keepdim=True) + hc_eps)
     for _ in range(iter_times - 1):
-        M = M / (M.sum(dim=-1, keepdim=True) + hc_eps)
         M = M / (M.sum(dim=-2, keepdim=True) + hc_eps)
+        M = M / (M.sum(dim=-1, keepdim=True) + hc_eps)
 
     # hin = sum_n (x * pre) -> (T, D)
     y = (xf.float() * pre.unsqueeze(-1)).sum(dim=-2).to(orig_dtype)
