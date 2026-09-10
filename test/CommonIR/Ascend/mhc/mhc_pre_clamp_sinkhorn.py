@@ -266,15 +266,15 @@ def _heads_sinkhorn_kernel_tle(mixes_ptr,  # (T, 24) fp32
 
         # ---- remaining (ITERS-1) Sinkhorn iterations ----
         for _ in tl.range(ITERS - 1):
-            cs = r0 + r1 + r2 + r3 + HC_EPS
+            cs = r0 + r1 + r2 + r3
             r0 = r0 / cs
             r1 = r1 / cs
             r2 = r2 / cs
             r3 = r3 / cs
-            rs0 = tl.sum(r0, axis=0) + HC_EPS
-            rs1 = tl.sum(r1, axis=0) + HC_EPS
-            rs2 = tl.sum(r2, axis=0) + HC_EPS
-            rs3 = tl.sum(r3, axis=0) + HC_EPS
+            rs0 = tl.sum(r0, axis=0)
+            rs1 = tl.sum(r1, axis=0)
+            rs2 = tl.sum(r2, axis=0)
+            rs3 = tl.sum(r3, axis=0)
             r0 = r0 / rs0
             r1 = r1 / rs1
             r2 = r2 / rs2
