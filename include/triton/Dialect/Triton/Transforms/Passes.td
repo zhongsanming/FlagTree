@@ -83,10 +83,15 @@ def TritonLanePack : Pass<"triton-lane-pack", "mlir::ModuleOp"> {
   let summary = "Recognize lane-parallel tensor update patterns";
   let description = [{
     This pass recognizes groups of loop-carried Triton tensors that represent
-    independent lanes of the same computation. The first implementation keeps
-    matching strict: all candidate lane values must have the same ranked tensor
-    type, and the pass only targets repeated lane-parallel reduction and
-    normalization structures that can later be rewritten into a packed form.
+    independent lanes of the same computation and packs them into a single
+    tensor with a synthesized leading lane dimension.
+
+    Matching is structural rather than semantic: an operation is lifted when
+    each of its per-lane instances computes the same math and its operands are
+    either already packed or lane-invariant. Associative combines across the
+    lanes (for example an add tree over all lanes) are recognized as reductions
+    over the lane axis. Any operation whose packed form is mathematically
+    equivalent is allowed.
   }];
 
   let dependentDialects = ["mlir::scf::SCFDialect",
