@@ -320,6 +320,22 @@ static RankedTensorType packedTypeOf(Value v, int64_t laneCount) {
   return RankedTensorType::get(shape, elemTy, enc);
 }
 
+// The packed type an operand of an elementwise op must take: the op broadcasts
+// its operands to the result shape, so use the result's packed shape but keep
+// the operand's element type (e.g. an i1 select condition becomes
+// tensor<[N]x...xi1>).
+static RankedTensorType packedOperandType(Value operand,
+                                          RankedTensorType resultPackedTy) {
+  Type elemTy = isa<RankedTensorType>(operand.getType())
+                    ? cast<RankedTensorType>(operand.getType())
+                          .getElementType()
+                    : operand.getType();
+  if (elemTy == resultPackedTy.getElementType())
+    return resultPackedTy;
+  return RankedTensorType::get(resultPackedTy.getShape(), elemTy,
+                               resultPackedTy.getEncoding());
+}
+
 // Grows an already packed value to dstTy by appending size-1 dims and
 // broadcasting. Used when a scalar-lane packed value meets a tensor-lane one.
 static Value widenPacked(OpBuilder &builder, Location loc, Value v,
@@ -722,7 +738,7 @@ struct Lifter {
     } else {
       SmallVector<Value> operands;
       for (auto [a, pv] : llvm::zip(op->getOperands(), pvs)) {
-        Value v = materialize(builder, loc, pv, packedTypeOf(a, n));
+        Value v = materialize(builder, loc, pv, packedOperandType(a, resultTy));
         if (!v)
           return failure();
         operands.push_back(v);

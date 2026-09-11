@@ -599,4 +599,16 @@ module {
   // CHECK: math.exp
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
+
+  // A scalar (lane-invariant) select condition must be broadcast to the packed
+  // value shape, not packed to its own lane shape, or arith.select fails.
+  tt.func @select_scalar_condition(%c: i1, %a0: tensor<4xf32>, %a1: tensor<4xf32>, %b0: tensor<4xf32>, %b1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %r0 = arith.select %c, %a0, %b0 : tensor<4xf32>
+    %r1 = arith.select %c, %a1, %b1 : tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @select_scalar_condition(
+  // CHECK: %[[COND:.*]] = tt.splat %{{.*}} : i1 -> tensor<2x4xi1>
+  // CHECK: arith.select %[[COND]],
 }
