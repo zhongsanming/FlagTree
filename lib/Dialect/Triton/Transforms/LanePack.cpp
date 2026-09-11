@@ -870,21 +870,23 @@ struct Lifter {
     // re-cloning it as a shared op would be wrong.
     if (op->getNumResults() == 1 && packedOf.contains(op->getResult(0)))
       return success();
+    // Effectful ops are hard boundaries: never lift or clone them. This must
+    // precede the shared/per-lane attempts, which would otherwise clone e.g. a
+    // load whose operands happen to be resolved.
+    if (!isMemoryEffectFree(op)) {
+      if (blockMode)
+        return success(); // boundary: leave the op in place
+      LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful op " << *op
+                              << "\n");
+      return failure();
+    }
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
       return liftPerLaneOp(op);
     if (succeeded(liftCrossLane(op)))
       return success();
-    // Unmatched: drop it from the packed loop. Only safe for side-effect-free
-    // ops; anything else must abort the rewrite.
-    if (!isMemoryEffectFree(op)) {
-      if (blockMode)
-        return success(); // boundary: leave the op in place
-      LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful unmatched op "
-                              << *op << "\n");
-      return failure();
-    }
+    // Unmatched pure op: drop it from the packed loop.
     LLVM_DEBUG(llvm::dbgs()
                << "[lane-pack] dropping unmatched pure op " << *op << "\n");
     return success();
@@ -1176,6 +1178,17 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       if (!isa<RankedTensorType>(ref.getType())) {
         if (lanePackDebug())
           llvm::errs() << "[lane-pack] cone fail: non-tensor leaf " << ref
+                       << "\n";
+        return failure();
+      }
+      // A leaf produced by a side-effecting op is a hard boundary: packing it
+      // would concatenate memory results, i.e. memory vectorization, which is
+      // left to other passes. With correct op effects this covers loads,
+      // copies and buffer materialisations such as tile.to_tensor.
+      if (Operation *def = ref.getDefiningOp();
+          def && !isMemoryEffectFree(def)) {
+        if (lanePackDebug())
+          llvm::errs() << "[lane-pack] cone fail: effectful leaf " << ref
                        << "\n";
         return failure();
       }

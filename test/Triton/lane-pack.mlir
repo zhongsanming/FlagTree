@@ -752,4 +752,18 @@ module {
   // CHECK-LABEL: tt.func @no_pack_addptr(
   // CHECK-NOT: tensor.concat
   // CHECK: tt.return
+
+  // Effectful ops are hard boundaries: a lane group fed by loads must not be
+  // packed into a tensor.concat of the load results.
+  tt.func @no_pack_load_leaves(%p0: tensor<8x!tt.ptr<bf16>>, %p1: tensor<8x!tt.ptr<bf16>>) -> (tensor<8xf32>, tensor<8xf32>) {
+    %l0 = tt.load %p0 : tensor<8x!tt.ptr<bf16>>
+    %l1 = tt.load %p1 : tensor<8x!tt.ptr<bf16>>
+    %e0 = arith.extf %l0 : tensor<8xbf16> to tensor<8xf32>
+    %e1 = arith.extf %l1 : tensor<8xbf16> to tensor<8xf32>
+    tt.return %e0, %e1 : tensor<8xf32>, tensor<8xf32>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_load_leaves(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
 }
