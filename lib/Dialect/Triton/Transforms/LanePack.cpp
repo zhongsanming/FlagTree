@@ -1412,6 +1412,10 @@ static bool rewriteBlock(Block *block, Operation *scope,
     for (Operation *op : lifter.liftedOps)
       if (op->getBlock() == block)
         toErase.push_back(op);
+    // Anything this rewrite consumed or emitted must not become a candidate
+    // again, even if it survives (still used) instead of being erased.
+    for (Operation *op : toErase)
+      skip.insert(op);
     llvm::stable_sort(toErase, [](Operation *a, Operation *b) {
       return a->isBeforeInBlock(b);
     });
@@ -1500,8 +1504,11 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       if (lanePackDebug())
         llvm::errs() << "[lane-pack] block parent=" << parent->getName()
                      << " visiting\n";
-      while (rewriteBlock(block, parent, packedOps))
-        LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
+      // Bound the fixpoint; a block with a great many families still gets
+      // several of them packed without risking an unbounded rewrite loop.
+      unsigned rewrites = 0;
+      while (rewrites < 64 && rewriteBlock(block, parent, packedOps))
+        ++rewrites;
     }
   }
 };
