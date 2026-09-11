@@ -531,4 +531,70 @@ module {
   // CHECK-LABEL: tt.func @prologue_feeds_packed_loop(
   // CHECK: tensor.concat
   // CHECK: arith.addf
+
+  tt.func @softmax_prologue_feeds_packed_loop(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %m0 = "tt.reduce"(%x0) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxnumf %a, %b : f32
+      tt.reduce.return %mx : f32
+    }) : (tensor<4xf32>) -> f32
+    %m1 = "tt.reduce"(%x1) <{axis = 0 : i32}> ({
+    ^bb0(%c: f32, %d: f32):
+      %mx1 = arith.maxnumf %c, %d : f32
+      tt.reduce.return %mx1 : f32
+    }) : (tensor<4xf32>) -> f32
+    %mb0 = tt.splat %m0 : f32 -> tensor<4xf32>
+    %mb1 = tt.splat %m1 : f32 -> tensor<4xf32>
+    %e0 = arith.subf %x0, %mb0 : tensor<4xf32>
+    %e1 = arith.subf %x1, %mb1 : tensor<4xf32>
+    %ex0 = math.exp %e0 : tensor<4xf32>
+    %ex1 = math.exp %e1 : tensor<4xf32>
+    %s0 = "tt.reduce"(%ex0) <{axis = 0 : i32}> ({
+    ^bb0(%e: f32, %f: f32):
+      %sm = arith.addf %e, %f : f32
+      tt.reduce.return %sm : f32
+    }) : (tensor<4xf32>) -> f32
+    %s1 = "tt.reduce"(%ex1) <{axis = 0 : i32}> ({
+    ^bb0(%g: f32, %h: f32):
+      %sm1 = arith.addf %g, %h : f32
+      tt.reduce.return %sm1 : f32
+    }) : (tensor<4xf32>) -> f32
+    %sb0 = tt.splat %s0 : f32 -> tensor<4xf32>
+    %sb1 = tt.splat %s1 : f32 -> tensor<4xf32>
+    %o0 = arith.divf %ex0, %sb0 : tensor<4xf32>
+    %o1 = arith.divf %ex1, %sb1 : tensor<4xf32>
+    %cs = arith.addf %o0, %o1 : tensor<4xf32>
+    %cst = arith.constant dense<1.000000e-06> : tensor<4xf32>
+    %cs2 = arith.addf %cs, %cst : tensor<4xf32>
+    %r0 = arith.divf %o0, %cs2 : tensor<4xf32>
+    %r1 = arith.divf %o1, %cs2 : tensor<4xf32>
+    %c = arith.constant dense<[1, 4]> : tensor<2xi64>
+    %rs0 = tensor.reshape %r0(%c) : (tensor<4xf32>, tensor<2xi64>) -> tensor<1x4xf32>
+    %rs1 = tensor.reshape %r1(%c) : (tensor<4xf32>, tensor<2xi64>) -> tensor<1x4xf32>
+    %concat = tensor.concat dim(0) %rs0, %rs1 : (tensor<1x4xf32>, tensor<1x4xf32>) -> tensor<2x4xf32>
+    %0 = scf.for %i = %lb to %ub step %step iter_args(%acc = %concat) -> (tensor<2x4xf32>) {
+      %rd = "tt.reduce"(%acc) <{axis = 1 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b : f32
+        tt.reduce.return %s : f32
+      }) : (tensor<2x4xf32>) -> tensor<2xf32>
+      %ed = tt.expand_dims %rd {axis = 1 : i32} : tensor<2xf32> -> tensor<2x1xf32>
+      %bc = tt.broadcast %ed : tensor<2x1xf32> -> tensor<2x4xf32>
+      %d = arith.divf %acc, %bc : tensor<2x4xf32>
+      scf.yield %d : tensor<2x4xf32>
+    }
+    %c2 = arith.constant dense<4> : tensor<1xi64>
+    %es0 = tensor.extract_slice %0[0, 0] [1, 4] [1, 1] : tensor<2x4xf32> to tensor<1x4xf32>
+    %res0 = tensor.reshape %es0(%c2) : (tensor<1x4xf32>, tensor<1xi64>) -> tensor<4xf32>
+    %es1 = tensor.extract_slice %0[1, 0] [1, 4] [1, 1] : tensor<2x4xf32> to tensor<1x4xf32>
+    %res1 = tensor.reshape %es1(%c2) : (tensor<1x4xf32>, tensor<1xi64>) -> tensor<4xf32>
+    tt.return %res0, %res1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @softmax_prologue_feeds_packed_loop(
+  // CHECK: tensor.concat
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+  // CHECK: math.exp
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
 }
