@@ -285,29 +285,6 @@ static bool isLiftableOp(Operation *op) {
   return isPackableElementwise(op) && op->getNumRegions() == 0;
 }
 
-// A lane leaf is only usable when it is pure arithmetic over compute values.
-// A value produced by anything that touches memory -- an effectful op, or a
-// view/materialisation that consumes a buffer, memref or pointer (tt.load,
-// tile.to_tensor, tile.copy, tt.addptr, ...) -- is a memory boundary. Packing
-// it would concatenate memory results, i.e. memory vectorization, which is
-// deliberately left to other passes. Note some materialisations (tile.to_tensor)
-// are declared Pure, so the effect check alone is not enough; the operand type
-// check catches them.
-static bool isMemoryBoundary(Operation *def) {
-  if (!def)
-    return false;
-  if (!isMemoryEffectFree(def))
-    return true;
-  for (Value operand : def->getOperands()) {
-    Type type = operand.getType();
-    if (isa<TensorType, VectorType, IntegerType, FloatType, IndexType,
-            ComplexType>(type))
-      continue;
-    return true;
-  }
-  return false;
-}
-
 static void collectAssociativeLeaves(Value v, StringRef opName,
                                      SmallVectorImpl<Value> &leaves) {
   if (Operation *def = v.getDefiningOp()) {
@@ -893,23 +870,21 @@ struct Lifter {
     // re-cloning it as a shared op would be wrong.
     if (op->getNumResults() == 1 && packedOf.contains(op->getResult(0)))
       return success();
-    // Effectful ops are hard boundaries: never lift, clone, or pack them. This
-    // must precede the shared/per-lane attempts, which would otherwise clone
-    // e.g. a load whose operands happen to be resolved.
-    if (!isMemoryEffectFree(op)) {
-      if (blockMode)
-        return success(); // boundary: leave the op in place
-      LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful op " << *op
-                              << "\n");
-      return failure();
-    }
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
       return liftPerLaneOp(op);
     if (succeeded(liftCrossLane(op)))
       return success();
-    // Unmatched pure op: drop it from the packed loop.
+    // Unmatched: drop it from the packed loop. Only safe for side-effect-free
+    // ops; anything else must abort the rewrite.
+    if (!isMemoryEffectFree(op)) {
+      if (blockMode)
+        return success(); // boundary: leave the op in place
+      LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful unmatched op "
+                              << *op << "\n");
+      return failure();
+    }
     LLVM_DEBUG(llvm::dbgs()
                << "[lane-pack] dropping unmatched pure op " << *op << "\n");
     return success();
@@ -1201,13 +1176,6 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       if (!isa<RankedTensorType>(ref.getType())) {
         if (lanePackDebug())
           llvm::errs() << "[lane-pack] cone fail: non-tensor leaf " << ref
-                       << "\n";
-        return failure();
-      }
-      // Never pack across a memory boundary.
-      if (isMemoryBoundary(ref.getDefiningOp())) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: memory boundary leaf " << ref
                        << "\n";
         return failure();
       }
