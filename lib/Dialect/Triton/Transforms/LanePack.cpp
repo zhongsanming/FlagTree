@@ -293,7 +293,9 @@ struct Lifter {
         laneImages(n) {}
 
   void seed(Value packedInit) {
-    initLanes.assign(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
+    // The loop body operates on the region iter args, not the init args.
+    auto iterArgs = forOp.getRegionIterArgs();
+    initLanes.assign(iterArgs.begin(), iterArgs.end());
     packedOf[initLanes[0]] = {packedInit, false};
     referenceOrder.push_back(initLanes[0]);
     for (unsigned i = 1; i < n; ++i)
