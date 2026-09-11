@@ -327,11 +327,83 @@ module {
       %row1 = arith.divf %lane1, %den1 : tensor<4xf32>
 
       %extra = arith.addf %row0, %row0 : tensor<4xf32>
-      scf.yield %row0, %row1 : tensor<4xf32>, tensor<4xf32>
+      scf.yield %extra, %row1 : tensor<4xf32>, tensor<4xf32>
     }
     tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
   }
 
   // CHECK-LABEL: tt.func @reject_unmatched_extra_op(
+  // CHECK-NOT: tensor.concat
+
+  tt.func @row_softmax(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %m0 = "tt.reduce"(%lane0) <{axis = 0 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %mx = arith.maximumf %a, %b : f32
+        tt.reduce.return %mx : f32
+      }) : (tensor<4xf32>) -> f32
+      %mb0 = tt.splat %m0 : f32 -> tensor<4xf32>
+      %e0 = arith.subf %lane0, %mb0 : tensor<4xf32>
+      %ex0 = math.exp %e0 : tensor<4xf32>
+      %s0 = "tt.reduce"(%ex0) <{axis = 0 : i32}> ({
+      ^bb0(%c: f32, %d: f32):
+        %sm = arith.addf %c, %d : f32
+        tt.reduce.return %sm : f32
+      }) : (tensor<4xf32>) -> f32
+      %sb0 = tt.splat %s0 : f32 -> tensor<4xf32>
+      %out0 = arith.divf %ex0, %sb0 : tensor<4xf32>
+
+      %m1 = "tt.reduce"(%lane1) <{axis = 0 : i32}> ({
+      ^bb0(%a0: f32, %b0: f32):
+        %mx1 = arith.maximumf %a0, %b0 : f32
+        tt.reduce.return %mx1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %mb1 = tt.splat %m1 : f32 -> tensor<4xf32>
+      %e1 = arith.subf %lane1, %mb1 : tensor<4xf32>
+      %ex1 = math.exp %e1 : tensor<4xf32>
+      %s1 = "tt.reduce"(%ex1) <{axis = 0 : i32}> ({
+      ^bb0(%c0: f32, %d0: f32):
+        %sm1 = arith.addf %c0, %d0 : f32
+        tt.reduce.return %sm1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %sb1 = tt.splat %s1 : f32 -> tensor<4xf32>
+      %out1 = arith.divf %ex1, %sb1 : tensor<4xf32>
+      scf.yield %out0, %out1 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @row_softmax(
+  // CHECK: tensor.concat
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+  // CHECK: math.exp
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+  tt.func @clamp_lanes(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lo: tensor<4xf32>, %hi: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %c0 = arith.maximumf %lane0, %lo : tensor<4xf32>
+      %d0 = arith.minimumf %c0, %hi : tensor<4xf32>
+      %c1 = arith.maximumf %lane1, %lo : tensor<4xf32>
+      %d1 = arith.minimumf %c1, %hi : tensor<4xf32>
+      scf.yield %d0, %d1 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @clamp_lanes(
+  // CHECK: tensor.concat
+  // CHECK: arith.maximumf
+  // CHECK: arith.minimumf
+
+  tt.func @reject_divergent_lanes(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %a = arith.addf %lane0, %lane0 : tensor<4xf32>
+      %b = arith.mulf %lane1, %lane1 : tensor<4xf32>
+      scf.yield %a, %b : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @reject_divergent_lanes(
   // CHECK-NOT: tensor.concat
 }
