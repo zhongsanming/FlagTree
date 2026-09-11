@@ -406,4 +406,32 @@ module {
 
   // CHECK-LABEL: tt.func @reject_divergent_lanes(
   // CHECK-NOT: tensor.concat
+
+  tt.func @mixed_iter_args(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %acc0: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>, f32) {
+    %0:3 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1, %acc = %acc0) -> (tensor<4xf32>, tensor<4xf32>, f32) {
+      %r0 = "tt.reduce"(%lane0) <{axis = 0 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %sum0 = arith.addf %a, %b : f32
+        tt.reduce.return %sum0 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den0 = tt.splat %r0 : f32 -> tensor<4xf32>
+      %row0 = arith.divf %lane0, %den0 : tensor<4xf32>
+
+      %r1 = "tt.reduce"(%lane1) <{axis = 0 : i32}> ({
+      ^bb0(%a0: f32, %b0: f32):
+        %sum1 = arith.addf %a0, %b0 : f32
+        tt.reduce.return %sum1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %den1 = tt.splat %r1 : f32 -> tensor<4xf32>
+      %row1 = arith.divf %lane1, %den1 : tensor<4xf32>
+
+      %acc2 = arith.addf %acc, %acc : f32
+      scf.yield %row0, %row1, %acc2 : tensor<4xf32>, tensor<4xf32>, f32
+    }
+    tt.return %0#0, %0#1, %0#2 : tensor<4xf32>, tensor<4xf32>, f32
+  }
+
+  // CHECK-LABEL: tt.func @mixed_iter_args(
+  // CHECK: tensor.concat
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
 }
