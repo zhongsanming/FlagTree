@@ -47,6 +47,9 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
+#include <vector>
+
 #define DEBUG_TYPE "lane-pack"
 
 namespace mlir::triton {
@@ -1028,32 +1031,80 @@ static bool sameOpStructure(Operation *a, Operation *b) {
 // by shallow structure.
 static SmallVector<SmallVector<Value>>
 findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
-  SmallVector<SmallVector<Value>> groups;
+  // Largest lane group we are willing to synthesize. A real family is small;
+  // anything larger is almost certainly a mistaken merge and would blow up the
+  // cone/lifter.
+  constexpr unsigned kMaxLanes = 32;
+
+  SmallVector<Value> candidates;
   for (Operation &op : *block) {
     if (skip.contains(&op))
       continue;
     if (op.getNumResults() != 1)
       continue;
-    if (!isa<RankedTensorType>(op.getResult(0).getType()))
-      continue;
-    if (!isPackableElementwise(&op) || op.getNumRegions() != 0)
+    // Reduces (and scalar results, e.g. a per-lane reduce) take part in the
+    // lane structure but cannot seed a cone, so include them in the congruence
+    // refinement even though the final groups are filtered to tensors below.
+    if (!isLiftableOp(&op))
       continue;
     // These are the pack/unpack scaffolding used by this pass itself.
     if (isa<tensor::ReshapeOp, tensor::ExtractSliceOp>(&op))
       continue;
+    candidates.push_back(op.getResult(0));
+  }
+
+  // Initial partition by shallow structure (op + operand/result types +
+  // attributes).
+  SmallVector<SmallVector<Value>> groups;
+  for (Value v : candidates) {
+    Operation *op = v.getDefiningOp();
     bool added = false;
     for (SmallVector<Value> &g : groups) {
-      if (sameOpStructure(&op, g.front().getDefiningOp())) {
-        g.push_back(op.getResult(0));
+      if (sameOpStructure(op, g.front().getDefiningOp())) {
+        g.push_back(v);
         added = true;
         break;
       }
     }
     if (!added)
-      groups.push_back({op.getResult(0)});
+      groups.push_back({v});
   }
-  llvm::erase_if(groups,
-                 [](const SmallVector<Value> &g) { return g.size() < 2; });
+
+  // Refine by operand congruence: two values stay together only if their
+  // corresponding operands live in the same group. A shallow signature merges
+  // every independent instance of the same structure (e.g. all iterations of
+  // an unrolled loop); congruence separates them because iteration N consumes
+  // iteration N-1's results, which are a different group.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    DenseMap<Value, unsigned> groupOf;
+    for (unsigned gi = 0; gi < groups.size(); ++gi)
+      for (Value v : groups[gi])
+        groupOf[v] = gi;
+    SmallVector<SmallVector<Value>> refined;
+    for (SmallVector<Value> &g : groups) {
+      std::map<std::vector<unsigned>, SmallVector<Value>> buckets;
+      for (Value v : g) {
+        std::vector<unsigned> key;
+        for (Value operand : v.getDefiningOp()->getOperands()) {
+          auto it = groupOf.find(operand);
+          key.push_back(it == groupOf.end() ? 0 : it->second + 1);
+        }
+        buckets[key].push_back(v);
+      }
+      if (buckets.size() > 1)
+        changed = true;
+      for (auto &entry : buckets)
+        refined.push_back(entry.second);
+    }
+    groups = std::move(refined);
+  }
+
+  llvm::erase_if(groups, [&](const SmallVector<Value> &g) {
+    return g.size() < 2 || g.size() > kMaxLanes ||
+           !isa<RankedTensorType>(g.front().getType());
+  });
   return groups;
 }
 

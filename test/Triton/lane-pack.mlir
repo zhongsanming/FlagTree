@@ -624,4 +624,84 @@ module {
   // CHECK-LABEL: tt.func @two_families(
   // CHECK: arith.addf %{{.*}} : tensor<2x4xf32>
   // CHECK: arith.mulf %{{.*}} : tensor<2x4xf32>
+
+  // Two unrolled (tl.static_range) iterations must be discovered as two
+  // separate 4-lane families, not merged into one 8-lane bogus group.
+  tt.func @unrolled_families(%a0: tensor<4xf32>, %a1: tensor<4xf32>, %a2: tensor<4xf32>, %a3: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %csu0_0 = arith.addf %a0, %a1 : tensor<4xf32>
+    %csu0_1 = arith.addf %csu0_0, %a2 : tensor<4xf32>
+    %csu0_2 = arith.addf %csu0_1, %a3 : tensor<4xf32>
+    %bu0_0 = arith.divf %a0, %csu0_2 : tensor<4xf32>
+    %bu0_1 = arith.divf %a1, %csu0_2 : tensor<4xf32>
+    %bu0_2 = arith.divf %a2, %csu0_2 : tensor<4xf32>
+    %bu0_3 = arith.divf %a3, %csu0_2 : tensor<4xf32>
+    %rru0_0 = "tt.reduce"(%bu0_0) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ0_0 = tt.splat %rru0_0 : f32 -> tensor<4xf32>
+    %cu0_0 = arith.divf %bu0_0, %squ0_0 : tensor<4xf32>
+    %rru0_1 = "tt.reduce"(%bu0_1) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ0_1 = tt.splat %rru0_1 : f32 -> tensor<4xf32>
+    %cu0_1 = arith.divf %bu0_1, %squ0_1 : tensor<4xf32>
+    %rru0_2 = "tt.reduce"(%bu0_2) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ0_2 = tt.splat %rru0_2 : f32 -> tensor<4xf32>
+    %cu0_2 = arith.divf %bu0_2, %squ0_2 : tensor<4xf32>
+    %rru0_3 = "tt.reduce"(%bu0_3) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ0_3 = tt.splat %rru0_3 : f32 -> tensor<4xf32>
+    %cu0_3 = arith.divf %bu0_3, %squ0_3 : tensor<4xf32>
+    %csu1_0 = arith.addf %cu0_0, %cu0_1 : tensor<4xf32>
+    %csu1_1 = arith.addf %csu1_0, %cu0_2 : tensor<4xf32>
+    %csu1_2 = arith.addf %csu1_1, %cu0_3 : tensor<4xf32>
+    %bu1_0 = arith.divf %cu0_0, %csu1_2 : tensor<4xf32>
+    %bu1_1 = arith.divf %cu0_1, %csu1_2 : tensor<4xf32>
+    %bu1_2 = arith.divf %cu0_2, %csu1_2 : tensor<4xf32>
+    %bu1_3 = arith.divf %cu0_3, %csu1_2 : tensor<4xf32>
+    %rru1_0 = "tt.reduce"(%bu1_0) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ1_0 = tt.splat %rru1_0 : f32 -> tensor<4xf32>
+    %cu1_0 = arith.divf %bu1_0, %squ1_0 : tensor<4xf32>
+    %rru1_1 = "tt.reduce"(%bu1_1) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ1_1 = tt.splat %rru1_1 : f32 -> tensor<4xf32>
+    %cu1_1 = arith.divf %bu1_1, %squ1_1 : tensor<4xf32>
+    %rru1_2 = "tt.reduce"(%bu1_2) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ1_2 = tt.splat %rru1_2 : f32 -> tensor<4xf32>
+    %cu1_2 = arith.divf %bu1_2, %squ1_2 : tensor<4xf32>
+    %rru1_3 = "tt.reduce"(%bu1_3) <{axis = 0 : i32}> ({
+    ^bb0(%p: f32, %q: f32):
+      %s = arith.addf %p, %q : f32
+      tt.reduce.return %s : f32
+    }) : (tensor<4xf32>) -> f32
+    %squ1_3 = tt.splat %rru1_3 : f32 -> tensor<4xf32>
+    %cu1_3 = arith.divf %bu1_3, %squ1_3 : tensor<4xf32>
+    tt.return %cu1_0, %cu1_1, %cu1_2, %cu1_3 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @unrolled_families(
+  // CHECK-NOT: tensor<8x
+  // CHECK: tensor<4x4xf32>
 }
