@@ -440,8 +440,8 @@ struct Lifter {
       return failure();
     if (isa<triton::ReduceOp>(op))
       return liftLaneReduce(cast<triton::ReduceOp>(op));
-    // Shape-changing ops need explicit lane-axis remapping; defer them.
-    if (isa<triton::TransOp, tensor::ReshapeOp>(op))
+    // Shape-changing / region ops need explicit lane-axis remapping; defer.
+    if (isa<triton::TransOp, tensor::ReshapeOp>(op) || op->getNumRegions() != 0)
       return failure();
 
     SmallVector<PackedValue> pvs;
@@ -565,11 +565,10 @@ struct Lifter {
           if (!operand)
             return failure();
         }
-        OperationState state(loc, op->getName());
-        state.addOperands({reduced, operand});
-        state.addTypes(reduced.getType());
-        state.addAttributes(op->getAttrs());
-        reduced = builder.create(state)->getResult(0);
+        IRMapping foldMapping;
+        foldMapping.map(op->getOperand(0), reduced);
+        foldMapping.map(op->getOperand(1), operand);
+        reduced = builder.clone(*op, foldMapping)->getResult(0);
       }
       packedOf[op->getResult(0)] = {reduced, true};
       return success();
