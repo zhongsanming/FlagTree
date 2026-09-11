@@ -22,6 +22,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -237,10 +238,23 @@ static Value materialize(OpBuilder &builder, Location loc, PackedValue pv,
   return builder.create<triton::SplatOp>(loc, dstTy, pv.value);
 }
 
-// Builds a tt.reduce whose combine region is a single instance of `combiner`.
-static Value buildReduceFromCombiner(OpBuilder &builder, Location loc,
-                                     Value src, int64_t axis,
-                                     Operation *combiner) {
+// Builds a tt.reduce over `src` whose combine region is cloned from `proto`.
+// Used for per-lane reduces, where `proto` is the original reduce op.
+static Value buildReduceFromRegion(OpBuilder &builder, Location loc,
+                                   Value src, int64_t axis,
+                                   triton::ReduceOp proto) {
+  auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
+  Region &region = reduce.getCombineOp();
+  IRMapping mapping;
+  proto.getCombineOp().cloneInto(&region, mapping);
+  return reduce->getResult(0);
+}
+
+// Builds a tt.reduce over `src` whose combine region computes a single instance
+// of `kind`. Used for cross-lane tree reductions, where `kind` is a top-level
+// associative op rather than an op nested in a reduce region.
+static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
+                                 int64_t axis, Operation *kind) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
   Region &region = reduce.getCombineOp();
   Block *block = builder.createBlock(&region);
@@ -249,10 +263,10 @@ static Value buildReduceFromCombiner(OpBuilder &builder, Location loc,
   block->addArgument(elemTy, loc);
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(block);
-  OperationState state(loc, combiner->getName());
+  OperationState state(loc, kind->getName());
   state.addOperands({block->getArgument(0), block->getArgument(1)});
   state.addTypes(elemTy);
-  state.addAttributes(combiner->getAttrs());
+  state.addAttributes(kind->getAttrs());
   Operation *c = builder.create(state);
   builder.create<triton::ReduceReturnOp>(loc, c->getResult(0));
   return reduce->getResult(0);
@@ -349,7 +363,9 @@ struct Lifter {
         continue;
       if (u->getNumResults() != refOp->getNumResults())
         continue;
-      if (u->getAttrs() != refOp->getAttrs())
+      if (!OperationEquivalence::isEquivalentTo(
+              refOp, u, OperationEquivalence::ignoreValueEquivalence, nullptr,
+              OperationEquivalence::Flags::IgnoreLocations))
         continue;
       if (!llvm::equal(u->getOperands(), expected))
         continue;
@@ -359,14 +375,13 @@ struct Lifter {
   }
 
   Value emitClonedOp(Operation *op, ValueRange operands, TypeRange resultTypes) {
-    OperationState state(loc, op->getName());
-    state.addOperands(operands);
-    state.addTypes(resultTypes);
-    state.addAttributes(op->getAttrs());
     IRMapping mapping;
-    for (Region &r : op->getRegions())
-      r.cloneInto(state.addRegion(), mapping);
-    return builder.create(state)->getResult(0);
+    for (auto [from, to] : llvm::zip(op->getOperands(), operands))
+      mapping.map(from, to);
+    Operation *newOp = builder.clone(*op, mapping);
+    for (auto [result, type] : llvm::zip(newOp->getResults(), resultTypes))
+      result.setType(type);
+    return newOp->getResult(0);
   }
 
   // Lane-invariant op inside the loop: clone it (with already packed operands)
@@ -410,8 +425,8 @@ struct Lifter {
       laneOps.push_back(oi);
     }
 
-    Value packed = buildReduceFromCombiner(builder, loc, pv->value,
-                                           reduce.getAxis() + 1, combiner);
+    Value packed = buildReduceFromRegion(builder, loc, pv->value,
+                                         reduce.getAxis() + 1, reduce);
     packedOf[reduce->getResult(0)] = {packed, false};
     referenceOrder.push_back(reduce->getResult(0));
     for (unsigned i = 1; i < n; ++i)
@@ -534,7 +549,7 @@ struct Lifter {
         continue;
 
       Value reduced =
-          buildReduceFromCombiner(builder, loc, pvIt->second.value, 0, op);
+          buildReduceFromKind(builder, loc, pvIt->second.value, 0, op);
       for (Value l : leaves) {
         if (expectedSet.contains(l.getAsOpaquePointer()))
           continue;
