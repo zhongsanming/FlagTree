@@ -43,6 +43,16 @@ namespace mlir::triton {
 
 namespace {
 
+// Debug logging. On by default for the current diagnostic round; set
+// LANE_PACK_DEBUG=0 to silence it.
+static bool lanePackDebug() {
+  static const bool enabled = [] {
+    const char *v = ::getenv("LANE_PACK_DEBUG");
+    return !v || llvm::StringRef(v) != "0";
+  }();
+  return enabled;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -767,6 +777,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
 
   auto initArgs = forOp.getInitArgs();
   unsigned m = initArgs.size();
+  if (lanePackDebug())
+    llvm::errs() << "[lane-pack] loop: iterArgs=" << m << "\n";
   if (m < 2)
     return failure();
 
@@ -855,6 +867,8 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
   for (unsigned j = 0; j < m; ++j)
     forOp.getResult(j).replaceAllUsesWith(newResults[j]);
   packedBodies.insert(newFor.getBody());
+  if (lanePackDebug())
+    llvm::errs() << "[lane-pack] loop packed: lanes=" << n << "\n";
   forOp.erase();
   return success();
 }
@@ -949,8 +963,12 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
     }
 
     if (isLeaf) {
-      if (!isa<RankedTensorType>(ref.getType()))
+      if (!isa<RankedTensorType>(ref.getType())) {
+        if (lanePackDebug())
+          llvm::errs() << "[lane-pack] cone fail: non-tensor leaf " << ref
+                       << "\n";
         return failure();
+      }
       cone.leafGroups.push_back(group);
       continue;
     }
@@ -965,8 +983,12 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
                        [&](Value v) { return v == operands.front(); }))
         continue; // lane-invariant
       Type ty = operands.front().getType();
-      if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; }))
+      if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; })) {
+        if (lanePackDebug())
+          llvm::errs() << "[lane-pack] cone fail: operand type mismatch at "
+                       << op0->getName() << " operand " << k << "\n";
         return failure();
+      }
       worklist.push_back(operands);
     }
   }
@@ -1022,10 +1044,21 @@ static bool rewriteBlock(Block *block, Operation *scope) {
   for (SmallVector<Value> &g : siblingGroups)
     candidates.push_back(std::move(g));
 
+  if (lanePackDebug())
+    llvm::errs() << "[lane-pack] rewriteBlock("
+                 << block->getParentOp()->getName()
+                 << ") boundary=" << (boundary ? boundary->sources.size() : 0)
+                 << " candidates=" << candidates.size() << "\n";
+
   for (unsigned ci = 0; ci < candidates.size(); ++ci) {
     SmallVector<Value> &seed = candidates[ci];
     bool isBoundarySeed = boundary && ci == 0;
     FailureOr<Cone> cone = discoverCone(seed);
+    if (lanePackDebug())
+      llvm::errs() << "[lane-pack]   cand " << ci << " n=" << seed.size()
+                   << " boundarySeed=" << isBoundarySeed << " cone="
+                   << (failed(cone) ? "FAIL" : "ok") << " refOps="
+                   << (failed(cone) ? 0 : (int)cone->refOps.size()) << "\n";
     if (failed(cone))
       continue;
 
@@ -1033,8 +1066,11 @@ static bool rewriteBlock(Block *block, Operation *scope) {
     for (Operation *op : cone->refOps)
       if (!insertBefore || op->isBeforeInBlock(insertBefore))
         insertBefore = op;
-    if (!insertBefore)
+    if (!insertBefore) {
+      if (lanePackDebug())
+        llvm::errs() << "[lane-pack]   skip: no ref op\n";
       continue;
+    }
 
     bool ok = true;
     for (SmallVector<Value> &g : cone->leafGroups) {
@@ -1048,8 +1084,11 @@ static bool rewriteBlock(Block *block, Operation *scope) {
       if (!ok)
         break;
     }
-    if (!ok)
+    if (!ok) {
+      if (lanePackDebug())
+        llvm::errs() << "[lane-pack]   skip: leaf after cone start\n";
       continue;
+    }
 
     OpBuilder builder(insertBefore);
     Location loc = insertBefore->getLoc();
@@ -1069,6 +1108,9 @@ static bool rewriteBlock(Block *block, Operation *scope) {
       (void)lifter.liftOp(op);
       op = next;
     }
+    if (lanePackDebug())
+      llvm::errs() << "[lane-pack]   lifted=" << lifter.liftedOps.size()
+                   << "\n";
 
     // If this cone is the producer of a pack boundary, hand the packed result
     // straight to the concat's users instead of unpacking and re-packing.
@@ -1187,16 +1229,32 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
         for (Block &block : region)
           blocks.push_back(&block);
     });
+    if (lanePackDebug())
+      llvm::errs() << "[lane-pack] run: blocks=" << blocks.size()
+                   << " packedBodies=" << packedBodies.size() << "\n";
     for (Block *block : blocks) {
-      if (packedBodies.contains(block))
+      Operation *parent = block->getParentOp();
+      if (packedBodies.contains(block)) {
+        if (lanePackDebug())
+          llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+                       << " skip=packedBody\n";
         continue;
+      }
       // Loop bodies with iter args are the loop rewrite's job; only pack
       // straight-line code (e.g. the body of the outer token loop, which has no
       // iter args).
-      if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp()))
-        if (forOp.getNumRegionIterArgs() > 0)
+      if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+        if (forOp.getNumRegionIterArgs() > 0) {
+          if (lanePackDebug())
+            llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+                         << " skip=loopWithIterArgs\n";
           continue;
-      if (rewriteBlock(block, block->getParentOp()))
+        }
+      }
+      if (lanePackDebug())
+        llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+                     << " visiting\n";
+      if (rewriteBlock(block, parent))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
     }
   }
