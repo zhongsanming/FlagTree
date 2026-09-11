@@ -357,6 +357,9 @@ struct Lifter {
   SmallVector<Value> sharedRefs;
   // Original operations replaced by the packed computation.
   SmallPtrSet<Operation *, 32> liftedOps;
+  // Diagnostic budget for temporary per-op logging.
+  int debugBudget = 30;
+  int opBudget = 25;
   // laneImages[i][ref] is the lane-i value corresponding to reference value
   // `ref` (lane 0). laneImages[0] is unused (identity).
   SmallVector<DenseMap<Value, Value>> laneImages;
@@ -468,8 +471,12 @@ struct Lifter {
         continue;
       }
       Value img = laneImages[lane].lookup(a);
-      if (!img)
+      if (!img) {
+        if (lanePackDebug() && debugBudget-- > 0)
+          llvm::errs() << "[lane-pack]       no lane image for " << a
+                       << " lane=" << lane << " in " << *refOp << "\n";
         return nullptr;
+      }
       expected.push_back(img);
     }
     if (expected.empty())
@@ -489,6 +496,13 @@ struct Lifter {
       if (!llvm::equal(u->getOperands(), expected))
         continue;
       return u;
+    }
+    if (lanePackDebug() && debugBudget-- > 0) {
+      llvm::errs() << "[lane-pack]       no sibling for lane=" << lane << " "
+                   << *refOp << " expected:";
+      for (Value e : expected)
+        llvm::errs() << " " << e;
+      llvm::errs() << "\n";
     }
     return nullptr;
   }
@@ -525,22 +539,38 @@ struct Lifter {
     if (reduce->getNumOperands() != 1 || reduce->getNumResults() != 1)
       return failure();
     Operation *combiner = reduce.getSingleCombiner();
-    if (!combiner || !isAssociativeCombine(combiner))
+    if (!combiner || !isAssociativeCombine(combiner)) {
+      if (lanePackDebug() && debugBudget-- > 0)
+        llvm::errs() << "[lane-pack]     reduce combiner not associative: "
+                     << *reduce << "\n";
       return failure();
+    }
     Value src = reduce.getOperand(0);
     auto pv = getPacked(src);
-    if (!pv || pv->shared)
+    if (!pv || pv->shared) {
+      if (lanePackDebug() && debugBudget-- > 0)
+        llvm::errs() << "[lane-pack]     reduce src unresolved/shared: "
+                     << *reduce << "\n";
       return failure();
+    }
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
       Operation *oi = findLaneOp(reduce, i);
-      if (!oi)
+      if (!oi) {
+        if (lanePackDebug() && debugBudget-- > 0)
+          llvm::errs() << "[lane-pack]     reduce findLaneOp fail lane=" << i
+                       << " : " << *reduce << "\n";
         return failure();
+      }
       auto other = dyn_cast<triton::ReduceOp>(oi);
       if (!other || !other.getSingleCombiner() ||
-          other.getSingleCombiner()->getName() != combiner->getName())
+          other.getSingleCombiner()->getName() != combiner->getName()) {
+        if (lanePackDebug() && debugBudget-- > 0)
+          llvm::errs() << "[lane-pack]     reduce combiner mismatch lane=" << i
+                       << " : " << *oi << "\n";
         return failure();
+      }
       laneOps.push_back(oi);
     }
 
@@ -562,22 +592,34 @@ struct Lifter {
       return failure();
     if (isa<triton::ReduceOp>(op))
       return liftLaneReduce(cast<triton::ReduceOp>(op));
-    if (op->getNumRegions() != 0 || !isPackableElementwise(op))
+    if (op->getNumRegions() != 0 || !isPackableElementwise(op)) {
+      if (lanePackDebug() && debugBudget-- > 0)
+        llvm::errs() << "[lane-pack]     not liftable elementwise: "
+                     << op->getName() << "\n";
       return failure();
+    }
 
     SmallVector<PackedValue> pvs;
     for (Value a : op->getOperands()) {
       auto pv = getPacked(a);
-      if (!pv)
+      if (!pv) {
+        if (lanePackDebug() && debugBudget-- > 0)
+          llvm::errs() << "[lane-pack]     operand unresolved: " << *op
+                       << "  via " << a << "\n";
         return failure();
+      }
       pvs.push_back(*pv);
     }
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
       Operation *oi = findLaneOp(op, i);
-      if (!oi)
+      if (!oi) {
+        if (lanePackDebug() && debugBudget-- > 0)
+          llvm::errs() << "[lane-pack]     findLaneOp fail lane=" << i
+                       << " : " << *op << "\n";
         return failure();
+      }
       laneOps.push_back(oi);
     }
 
@@ -723,6 +765,10 @@ struct Lifter {
   }
 
   LogicalResult liftOp(Operation *op) {
+    if (lanePackDebug() && opBudget-- > 0)
+      llvm::errs() << "[lane-pack]   try " << op->getName()
+                   << " allShared=" << allOperandsShared(op)
+                   << " allResolved=" << allOperandsResolved(op) << "\n";
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
