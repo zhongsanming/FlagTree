@@ -611,4 +611,17 @@ module {
   // CHECK-LABEL: tt.func @select_scalar_condition(
   // CHECK: %[[COND:.*]] = tt.splat %{{.*}} : i1 -> tensor<2x4xi1>
   // CHECK: arith.select %[[COND]],
+
+  // Two independent lane families in the same block must both be packed.
+  tt.func @two_families(%a0: tensor<4xf32>, %a1: tensor<4xf32>, %b0: tensor<4xf32>, %b1: tensor<4xf32>, %c0: tensor<4xf32>, %c1: tensor<4xf32>, %d0: tensor<4xf32>, %d1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %r0 = arith.addf %a0, %a1 : tensor<4xf32>
+    %r1 = arith.addf %b0, %b1 : tensor<4xf32>
+    %s0 = arith.mulf %c0, %c1 : tensor<4xf32>
+    %s1 = arith.mulf %d0, %d1 : tensor<4xf32>
+    tt.return %r0, %r1, %s0, %s1 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @two_families(
+  // CHECK: arith.addf %{{.*}} : tensor<2x4xf32>
+  // CHECK: arith.mulf %{{.*}} : tensor<2x4xf32>
 }

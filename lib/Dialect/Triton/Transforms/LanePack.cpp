@@ -1026,9 +1026,12 @@ static bool sameOpStructure(Operation *a, Operation *b) {
 
 // Candidate lane groups in a block: single-result packable tensor ops grouped
 // by shallow structure.
-static SmallVector<SmallVector<Value>> findSiblingGroups(Block *block) {
+static SmallVector<SmallVector<Value>>
+findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
   SmallVector<SmallVector<Value>> groups;
   for (Operation &op : *block) {
+    if (skip.contains(&op))
+      continue;
     if (op.getNumResults() != 1)
       continue;
     if (!isa<RankedTensorType>(op.getResult(0).getType()))
@@ -1082,17 +1085,29 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
 
     Operation *op0 = ref.getDefiningOp();
     bool isLeaf = !op0 || !isLiftableOp(op0);
+    bool mismatchedComputational = false;
     if (!isLeaf) {
       for (unsigned i = 1; i < cone.n; ++i) {
         Operation *oi = group[i].getDefiningOp();
         if (!oi || !sameOpStructure(op0, oi)) {
           isLeaf = true;
+          mismatchedComputational = true;
           break;
         }
       }
     }
 
     if (isLeaf) {
+      // A group of liftable ops that are not structurally identical is not a
+      // lane family, just unrelated ops that happen to share a shallow
+      // signature. Packing them would be correct but pointless and can blow up
+      // the fixpoint, so reject the whole cone.
+      if (mismatchedComputational) {
+        if (lanePackDebug())
+          llvm::errs() << "[lane-pack] cone fail: mixed computational leaf at "
+                       << op0->getName() << "\n";
+        return failure();
+      }
       if (!isa<RankedTensorType>(ref.getType())) {
         if (lanePackDebug())
           llvm::errs() << "[lane-pack] cone fail: non-tensor leaf " << ref
@@ -1134,8 +1149,11 @@ struct ConcatBoundary {
   SmallVector<Value> sources;
 };
 
-static std::optional<ConcatBoundary> findConcatBoundary(Block *block) {
+static std::optional<ConcatBoundary>
+findConcatBoundary(Block *block, const DenseSet<Operation *> &skip) {
   for (Operation &op : *block) {
+    if (skip.contains(&op))
+      continue;
     auto concat = dyn_cast<tensor::ConcatOp>(&op);
     if (!concat)
       continue;
@@ -1160,12 +1178,19 @@ static std::optional<ConcatBoundary> findConcatBoundary(Block *block) {
 
 // Packs one lane cone in a straight-line block. Returns true if anything was
 // rewritten.
-static bool rewriteBlock(Block *block, Operation *scope) {
+static bool rewriteBlock(Block *block, Operation *scope,
+                         DenseSet<Operation *> &skip) {
+  // Snapshot so that, on success, every op the rewrite emitted can be marked
+  // and excluded from later fixpoint iterations in the same block.
+  SmallPtrSet<Operation *, 32> before;
+  for (Operation &op : *block)
+    before.insert(&op);
+
   SmallVector<SmallVector<Value>> candidates;
-  std::optional<ConcatBoundary> boundary = findConcatBoundary(block);
+  std::optional<ConcatBoundary> boundary = findConcatBoundary(block, skip);
   if (boundary)
     candidates.push_back(boundary->sources);
-  SmallVector<SmallVector<Value>> siblingGroups = findSiblingGroups(block);
+  SmallVector<SmallVector<Value>> siblingGroups = findSiblingGroups(block, skip);
   llvm::stable_sort(siblingGroups,
                     [](const SmallVector<Value> &a,
                        const SmallVector<Value> &b) {
@@ -1356,6 +1381,11 @@ static bool rewriteBlock(Block *block, Operation *scope) {
         llvm::errs() << "[lane-pack]   no-op candidate, trying next\n";
       continue;
     }
+    // Mark every op this rewrite emitted so later fixpoint iterations in the
+    // same block do not re-pack them.
+    for (Operation &op : *block)
+      if (!before.contains(&op))
+        skip.insert(&op);
     return true;
   }
   return false;
@@ -1377,7 +1407,8 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
 
     // Straight-line packing runs on every block (the lane-parallel prologue is
     // often inside an outer loop body), except the loop bodies already produced
-    // by the loop rewrite.
+    // by the loop rewrite. Each block is rewritten to a fixpoint so several
+    // independent lane cones can be packed.
     SmallVector<Block *> blocks;
     getOperation().walk([&](Operation *op) {
       for (Region &region : op->getRegions())
@@ -1387,6 +1418,7 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
     if (lanePackDebug())
       llvm::errs() << "[lane-pack] run: blocks=" << blocks.size()
                    << " packedBodies=" << packedBodies.size() << "\n";
+    DenseSet<Operation *> packedOps;
     for (Block *block : blocks) {
       Operation *parent = block->getParentOp();
       if (packedBodies.contains(block)) {
@@ -1409,7 +1441,7 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       if (lanePackDebug())
         llvm::errs() << "[lane-pack] block parent=" << parent->getName()
                      << " visiting\n";
-      if (rewriteBlock(block, parent))
+      while (rewriteBlock(block, parent, packedOps))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
     }
   }
