@@ -722,4 +722,20 @@ module {
   // CHECK: tensor.concat
   // CHECK: arith.cmpi
   // CHECK: arith.select
+
+  // An external use that precedes an interleaved leaf must keep the original
+  // computation; only uses at/after the emission point get the unpacked value.
+  tt.func @external_use_before_emission(%a0: tensor<8xf32>, %a1: tensor<8xf32>, %b0: tensor<8xf32>, %b1: tensor<8xf32>) -> (tensor<8xf32>, tensor<8xf32>) {
+    %r0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %cst = arith.constant dense<0> : tensor<8xi32>
+    %c0 = arith.cmpi slt, %r0, %cst : tensor<8xi32>
+    %s0 = arith.select %c0, %a0, %b0 : tensor<8xi1>, tensor<8xf32>
+    %r1 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %c1 = arith.cmpi slt, %r1, %cst : tensor<8xi32>
+    %s1 = arith.select %c1, %a1, %b1 : tensor<8xi1>, tensor<8xf32>
+    tt.return %s0, %s1 : tensor<8xf32>, tensor<8xf32>
+  }
+
+  // CHECK-LABEL: tt.func @external_use_before_emission(
+  // CHECK: tensor.concat
 }
