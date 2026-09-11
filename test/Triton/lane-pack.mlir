@@ -766,4 +766,21 @@ module {
   // CHECK-LABEL: tt.func @no_pack_load_leaves(
   // CHECK-NOT: tensor.concat
   // CHECK: tt.return
+
+  // Addressing is not packing-eligible either: tt.ptr_to_int has a compute
+  // (i64) result but a pointer operand, so it must not be lifted into a
+  // tensor.concat of pointer tensors.
+  tt.func @no_pack_ptr_to_int(%ptrs: tensor<8x!tt.ptr<f32>>) -> (tensor<8xi64>, tensor<8xi64>) {
+    %c0 = arith.constant dense<0> : tensor<8xi32>
+    %c1 = arith.constant dense<1> : tensor<8xi32>
+    %p0 = tt.addptr %ptrs, %c0 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
+    %p1 = tt.addptr %ptrs, %c1 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
+    %i0 = tt.ptr_to_int %p0 : tensor<8x!tt.ptr<f32>> -> tensor<8xi64>
+    %i1 = tt.ptr_to_int %p1 : tensor<8x!tt.ptr<f32>> -> tensor<8xi64>
+    tt.return %i0, %i1 : tensor<8xi64>, tensor<8xi64>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_ptr_to_int(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
 }
