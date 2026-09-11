@@ -969,38 +969,44 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
 
 // A packing boundary (tensor.concat created by the loop rewrite, or by an
 // explicit pack) exposes exactly the lane values of a cone: use the values
-// feeding the concat (looking through the per-lane reshapes) as the seed.
-static SmallVector<Value> findConcatSeed(Block *block) {
+// feeding the concat (looking through the per-lane reshapes) as the seed, and
+// remember the concat so it can be replaced by the packed result.
+struct ConcatBoundary {
+  Operation *concat;
+  SmallVector<Value> sources;
+};
+
+static std::optional<ConcatBoundary> findConcatBoundary(Block *block) {
   for (Operation &op : *block) {
     auto concat = dyn_cast<tensor::ConcatOp>(&op);
     if (!concat)
       continue;
-    SmallVector<Value> seed;
+    SmallVector<Value> sources;
     for (Value input : concat.getInputs()) {
       Value src = input;
       if (auto reshape = input.getDefiningOp<tensor::ReshapeOp>())
         src = reshape.getSource();
-      seed.push_back(src);
+      sources.push_back(src);
     }
-    if (seed.size() < 2)
+    if (sources.size() < 2)
       continue;
-    Type ty = seed.front().getType();
+    Type ty = sources.front().getType();
     if (!isa<RankedTensorType>(ty))
       continue;
-    if (!llvm::all_of(seed, [&](Value v) { return v.getType() == ty; }))
+    if (!llvm::all_of(sources, [&](Value v) { return v.getType() == ty; }))
       continue;
-    return seed;
+    return ConcatBoundary{concat.getOperation(), std::move(sources)};
   }
-  return {};
+  return std::nullopt;
 }
 
 // Packs one lane cone in a straight-line block. Returns true if anything was
 // rewritten.
 static bool rewriteBlock(Block *block, Operation *scope) {
   SmallVector<SmallVector<Value>> candidates;
-  SmallVector<Value> concatSeed = findConcatSeed(block);
-  if (!concatSeed.empty())
-    candidates.push_back(concatSeed);
+  std::optional<ConcatBoundary> boundary = findConcatBoundary(block);
+  if (boundary)
+    candidates.push_back(boundary->sources);
   SmallVector<SmallVector<Value>> siblingGroups = findSiblingGroups(block);
   llvm::stable_sort(siblingGroups,
                     [](const SmallVector<Value> &a,
@@ -1010,7 +1016,9 @@ static bool rewriteBlock(Block *block, Operation *scope) {
   for (SmallVector<Value> &g : siblingGroups)
     candidates.push_back(std::move(g));
 
-  for (SmallVector<Value> &seed : candidates) {
+  for (unsigned ci = 0; ci < candidates.size(); ++ci) {
+    SmallVector<Value> &seed = candidates[ci];
+    bool isBoundarySeed = boundary && ci == 0;
     FailureOr<Cone> cone = discoverCone(seed);
     if (failed(cone))
       continue;
@@ -1054,6 +1062,25 @@ static bool rewriteBlock(Block *block, Operation *scope) {
       Operation *next = op->getNextNode();
       (void)lifter.liftOp(op);
       op = next;
+    }
+
+    // If this cone is the producer of a pack boundary, hand the packed result
+    // straight to the concat's users instead of unpacking and re-packing.
+    if (isBoundarySeed) {
+      auto it = lifter.packedOf.find(boundary->sources.front());
+      if (it != lifter.packedOf.end() && !it->second.shared &&
+          it->second.value.getType() ==
+              boundary->concat->getResult(0).getType()) {
+        boundary->concat->getResult(0).replaceAllUsesWith(it->second.value);
+        SmallVector<Operation *> reshapes;
+        for (Value input : boundary->concat->getOperands())
+          if (auto reshape = input.getDefiningOp<tensor::ReshapeOp>())
+            reshapes.push_back(reshape.getOperation());
+        boundary->concat->erase();
+        for (Operation *reshape : reshapes)
+          if (reshape->use_empty())
+            reshape->erase();
+      }
     }
 
     // Materialise escaping lane values, then erase the original computation.
