@@ -486,4 +486,19 @@ module {
   // CHECK-LABEL: tt.func @straight_line_four(
   // CHECK: %[[C:.*]] = tensor.concat
   // CHECK: arith.addf %[[C]]
+
+  tt.func @prologue_in_outer_loop(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %y0: tensor<4xf32>, %y1: tensor<4xf32>, %o0: tensor<4x!tt.ptr<f32>>, %o1: tensor<4x!tt.ptr<f32>>, %lb: index, %ub: index, %step: index) {
+    scf.for %i = %lb to %ub step %step {
+      %r0 = arith.addf %x0, %y0 : tensor<4xf32>
+      %r1 = arith.addf %x1, %y1 : tensor<4xf32>
+      tt.store %o0, %r0 : tensor<4x!tt.ptr<f32>>
+      tt.store %o1, %r1 : tensor<4x!tt.ptr<f32>>
+      scf.yield
+    }
+    tt.return
+  }
+
+  // CHECK-LABEL: tt.func @prologue_in_outer_loop(
+  // CHECK: tensor.concat
+  // CHECK: arith.addf
 }
