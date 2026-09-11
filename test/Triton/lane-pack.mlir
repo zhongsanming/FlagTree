@@ -434,4 +434,19 @@ module {
   // CHECK-LABEL: tt.func @mixed_iter_args(
   // CHECK: tensor.concat
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+  tt.func @trans_lanes(%arg0: tensor<4x2xf32>, %arg1: tensor<4x2xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4x2xf32>, tensor<4x2xf32>) {
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%lane0 = %arg0, %lane1 = %arg1) -> (tensor<4x2xf32>, tensor<4x2xf32>) {
+      %t0 = "tt.trans"(%lane0) <{order = array<i32: 1, 0>}> : (tensor<4x2xf32>) -> tensor<2x4xf32>
+      %u0 = "tt.trans"(%t0) <{order = array<i32: 1, 0>}> : (tensor<2x4xf32>) -> tensor<4x2xf32>
+      %t1 = "tt.trans"(%lane1) <{order = array<i32: 1, 0>}> : (tensor<4x2xf32>) -> tensor<2x4xf32>
+      %u1 = "tt.trans"(%t1) <{order = array<i32: 1, 0>}> : (tensor<2x4xf32>) -> tensor<4x2xf32>
+      scf.yield %u0, %u1 : tensor<4x2xf32>, tensor<4x2xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4x2xf32>, tensor<4x2xf32>
+  }
+
+  // CHECK-LABEL: tt.func @trans_lanes(
+  // CHECK: tensor.concat
+  // CHECK: "tt.trans"(%{{.*}}) <{order = array<i32: 0, 2, 1>}>
 }
