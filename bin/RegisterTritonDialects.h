@@ -44,6 +44,7 @@
 
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/InitAllPasses.h"
 
 namespace mlir {
@@ -140,7 +141,8 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::gpu::TritonGPUDialect,
       mlir::triton::instrument::TritonInstrumentDialect,
       mlir::math::MathDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect,
-      mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect, mlir::NVVM::NVVMDialect,
+      mlir::tensor::TensorDialect, mlir::gpu::GPUDialect,
+      mlir::LLVM::LLVMDialect, mlir::NVVM::NVVMDialect,
       mlir::triton::nvgpu::NVGPUDialect, mlir::triton::nvws::NVWSDialect,
       mlir::triton::amdgpu::TritonAMDGPUDialect,
 #ifndef __FLAGPRISM__
