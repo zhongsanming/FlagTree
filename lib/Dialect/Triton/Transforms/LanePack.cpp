@@ -26,6 +26,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -168,6 +169,16 @@ static void collectAssociativeLeaves(Value v, StringRef opName,
     }
   }
   leaves.push_back(v);
+}
+
+static void collectAssociativeTreeOps(Value v, StringRef opName,
+                                      SmallVectorImpl<Operation *> &ops) {
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getName().getStringRef() != opName)
+    return;
+  ops.push_back(def);
+  for (Value operand : def->getOperands())
+    collectAssociativeTreeOps(operand, opName, ops);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +330,13 @@ struct Lifter {
   SmallVector<Value> referenceOrder;
   // Indices (into the loop iter args) that form the packed lane group.
   SmallVector<unsigned> laneIndices;
+  // Block mode does not clone lane-invariant ops and does not abort on
+  // effectful/unmatched ops.
+  bool blockMode = false;
+  // Results of cross-lane reductions (shared across lanes).
+  SmallVector<Value> sharedRefs;
+  // Original operations replaced by the packed computation.
+  SmallPtrSet<Operation *, 32> liftedOps;
   // laneImages[i][ref] is the lane-i value corresponding to reference value
   // `ref` (lane 0). laneImages[0] is unused (identity).
   SmallVector<DenseMap<Value, Value>> laneImages;
@@ -331,7 +349,9 @@ struct Lifter {
   Lifter(Operation *scope, Operation *coneStart, OpBuilder &builder,
          unsigned n)
       : scope(scope), coneStart(coneStart), builder(builder),
-        loc(scope->getLoc()), n(n), laneImages(n) {}
+        loc(scope->getLoc()), n(n), laneImages(n) {
+    blockMode = true;
+  }
 
   void seed(Value packedCurrent, ArrayRef<unsigned> indices, scf::ForOp newFor) {
     laneIndices.assign(indices.begin(), indices.end());
@@ -508,8 +528,11 @@ struct Lifter {
                                          reduce.getAxis() + 1, reduce);
     packedOf[reduce->getResult(0)] = {packed, false};
     referenceOrder.push_back(reduce->getResult(0));
-    for (unsigned i = 1; i < n; ++i)
+    liftedOps.insert(reduce.getOperation());
+    for (unsigned i = 1; i < n; ++i) {
       laneImages[i][reduce->getResult(0)] = laneOps[i - 1]->getResult(0);
+      liftedOps.insert(laneOps[i - 1]);
+    }
     return success();
   }
 
@@ -584,8 +607,11 @@ struct Lifter {
 
     packedOf[op->getResult(0)] = {packed, false};
     referenceOrder.push_back(op->getResult(0));
-    for (unsigned i = 1; i < n; ++i)
+    liftedOps.insert(op);
+    for (unsigned i = 1; i < n; ++i) {
       laneImages[i][op->getResult(0)] = laneOps[i - 1]->getResult(0);
+      liftedOps.insert(laneOps[i - 1]);
+    }
     return success();
   }
 
@@ -650,6 +676,11 @@ struct Lifter {
 
       Value reduced =
           buildReduceFromKind(builder, loc, pvIt->second.value, 0, op);
+      SmallVector<Operation *> treeOps;
+      collectAssociativeTreeOps(op->getResult(0), op->getName().getStringRef(),
+                                treeOps);
+      for (Operation *treeOp : treeOps)
+        liftedOps.insert(treeOp);
       for (Value l : leaves) {
         if (expectedSet.contains(l.getAsOpaquePointer()))
           continue;
@@ -671,14 +702,18 @@ struct Lifter {
         reduced = builder.clone(*op, foldMapping)->getResult(0);
       }
       packedOf[op->getResult(0)] = {reduced, true};
+      sharedRefs.push_back(op->getResult(0));
       return success();
     }
     return failure();
   }
 
   LogicalResult liftOp(Operation *op) {
-    if (allOperandsShared(op))
+    if (allOperandsShared(op)) {
+      if (blockMode)
+        return success(); // don't clone unrelated lane-invariant ops
       return liftSharedOp(op);
+    }
     if (allOperandsResolved(op))
       return liftPerLaneOp(op);
     if (succeeded(liftCrossLane(op)))
@@ -686,6 +721,8 @@ struct Lifter {
     // Unmatched: drop it from the packed loop. Only safe for side-effect-free
     // ops; anything else must abort the rewrite.
     if (!isMemoryEffectFree(op)) {
+      if (blockMode)
+        return success(); // boundary: leave the op in place
       LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful unmatched op "
                               << *op << "\n");
       return failure();
@@ -820,6 +857,238 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
 }
 
 // ---------------------------------------------------------------------------
+// Straight-line (SLP) packing
+// ---------------------------------------------------------------------------
+
+// Two ops are structurally identical if they have the same op, operand types,
+// result types and attributes/regions, ignoring operand identities.
+static bool sameOpStructure(Operation *a, Operation *b) {
+  if (a->getName() != b->getName())
+    return false;
+  if (a->getNumOperands() != b->getNumOperands() ||
+      a->getNumResults() != b->getNumResults())
+    return false;
+  if (!llvm::equal(a->getOperandTypes(), b->getOperandTypes()))
+    return false;
+  if (!llvm::equal(a->getResultTypes(), b->getResultTypes()))
+    return false;
+  return OperationEquivalence::isEquivalentTo(
+      a, b, OperationEquivalence::ignoreValueEquivalence, nullptr,
+      OperationEquivalence::IgnoreLocations);
+}
+
+// Candidate lane groups in a block: single-result packable tensor ops grouped
+// by shallow structure.
+static SmallVector<SmallVector<Value>> findSiblingGroups(Block *block) {
+  SmallVector<SmallVector<Value>> groups;
+  for (Operation &op : *block) {
+    if (op.getNumResults() != 1)
+      continue;
+    if (!isa<RankedTensorType>(op.getResult(0).getType()))
+      continue;
+    if (!isPackableElementwise(&op) || op.getNumRegions() != 0)
+      continue;
+    // These are the pack/unpack scaffolding used by this pass itself.
+    if (isa<tensor::ReshapeOp, tensor::ExtractSliceOp>(&op))
+      continue;
+    bool added = false;
+    for (SmallVector<Value> &g : groups) {
+      if (sameOpStructure(&op, g.front().getDefiningOp())) {
+        g.push_back(op.getResult(0));
+        added = true;
+        break;
+      }
+    }
+    if (!added)
+      groups.push_back({op.getResult(0)});
+  }
+  llvm::erase_if(groups,
+                 [](const SmallVector<Value> &g) { return g.size() < 2; });
+  return groups;
+}
+
+struct Cone {
+  unsigned n = 0;
+  SmallVector<SmallVector<Value>> leafGroups;
+  SmallVector<DenseMap<Value, Value>> laneImages;
+  // Reference (lane 0) intermediate ops.
+  SmallVector<Operation *> refOps;
+};
+
+// Groups the operands of `seed` recursively. Every group has the same size as
+// the seed; groups whose members are not structurally identical become leaves.
+static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
+  Cone cone;
+  cone.n = seed.size();
+  cone.laneImages.resize(cone.n);
+  DenseSet<Value> seen;
+  SmallVector<SmallVector<Value>> worklist;
+  worklist.push_back(SmallVector<Value>(seed.begin(), seed.end()));
+  while (!worklist.empty()) {
+    SmallVector<Value> group = worklist.pop_back_val();
+    Value ref = group.front();
+    if (!seen.insert(ref).second)
+      continue;
+
+    for (unsigned i = 1; i < cone.n; ++i)
+      cone.laneImages[i][ref] = group[i];
+
+    Operation *op0 = ref.getDefiningOp();
+    bool isLeaf =
+        !op0 || !isPackableElementwise(op0) || op0->getNumRegions() != 0;
+    if (!isLeaf) {
+      for (unsigned i = 1; i < cone.n; ++i) {
+        Operation *oi = group[i].getDefiningOp();
+        if (!oi || !sameOpStructure(op0, oi)) {
+          isLeaf = true;
+          break;
+        }
+      }
+    }
+
+    if (isLeaf) {
+      if (!isa<RankedTensorType>(ref.getType()))
+        return failure();
+      cone.leafGroups.push_back(group);
+      continue;
+    }
+
+    cone.refOps.push_back(op0);
+    for (unsigned k = 0; k < op0->getNumOperands(); ++k) {
+      SmallVector<Value> operands;
+      operands.reserve(cone.n);
+      for (unsigned i = 0; i < cone.n; ++i)
+        operands.push_back(group[i].getDefiningOp()->getOperand(k));
+      if (llvm::all_of(operands,
+                       [&](Value v) { return v == operands.front(); }))
+        continue; // lane-invariant
+      Type ty = operands.front().getType();
+      if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; }))
+        return failure();
+      worklist.push_back(operands);
+    }
+  }
+  return cone;
+}
+
+// Packs one lane cone in a straight-line block. Returns true if anything was
+// rewritten.
+static bool rewriteBlock(Block *block, Operation *scope) {
+  SmallVector<SmallVector<Value>> candidates = findSiblingGroups(block);
+  llvm::stable_sort(candidates,
+                    [](const SmallVector<Value> &a,
+                       const SmallVector<Value> &b) {
+                      return a.size() > b.size();
+                    });
+
+  for (SmallVector<Value> &seed : candidates) {
+    FailureOr<Cone> cone = discoverCone(seed);
+    if (failed(cone))
+      continue;
+
+    Operation *insertBefore = nullptr;
+    for (Operation *op : cone->refOps)
+      if (!insertBefore || op->isBeforeInBlock(insertBefore))
+        insertBefore = op;
+    if (!insertBefore)
+      continue;
+
+    bool ok = true;
+    for (SmallVector<Value> &g : cone->leafGroups) {
+      for (Value v : g) {
+        Operation *def = v.getDefiningOp();
+        if (def && def->getBlock() == block && !def->isBeforeInBlock(insertBefore)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok)
+        break;
+    }
+    if (!ok)
+      continue;
+
+    OpBuilder builder(insertBefore);
+    Location loc = insertBefore->getLoc();
+    Lifter lifter(scope, insertBefore, builder, cone->n);
+    lifter.laneImages = std::move(cone->laneImages);
+
+    DenseSet<Value> leafRefs;
+    for (SmallVector<Value> &g : cone->leafGroups) {
+      Value packed = buildPackedLanes(builder, loc, g);
+      lifter.packedOf[g.front()] = {packed, false};
+      leafRefs.insert(g.front());
+    }
+
+    // Lift the cone plus any forward lane-parallel extension.
+    for (Operation *op = insertBefore; op;) {
+      Operation *next = op->getNextNode();
+      (void)lifter.liftOp(op);
+      op = next;
+    }
+
+    // Materialise escaping lane values, then erase the original computation.
+    for (Value ref : lifter.referenceOrder) {
+      auto it = lifter.packedOf.find(ref);
+      if (it == lifter.packedOf.end() || it->second.shared ||
+          leafRefs.contains(ref))
+        continue;
+      SmallVector<Value> lanes(cone->n);
+      lanes[0] = ref;
+      for (unsigned i = 1; i < cone->n; ++i)
+        lanes[i] = lifter.laneImages[i].lookup(ref);
+      bool external = false;
+      for (Value lane : lanes) {
+        if (!lane)
+          continue;
+        for (OpOperand &use : lane.getUses())
+          if (!lifter.liftedOps.contains(use.getOwner())) {
+            external = true;
+            break;
+          }
+        if (external)
+          break;
+      }
+      if (!external)
+        continue;
+      SmallVector<Value> unpacked =
+          unpackPackedLanes(builder, loc, it->second.value, cone->n);
+      if (unpacked.size() != cone->n)
+        continue;
+      for (unsigned i = 0; i < cone->n; ++i) {
+        if (!lanes[i])
+          continue;
+        for (OpOperand &use : llvm::make_early_inc_range(lanes[i].getUses()))
+          if (!lifter.liftedOps.contains(use.getOwner()))
+            use.set(unpacked[i]);
+      }
+    }
+    for (Value ref : lifter.sharedRefs) {
+      auto it = lifter.packedOf.find(ref);
+      if (it == lifter.packedOf.end())
+        continue;
+      for (OpOperand &use : llvm::make_early_inc_range(ref.getUses()))
+        if (!lifter.liftedOps.contains(use.getOwner()))
+          use.set(it->second.value);
+    }
+
+    SmallVector<Operation *> toErase;
+    for (Operation *op : lifter.liftedOps)
+      if (op->getBlock() == block)
+        toErase.push_back(op);
+    // Erase users before defs so uses among the erased ops drop first.
+    llvm::stable_sort(toErase, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    for (Operation *op : llvm::reverse(toErase))
+      if (op->use_empty())
+        op->erase();
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Pass
 // ---------------------------------------------------------------------------
 
@@ -831,6 +1100,16 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       if (succeeded(rewriteLanePackLoop(forOp)))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed loop\n");
     });
+
+    SmallVector<Block *> blocks;
+    getOperation().walk([&](triton::FuncOp funcOp) {
+      for (Block &block : funcOp.getBody())
+        blocks.push_back(&block);
+    });
+    for (Block *block : blocks) {
+      if (rewriteBlock(block, block->getParentOp()))
+        LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
+    }
   }
 };
 
