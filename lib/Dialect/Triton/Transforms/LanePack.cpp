@@ -13,11 +13,23 @@
 // reduction over the synthesized lane axis. No semantic pattern (row/column
 // normalization, softmax, ...) is hard-coded; anything whose packed form is
 // mathematically equivalent is allowed.
+//
+// Scope: only side-effect-free "math" ops are lifted. Ops with side effects
+// (loads/stores, copies, barriers, ...) are treated as boundaries and left for
+// other passes to vectorize. Leaf lane groups are packed either with a concat
+// or, when they are a contiguous run of tensor.extract_slice of one source,
+// with a single wider slice + reshape.
+//
+// Two modes share one lifter:
+//   * loop mode packs the iter args of an scf.for and replays its body once,
+//   * block mode (SLP) discovers a lane cone in straight-line code, seeded by a
+//     tensor.concat packing boundary or by shallow structural signatures.
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
@@ -25,6 +37,7 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -60,11 +73,92 @@ static Value buildShapeConst(OpBuilder &builder, Location loc,
   return builder.create<arith::ConstantOp>(loc, builder.getI64TensorAttr(shape));
 }
 
+// If the lanes are a contiguous run of tensor.extract_slice of one source
+// (e.g. mix_l0..3 = src[8,12,16,20]), pack them with a single wider slice +
+// reshape instead of a concat. Returns null when the pattern does not apply.
+static Value buildPackedContiguousSlices(OpBuilder &builder, Location loc,
+                                         ArrayRef<Value> lanes) {
+  auto toStatic = [](ArrayRef<OpFoldResult> ofrs)
+      -> std::optional<SmallVector<int64_t>> {
+    SmallVector<int64_t> out;
+    for (OpFoldResult ofr : ofrs) {
+      std::optional<int64_t> value = getConstantIntValue(ofr);
+      if (!value)
+        return std::nullopt;
+      out.push_back(*value);
+    }
+    return out;
+  };
+
+  auto first = lanes.front().getDefiningOp<tensor::ExtractSliceOp>();
+  if (!first)
+    return Value();
+  auto firstView = cast<OffsetSizeAndStrideOpInterface>(first.getOperation());
+  Value source = first.getSource();
+  auto sizes = toStatic(firstView.getMixedSizes());
+  auto strides = toStatic(firstView.getMixedStrides());
+  auto base = toStatic(firstView.getMixedOffsets());
+  if (!sizes || !strides || !base || sizes->empty() || (*strides)[0] != 1)
+    return Value();
+  int64_t laneExtent = (*sizes)[0];
+  if (laneExtent <= 0)
+    return Value();
+
+  for (auto [i, lane] : llvm::enumerate(lanes.drop_front())) {
+    auto slice = lane.getDefiningOp<tensor::ExtractSliceOp>();
+    if (!slice || slice.getSource() != source)
+      return Value();
+    auto view = cast<OffsetSizeAndStrideOpInterface>(slice.getOperation());
+    auto s = toStatic(view.getMixedSizes());
+    auto st = toStatic(view.getMixedStrides());
+    auto off = toStatic(view.getMixedOffsets());
+    if (!s || !st || !off || *s != *sizes || *st != *strides)
+      return Value();
+    if ((*off)[0] != (*base)[0] + (int64_t)(i + 1) * laneExtent)
+      return Value();
+    for (unsigned d = 1; d < off->size(); ++d)
+      if ((*off)[d] != (*base)[d])
+        return Value();
+  }
+
+  auto laneTy = cast<RankedTensorType>(lanes.front().getType());
+  int64_t n = (int64_t)lanes.size();
+
+  SmallVector<OpFoldResult> newOffsets;
+  for (int64_t o : *base)
+    newOffsets.push_back(builder.getIndexAttr(o));
+  SmallVector<OpFoldResult> newSizes;
+  newSizes.push_back(builder.getIndexAttr(n * laneExtent));
+  for (unsigned d = 1; d < sizes->size(); ++d)
+    newSizes.push_back(builder.getIndexAttr((*sizes)[d]));
+  SmallVector<OpFoldResult> newStrides;
+  for (int64_t s : *strides)
+    newStrides.push_back(builder.getIndexAttr(s));
+
+  SmallVector<int64_t> wideShape;
+  wideShape.push_back(n * laneExtent);
+  wideShape.append(laneTy.getShape().begin() + 1, laneTy.getShape().end());
+  auto wideTy = RankedTensorType::get(wideShape, laneTy.getElementType(),
+                                      laneTy.getEncoding());
+  Value wide = builder.create<tensor::ExtractSliceOp>(
+      loc, wideTy, source, newOffsets, newSizes, newStrides);
+
+  SmallVector<int64_t> packedShape;
+  packedShape.push_back(n);
+  packedShape.append(laneTy.getShape().begin(), laneTy.getShape().end());
+  auto packedTy = RankedTensorType::get(packedShape, laneTy.getElementType(),
+                                        laneTy.getEncoding());
+  return builder.create<tensor::ReshapeOp>(
+      loc, packedTy, wide, buildShapeConst(builder, loc, packedShape));
+}
+
 // Packs `lanes` (all of the same ranked tensor type) into one tensor with a new
 // leading dimension of size lanes.size().
 static Value buildPackedLanes(OpBuilder &builder, Location loc,
                               ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
+  if (Value coalesced = buildPackedContiguousSlices(builder, loc, lanes))
+    return coalesced;
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
 
   SmallVector<int64_t> singletonLaneShape;
@@ -357,9 +451,6 @@ struct Lifter {
   SmallPtrSet<Operation *, 32> liftedOps;
   // Values known to be lane-varying (members/images of a lane group).
   DenseSet<Value> laneVarying;
-  // Diagnostic budget for temporary per-op logging.
-  int debugBudget = 30;
-  int opBudget = 25;
   // laneImages[i][ref] is the lane-i value corresponding to reference value
   // `ref` (lane 0). laneImages[0] is unused (identity).
   SmallVector<DenseMap<Value, Value>> laneImages;
@@ -477,12 +568,8 @@ struct Lifter {
         continue;
       }
       Value img = laneImages[lane].lookup(a);
-      if (!img) {
-        if (lanePackDebug() && debugBudget-- > 0)
-          llvm::errs() << "[lane-pack]       no lane image for " << a
-                       << " lane=" << lane << " in " << *refOp << "\n";
+      if (!img)
         return nullptr;
-      }
       expected.push_back(img);
     }
     if (expected.empty())
@@ -502,13 +589,6 @@ struct Lifter {
       if (!llvm::equal(u->getOperands(), expected))
         continue;
       return u;
-    }
-    if (lanePackDebug() && debugBudget-- > 0) {
-      llvm::errs() << "[lane-pack]       no sibling for lane=" << lane << " "
-                   << *refOp << " expected:";
-      for (Value e : expected)
-        llvm::errs() << " " << e;
-      llvm::errs() << "\n";
     }
     return nullptr;
   }
@@ -545,20 +625,12 @@ struct Lifter {
     if (reduce->getNumOperands() != 1 || reduce->getNumResults() != 1)
       return failure();
     Operation *combiner = reduce.getSingleCombiner();
-    if (!combiner || !isAssociativeCombine(combiner)) {
-      if (lanePackDebug() && debugBudget-- > 0)
-        llvm::errs() << "[lane-pack]     reduce combiner not associative: "
-                     << *reduce << "\n";
+    if (!combiner || !isAssociativeCombine(combiner))
       return failure();
-    }
     Value src = reduce.getOperand(0);
     auto pv = getPacked(src);
-    if (!pv || pv->shared) {
-      if (lanePackDebug() && debugBudget-- > 0)
-        llvm::errs() << "[lane-pack]     reduce src unresolved/shared: "
-                     << *reduce << "\n";
+    if (!pv || pv->shared)
       return failure();
-    }
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
@@ -570,20 +642,12 @@ struct Lifter {
         oi = img.getDefiningOp();
       else
         oi = findLaneOp(reduce, i);
-      if (!oi) {
-        if (lanePackDebug() && debugBudget-- > 0)
-          llvm::errs() << "[lane-pack]     reduce findLaneOp fail lane=" << i
-                       << " : " << *reduce << "\n";
+      if (!oi)
         return failure();
-      }
       auto other = dyn_cast<triton::ReduceOp>(oi);
       if (!other || !other.getSingleCombiner() ||
-          other.getSingleCombiner()->getName() != combiner->getName()) {
-        if (lanePackDebug() && debugBudget-- > 0)
-          llvm::errs() << "[lane-pack]     reduce combiner mismatch lane=" << i
-                       << " : " << *oi << "\n";
+          other.getSingleCombiner()->getName() != combiner->getName())
         return failure();
-      }
       laneOps.push_back(oi);
     }
 
@@ -606,22 +670,14 @@ struct Lifter {
       return failure();
     if (isa<triton::ReduceOp>(op))
       return liftLaneReduce(cast<triton::ReduceOp>(op));
-    if (op->getNumRegions() != 0 || !isPackableElementwise(op)) {
-      if (lanePackDebug() && debugBudget-- > 0)
-        llvm::errs() << "[lane-pack]     not liftable elementwise: "
-                     << op->getName() << "\n";
+    if (op->getNumRegions() != 0 || !isPackableElementwise(op))
       return failure();
-    }
 
     SmallVector<PackedValue> pvs;
     for (Value a : op->getOperands()) {
       auto pv = getPacked(a);
-      if (!pv) {
-        if (lanePackDebug() && debugBudget-- > 0)
-          llvm::errs() << "[lane-pack]     operand unresolved: " << *op
-                       << "  via " << a << "\n";
+      if (!pv)
         return failure();
-      }
       pvs.push_back(*pv);
     }
 
@@ -633,12 +689,8 @@ struct Lifter {
         oi = img.getDefiningOp();
       else
         oi = findLaneOp(op, i);
-      if (!oi) {
-        if (lanePackDebug() && debugBudget-- > 0)
-          llvm::errs() << "[lane-pack]     findLaneOp fail lane=" << i
-                       << " : " << *op << "\n";
+      if (!oi)
         return failure();
-      }
       laneOps.push_back(oi);
     }
 
@@ -785,10 +837,6 @@ struct Lifter {
   }
 
   LogicalResult liftOp(Operation *op) {
-    if (lanePackDebug() && opBudget-- > 0)
-      llvm::errs() << "[lane-pack]   try " << op->getName()
-                   << " allShared=" << allOperandsShared(op)
-                   << " allResolved=" << allOperandsResolved(op) << "\n";
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
@@ -1128,35 +1176,35 @@ static bool rewriteBlock(Block *block, Operation *scope) {
     if (failed(cone))
       continue;
 
-    Operation *insertBefore = nullptr;
+    // Earliest cone ref op: the lifter scans from here so every cone op is
+    // visited, regardless of where the packed ops are emitted.
+    Operation *processStart = nullptr;
     for (Operation *op : cone->refOps)
-      if (!insertBefore || op->isBeforeInBlock(insertBefore))
-        insertBefore = op;
-    if (!insertBefore) {
+      if (!processStart || op->isBeforeInBlock(processStart))
+        processStart = op;
+    if (!processStart) {
       if (lanePackDebug())
         llvm::errs() << "[lane-pack]   skip: no ref op\n";
       continue;
     }
 
-    bool ok = true;
+    // Emit the packed ops after the last leaf defined in this block so every
+    // leaf dominates them, even when leaves are interleaved with cone ops.
+    Operation *emissionPoint = processStart;
     for (SmallVector<Value> &g : cone->leafGroups) {
       for (Value v : g) {
         Operation *def = v.getDefiningOp();
-        if (def && def->getBlock() == block && !def->isBeforeInBlock(insertBefore)) {
-          ok = false;
-          break;
-        }
+        if (!def || def->getBlock() != block)
+          continue;
+        if (def->isBeforeInBlock(emissionPoint))
+          continue;
+        if (Operation *next = def->getNextNode())
+          emissionPoint = next;
       }
-      if (!ok)
-        break;
-    }
-    if (!ok) {
-      if (lanePackDebug())
-        llvm::errs() << "[lane-pack]   skip: leaf after cone start\n";
-      continue;
     }
     if (lanePackDebug()) {
-      llvm::errs() << "[lane-pack]   insertBefore: " << *insertBefore
+      llvm::errs() << "[lane-pack]   processStart: " << *processStart
+                   << "\n[lane-pack]   emissionPoint: " << *emissionPoint
                    << "\n[lane-pack]   leafGroups=" << cone->leafGroups.size()
                    << "\n";
       for (SmallVector<Value> &g : cone->leafGroups) {
@@ -1167,9 +1215,9 @@ static bool rewriteBlock(Block *block, Operation *scope) {
       }
     }
 
-    OpBuilder builder(insertBefore);
-    Location loc = insertBefore->getLoc();
-    Lifter lifter(scope, insertBefore, builder, cone->n);
+    OpBuilder builder(emissionPoint);
+    Location loc = emissionPoint->getLoc();
+    Lifter lifter(scope, processStart, builder, cone->n);
     lifter.laneImages = std::move(cone->laneImages);
     for (unsigned i = 1; i < cone->n; ++i)
       for (auto &entry : lifter.laneImages[i])
@@ -1187,7 +1235,7 @@ static bool rewriteBlock(Block *block, Operation *scope) {
     }
 
     // Lift the cone plus any forward lane-parallel extension.
-    for (Operation *op = insertBefore; op;) {
+    for (Operation *op = processStart; op;) {
       Operation *next = op->getNextNode();
       (void)lifter.liftOp(op);
       op = next;
