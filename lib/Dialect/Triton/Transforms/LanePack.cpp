@@ -1365,6 +1365,13 @@ static bool rewriteBlock(Block *block, Operation *scope,
       }
     }
 
+    // The unpacked values are materialised at the emission point, so only uses
+    // at or after it can be served; earlier uses keep the original (unpacked)
+    // computation, which therefore is not erased.
+    auto canServe = [&](Operation *user) {
+      return user->getBlock() != block || !user->isBeforeInBlock(emissionPoint);
+    };
+
     // Materialise escaping lane values, then erase the original computation.
     for (Value ref : lifter.referenceOrder) {
       auto it = lifter.packedOf.find(ref);
@@ -1380,7 +1387,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
         if (!lane)
           continue;
         for (OpOperand &use : lane.getUses())
-          if (!lifter.liftedOps.contains(use.getOwner())) {
+          if (!lifter.liftedOps.contains(use.getOwner()) &&
+              canServe(use.getOwner())) {
             external = true;
             break;
           }
@@ -1397,7 +1405,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
         if (!lanes[i])
           continue;
         for (OpOperand &use : llvm::make_early_inc_range(lanes[i].getUses()))
-          if (!lifter.liftedOps.contains(use.getOwner()))
+          if (!lifter.liftedOps.contains(use.getOwner()) &&
+              canServe(use.getOwner()))
             use.set(unpacked[i]);
       }
     }
@@ -1406,7 +1415,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
       if (it == lifter.packedOf.end())
         continue;
       for (OpOperand &use : llvm::make_early_inc_range(ref.getUses()))
-        if (!lifter.liftedOps.contains(use.getOwner()))
+        if (!lifter.liftedOps.contains(use.getOwner()) &&
+            canServe(use.getOwner()))
           use.set(it->second.value);
     }
 
