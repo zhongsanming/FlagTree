@@ -449,4 +449,41 @@ module {
   // CHECK-LABEL: tt.func @trans_lanes(
   // CHECK: tensor.concat
   // CHECK: "tt.trans"(%{{.*}}) <{order = array<i32: 0, 2, 1>}>
+
+  tt.func @straight_line(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %y0: tensor<4xf32>, %y1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %r0 = arith.addf %x0, %y0 : tensor<4xf32>
+    %r1 = arith.addf %x1, %y1 : tensor<4xf32>
+    %s0 = arith.mulf %r0, %x0 : tensor<4xf32>
+    %s1 = arith.mulf %r1, %x1 : tensor<4xf32>
+    tt.return %s0, %s1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line(
+  // CHECK: tensor.concat
+  // CHECK: arith.addf
+  // CHECK: arith.mulf
+
+  tt.func @straight_line_shared(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %c: f32) -> (tensor<4xf32>, tensor<4xf32>) {
+    %cs = tt.splat %c : f32 -> tensor<4xf32>
+    %r0 = arith.mulf %x0, %cs : tensor<4xf32>
+    %r1 = arith.mulf %x1, %cs : tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line_shared(
+  // CHECK: tensor.concat
+  // CHECK: tt.broadcast
+  // CHECK: arith.mulf
+
+  tt.func @straight_line_four(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %x2: tensor<4xf32>, %x3: tensor<4xf32>, %y0: tensor<4xf32>, %y1: tensor<4xf32>, %y2: tensor<4xf32>, %y3: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+    %r0 = arith.addf %x0, %y0 : tensor<4xf32>
+    %r1 = arith.addf %x1, %y1 : tensor<4xf32>
+    %r2 = arith.addf %x2, %y2 : tensor<4xf32>
+    %r3 = arith.addf %x3, %y3 : tensor<4xf32>
+    tt.return %r0, %r1, %r2, %r3 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line_four(
+  // CHECK: %[[C:.*]] = tensor.concat
+  // CHECK: arith.addf %[[C]]
 }
