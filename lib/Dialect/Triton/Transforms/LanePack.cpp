@@ -663,7 +663,9 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
   };
 
   Lifter lifter(forOp, builder, n);
-  lifter.seed(packedInit);
+  // The body must start from the loop-carried packed value, not the pre-loop
+  // packed init.
+  lifter.seed(newFor.getRegionIterArg(0));
   builder.setInsertionPointToStart(newFor.getBody());
   FailureOr<Value> packedYield = lifter.run();
   if (failed(packedYield))
