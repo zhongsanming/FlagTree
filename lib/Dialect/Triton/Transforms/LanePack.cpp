@@ -357,6 +357,8 @@ struct Lifter {
   SmallVector<Value> sharedRefs;
   // Original operations replaced by the packed computation.
   SmallPtrSet<Operation *, 32> liftedOps;
+  // Values known to be lane-varying (members/images of a lane group).
+  DenseSet<Value> laneVarying;
   // Diagnostic budget for temporary per-op logging.
   int debugBudget = 30;
   int opBudget = 25;
@@ -414,6 +416,10 @@ struct Lifter {
     auto it = packedOf.find(v);
     if (it != packedOf.end())
       return it->second.shared;
+    // A lane-varying value is never lane-invariant, even if it is defined
+    // before the cone start (e.g. a per-lane splat or a leaf lane).
+    if (laneVarying.contains(v))
+      return false;
     if (isLaneArg(v))
       return false;
     if (auto barg = dyn_cast<BlockArgument>(v))
@@ -433,6 +439,8 @@ struct Lifter {
     auto it = packedOf.find(v);
     if (it != packedOf.end())
       return it->second;
+    if (laneVarying.contains(v))
+      return std::nullopt;
     if (isLaneArg(v))
       return std::nullopt;
     if (auto barg = dyn_cast<BlockArgument>(v)) {
@@ -581,6 +589,7 @@ struct Lifter {
     liftedOps.insert(reduce.getOperation());
     for (unsigned i = 1; i < n; ++i) {
       laneImages[i][reduce->getResult(0)] = laneOps[i - 1]->getResult(0);
+      laneVarying.insert(laneOps[i - 1]->getResult(0));
       liftedOps.insert(laneOps[i - 1]);
     }
     return success();
@@ -666,6 +675,7 @@ struct Lifter {
     liftedOps.insert(op);
     for (unsigned i = 1; i < n; ++i) {
       laneImages[i][op->getResult(0)] = laneOps[i - 1]->getResult(0);
+      laneVarying.insert(laneOps[i - 1]->getResult(0));
       liftedOps.insert(laneOps[i - 1]);
     }
     return success();
@@ -1151,11 +1161,18 @@ static bool rewriteBlock(Block *block, Operation *scope) {
     Location loc = insertBefore->getLoc();
     Lifter lifter(scope, insertBefore, builder, cone->n);
     lifter.laneImages = std::move(cone->laneImages);
+    for (unsigned i = 1; i < cone->n; ++i)
+      for (auto &entry : lifter.laneImages[i])
+        lifter.laneVarying.insert(entry.second);
 
     DenseSet<Value> leafRefs;
     for (SmallVector<Value> &g : cone->leafGroups) {
       Value packed = buildPackedLanes(builder, loc, g);
-      lifter.packedOf[g.front()] = {packed, false};
+      // Seed every lane of the leaf, not just the reference: otherwise the
+      // sibling lanes (defined before the cone start) are misclassified as
+      // lane-invariant by isShared and their whole chain is skipped.
+      for (Value v : g)
+        lifter.packedOf[v] = {packed, false};
       leafRefs.insert(g.front());
     }
 
@@ -1257,6 +1274,13 @@ static bool rewriteBlock(Block *block, Operation *scope) {
           changed = true;
         }
       }
+    }
+    // If nothing was actually lifted this candidate was a no-op (e.g. the
+    // boundary seed failed); roll forward to the next candidate.
+    if (lifter.liftedOps.empty()) {
+      if (lanePackDebug())
+        llvm::errs() << "[lane-pack]   no-op candidate, trying next\n";
+      continue;
     }
     return true;
   }
