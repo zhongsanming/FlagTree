@@ -292,9 +292,13 @@ struct Lifter {
   OpBuilder &builder;
   Location loc;
   unsigned n;
-  SmallVector<Value> initLanes;
   DenseMap<Value, PackedValue> packedOf;
+  // Old loop body block args (induction var and non-lane iter args) remapped to
+  // the corresponding args of the new loop.
+  DenseMap<Value, Value> argRemap;
   SmallVector<Value> referenceOrder;
+  // Indices (into the loop iter args) that form the packed lane group.
+  SmallVector<unsigned> laneIndices;
   // laneImages[i][ref] is the lane-i value corresponding to reference value
   // `ref` (lane 0). laneImages[0] is unused (identity).
   SmallVector<DenseMap<Value, Value>> laneImages;
@@ -303,14 +307,25 @@ struct Lifter {
       : forOp(forOp), builder(builder), loc(forOp.getLoc()), n(n),
         laneImages(n) {}
 
-  void seed(Value packedInit) {
-    // The loop body operates on the region iter args, not the init args.
+  void seed(Value packedCurrent, ArrayRef<unsigned> indices, scf::ForOp newFor) {
+    laneIndices.assign(indices.begin(), indices.end());
     auto iterArgs = forOp.getRegionIterArgs();
-    initLanes.assign(iterArgs.begin(), iterArgs.end());
-    packedOf[initLanes[0]] = {packedInit, false};
-    referenceOrder.push_back(initLanes[0]);
+    Value ref = iterArgs[laneIndices[0]];
+    packedOf[ref] = {packedCurrent, false};
+    referenceOrder.push_back(ref);
     for (unsigned i = 1; i < n; ++i)
-      laneImages[i][initLanes[0]] = initLanes[i];
+      laneImages[i][ref] = iterArgs[laneIndices[i]];
+
+    // Remap the induction variable and every non-lane iter arg to the new
+    // loop's corresponding argument.
+    argRemap[forOp.getInductionVar()] = newFor.getInductionVar();
+    auto newIterArgs = newFor.getRegionIterArgs();
+    unsigned nextNew = 1; // newIterArgs[0] is the packed lane group
+    for (unsigned j = 0; j < iterArgs.size(); ++j) {
+      if (llvm::is_contained(laneIndices, j))
+        continue;
+      argRemap[iterArgs[j]] = newIterArgs[nextNew++];
+    }
   }
 
   // A loop body block argument that is one of the lane iter args.
@@ -318,7 +333,10 @@ struct Lifter {
     auto barg = dyn_cast<BlockArgument>(v);
     if (!barg || barg.getOwner() != forOp.getBody())
       return false;
-    return barg.getArgNumber() >= 1; // arg 0 is the induction variable
+    unsigned idx = barg.getArgNumber();
+    if (idx == 0)
+      return false; // induction variable
+    return llvm::is_contained(laneIndices, idx - 1);
   }
 
   bool isShared(Value v) {
@@ -327,9 +345,11 @@ struct Lifter {
       return it->second.shared;
     if (isLaneArg(v))
       return false;
+    if (auto barg = dyn_cast<BlockArgument>(v))
+      return true; // induction var, non-lane iter arg, or an outer arg
     Operation *def = v.getDefiningOp();
     if (!def)
-      return true; // an outer block argument
+      return true;
     return !forOp->isAncestor(def);
   }
 
@@ -339,6 +359,14 @@ struct Lifter {
       return it->second;
     if (isLaneArg(v))
       return std::nullopt;
+    if (auto barg = dyn_cast<BlockArgument>(v)) {
+      if (barg.getOwner() == forOp.getBody() && barg.getArgNumber() >= 1) {
+        auto rit = argRemap.find(v);
+        if (rit != argRemap.end())
+          return PackedValue{rit->second, true};
+      }
+      return PackedValue{v, true};
+    }
     Operation *def = v.getDefiningOp();
     if (!def || !forOp->isAncestor(def))
       return PackedValue{v, true};
@@ -615,15 +643,16 @@ struct Lifter {
     }
 
     auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    if (!yield || yield.getNumOperands() != n)
+    if (!yield)
       return failure();
-    Value y0 = yield.getOperand(0);
+    Value y0 = yield.getOperand(laneIndices[0]);
     auto it = packedOf.find(y0);
     if (it == packedOf.end() || it->second.shared)
       return failure();
     for (unsigned i = 1; i < n; ++i) {
       auto img = laneImages[i].find(y0);
-      if (img == laneImages[i].end() || img->second != yield.getOperand(i))
+      if (img == laneImages[i].end() ||
+          img->second != yield.getOperand(laneIndices[i]))
         return failure();
     }
     return it->second.value;
@@ -639,21 +668,52 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
   Location loc = forOp.getLoc();
 
   auto initArgs = forOp.getInitArgs();
-  if (initArgs.size() < 2)
+  unsigned m = initArgs.size();
+  if (m < 2)
     return failure();
-  if (!isa<RankedTensorType>(initArgs[0].getType()))
-    return failure();
-  for (Value a : initArgs)
-    if (a.getType() != initArgs[0].getType())
-      return failure();
-  unsigned n = initArgs.size();
 
-  SmallVector<Value> initLanesVec(initArgs.begin(), initArgs.end());
-  Value packedInit = buildPackedLanes(builder, loc, initLanesVec);
-  auto newFor = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
-                                           forOp.getUpperBound(),
-                                           forOp.getStep(),
-                                           ValueRange{packedInit});
+  // Pick the largest group of same-typed tensor iter args to pack. Other iter
+  // args are carried through unchanged.
+  unsigned bestSize = 0;
+  Type bestTy;
+  for (unsigned i = 0; i < m; ++i) {
+    if (!isa<RankedTensorType>(initArgs[i].getType()))
+      continue;
+    unsigned size = 0;
+    for (unsigned j = 0; j < m; ++j)
+      if (initArgs[j].getType() == initArgs[i].getType())
+        ++size;
+    if (size > bestSize) {
+      bestSize = size;
+      bestTy = initArgs[i].getType();
+    }
+  }
+  if (bestSize < 2)
+    return failure();
+
+  SmallVector<unsigned> laneIndices;
+  for (unsigned j = 0; j < m; ++j)
+    if (initArgs[j].getType() == bestTy)
+      laneIndices.push_back(j);
+  unsigned n = laneIndices.size();
+
+  SmallVector<Value> initLanes;
+  for (unsigned idx : laneIndices)
+    initLanes.push_back(initArgs[idx]);
+  Value packedInit = buildPackedLanes(builder, loc, initLanes);
+
+  SmallVector<unsigned> otherIndices;
+  SmallVector<Value> newInitArgs{packedInit};
+  for (unsigned j = 0; j < m; ++j) {
+    if (llvm::is_contained(laneIndices, j))
+      continue;
+    otherIndices.push_back(j);
+    newInitArgs.push_back(initArgs[j]);
+  }
+
+  auto newFor = builder.create<scf::ForOp>(
+      loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
+      newInitArgs);
   newFor->setAttrs(forOp->getAttrs());
 
   auto fail = [&]() -> LogicalResult {
@@ -665,14 +725,22 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
   Lifter lifter(forOp, builder, n);
   // The body must start from the loop-carried packed value, not the pre-loop
   // packed init.
-  lifter.seed(newFor.getRegionIterArg(0));
+  lifter.seed(newFor.getRegionIterArg(0), laneIndices, newFor);
   builder.setInsertionPointToStart(newFor.getBody());
   FailureOr<Value> packedYield = lifter.run();
   if (failed(packedYield))
     return fail();
 
+  auto oldYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   builder.setInsertionPointToEnd(newFor.getBody());
-  builder.create<scf::YieldOp>(loc, *packedYield);
+  SmallVector<Value> newYieldOperands{*packedYield};
+  for (unsigned j : otherIndices) {
+    auto pv = lifter.getPacked(oldYield.getOperand(j));
+    if (!pv)
+      return fail();
+    newYieldOperands.push_back(pv->value);
+  }
+  builder.create<scf::YieldOp>(loc, newYieldOperands);
 
   builder.setInsertionPointAfter(newFor);
   SmallVector<Value> unpacked =
@@ -680,8 +748,14 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
   if (unpacked.size() != n)
     return fail();
 
-  for (auto [oldResult, newResult] : llvm::zip(forOp.getResults(), unpacked))
-    oldResult.replaceAllUsesWith(newResult);
+  SmallVector<Value> newResults(m);
+  for (unsigned k = 0; k < n; ++k)
+    newResults[laneIndices[k]] = unpacked[k];
+  for (unsigned k = 0; k < otherIndices.size(); ++k)
+    newResults[otherIndices[k]] = newFor.getResult(k + 1);
+
+  for (unsigned j = 0; j < m; ++j)
+    forOp.getResult(j).replaceAllUsesWith(newResults[j]);
   forOp.erase();
   return success();
 }
