@@ -39,13 +39,13 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "lane-pack"
 
@@ -70,7 +70,8 @@ static bool lanePackDebug() {
 
 static Value buildShapeConst(OpBuilder &builder, Location loc,
                              ArrayRef<int64_t> shape) {
-  return builder.create<arith::ConstantOp>(loc, builder.getI64TensorAttr(shape));
+  return builder.create<arith::ConstantOp>(loc,
+                                           builder.getI64TensorAttr(shape));
 }
 
 // If the lanes are a contiguous run of tensor.extract_slice of one source
@@ -78,8 +79,8 @@ static Value buildShapeConst(OpBuilder &builder, Location loc,
 // reshape instead of a concat. Returns null when the pattern does not apply.
 static Value buildPackedContiguousSlices(OpBuilder &builder, Location loc,
                                          ArrayRef<Value> lanes) {
-  auto toStatic = [](ArrayRef<OpFoldResult> ofrs)
-      -> std::optional<SmallVector<int64_t>> {
+  auto toStatic =
+      [](ArrayRef<OpFoldResult> ofrs) -> std::optional<SmallVector<int64_t>> {
     SmallVector<int64_t> out;
     for (OpFoldResult ofr : ofrs) {
       std::optional<int64_t> value = getConstantIntValue(ofr);
@@ -164,9 +165,8 @@ static Value buildPackedLanes(OpBuilder &builder, Location loc,
   SmallVector<int64_t> singletonLaneShape;
   singletonLaneShape.push_back(1);
   singletonLaneShape.append(laneTy.getShape().begin(), laneTy.getShape().end());
-  auto singletonLaneTy =
-      RankedTensorType::get(singletonLaneShape, laneTy.getElementType(),
-                            laneTy.getEncoding());
+  auto singletonLaneTy = RankedTensorType::get(
+      singletonLaneShape, laneTy.getElementType(), laneTy.getEncoding());
 
   auto reshapeLane = [&](Value lane) -> Value {
     return builder.create<tensor::ReshapeOp>(
@@ -212,7 +212,8 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
   sizes.push_back(builder.getIndexAttr(1));
   for (int64_t dim : laneShape)
     sizes.push_back(builder.getIndexAttr(dim));
-  SmallVector<OpFoldResult> strides(packedTy.getRank(), builder.getIndexAttr(1));
+  SmallVector<OpFoldResult> strides(packedTy.getRank(),
+                                    builder.getIndexAttr(1));
 
   for (unsigned laneIdx = 0; laneIdx < laneCount; ++laneIdx) {
     SmallVector<OpFoldResult> offsets(packedTy.getRank(),
@@ -327,8 +328,7 @@ static RankedTensorType packedTypeOf(Value v, int64_t laneCount) {
 static RankedTensorType packedOperandType(Value operand,
                                           RankedTensorType resultPackedTy) {
   Type elemTy = isa<RankedTensorType>(operand.getType())
-                    ? cast<RankedTensorType>(operand.getType())
-                          .getElementType()
+                    ? cast<RankedTensorType>(operand.getType()).getElementType()
                     : operand.getType();
   if (elemTy == resultPackedTy.getElementType())
     return resultPackedTy;
@@ -354,8 +354,8 @@ static Value widenPacked(OpBuilder &builder, Location loc, Value v,
     shape.push_back(1);
     auto nextTy = RankedTensorType::get(shape, curTy.getElementType(),
                                         curTy.getEncoding());
-    cur = builder.create<triton::ExpandDimsOp>(loc, nextTy, cur,
-                                               curTy.getRank());
+    cur =
+        builder.create<triton::ExpandDimsOp>(loc, nextTy, cur, curTy.getRank());
     curTy = nextTy;
   }
   if (curTy == dstTy)
@@ -389,9 +389,8 @@ static Value materialize(OpBuilder &builder, Location loc, PackedValue pv,
 
 // Builds a tt.reduce over `src` whose combine region is cloned from `proto`.
 // Used for per-lane reduces, where `proto` is the original reduce op.
-static Value buildReduceFromRegion(OpBuilder &builder, Location loc,
-                                   Value src, int64_t axis,
-                                   triton::ReduceOp proto) {
+static Value buildReduceFromRegion(OpBuilder &builder, Location loc, Value src,
+                                   int64_t axis, triton::ReduceOp proto) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
   OpBuilder::InsertionGuard guard(builder);
   Region &region = reduce.getCombineOp();
@@ -476,14 +475,14 @@ struct Lifter {
         builder(builder), loc(forOp.getLoc()), n(n), laneImages(n) {}
 
   // Block (straight-line) mode constructor.
-  Lifter(Operation *scope, Operation *coneStart, OpBuilder &builder,
-         unsigned n)
+  Lifter(Operation *scope, Operation *coneStart, OpBuilder &builder, unsigned n)
       : scope(scope), coneStart(coneStart), builder(builder),
         loc(scope->getLoc()), n(n), laneImages(n) {
     blockMode = true;
   }
 
-  void seed(Value packedCurrent, ArrayRef<unsigned> indices, scf::ForOp newFor) {
+  void seed(Value packedCurrent, ArrayRef<unsigned> indices,
+            scf::ForOp newFor) {
     laneIndices.assign(indices.begin(), indices.end());
     auto iterArgs = forOp.getRegionIterArgs();
     Value ref = iterArgs[laneIndices[0]];
@@ -568,7 +567,8 @@ struct Lifter {
   }
 
   bool allOperandsShared(Operation *op) {
-    return llvm::all_of(op->getOperands(), [&](Value a) { return isShared(a); });
+    return llvm::all_of(op->getOperands(),
+                        [&](Value a) { return isShared(a); });
   }
 
   bool allOperandsResolved(Operation *op) {
@@ -609,7 +609,8 @@ struct Lifter {
     return nullptr;
   }
 
-  Value emitClonedOp(Operation *op, ValueRange operands, TypeRange resultTypes) {
+  Value emitClonedOp(Operation *op, ValueRange operands,
+                     TypeRange resultTypes) {
     IRMapping mapping;
     for (auto [from, to] : llvm::zip(op->getOperands(), operands))
       mapping.map(from, to);
@@ -716,8 +717,7 @@ struct Lifter {
       // Scalar-lane -> tensor-lane: widen the packed source.
       packed = widenPacked(builder, loc, pvs[0].value, resultTy);
     } else if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-      packed = builder.create<triton::ExpandDimsOp>(loc, resultTy,
-                                                    pvs[0].value,
+      packed = builder.create<triton::ExpandDimsOp>(loc, resultTy, pvs[0].value,
                                                     expand.getAxis() + 1);
     } else if (auto trans = dyn_cast<triton::TransOp>(op)) {
       // The lane axis is inserted at 0, so every transposed axis shifts by one.
@@ -868,8 +868,8 @@ struct Lifter {
                               << *op << "\n");
       return failure();
     }
-    LLVM_DEBUG(llvm::dbgs() << "[lane-pack] dropping unmatched pure op " << *op
-                            << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "[lane-pack] dropping unmatched pure op " << *op << "\n");
     return success();
   }
 
@@ -900,8 +900,8 @@ struct Lifter {
 // Rewrite
 // ---------------------------------------------------------------------------
 
-static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
-                                         SmallPtrSetImpl<Block *> &packedBodies) {
+static LogicalResult
+rewriteLanePackLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodies) {
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
 
@@ -951,9 +951,9 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
     newInitArgs.push_back(initArgs[j]);
   }
 
-  auto newFor = builder.create<scf::ForOp>(
-      loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
-      newInitArgs);
+  auto newFor = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
+                                           forOp.getUpperBound(),
+                                           forOp.getStep(), newInitArgs);
   newFor->setAttrs(forOp->getAttrs());
 
   auto fail = [&]() -> LogicalResult {
@@ -1190,12 +1190,12 @@ static bool rewriteBlock(Block *block, Operation *scope,
   std::optional<ConcatBoundary> boundary = findConcatBoundary(block, skip);
   if (boundary)
     candidates.push_back(boundary->sources);
-  SmallVector<SmallVector<Value>> siblingGroups = findSiblingGroups(block, skip);
-  llvm::stable_sort(siblingGroups,
-                    [](const SmallVector<Value> &a,
-                       const SmallVector<Value> &b) {
-                      return a.size() > b.size();
-                    });
+  SmallVector<SmallVector<Value>> siblingGroups =
+      findSiblingGroups(block, skip);
+  llvm::stable_sort(siblingGroups, [](const SmallVector<Value> &a,
+                                      const SmallVector<Value> &b) {
+    return a.size() > b.size();
+  });
   for (SmallVector<Value> &g : siblingGroups)
     candidates.push_back(std::move(g));
 
@@ -1211,8 +1211,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     FailureOr<Cone> cone = discoverCone(seed);
     if (lanePackDebug())
       llvm::errs() << "[lane-pack]   cand " << ci << " n=" << seed.size()
-                   << " boundarySeed=" << isBoundarySeed << " cone="
-                   << (failed(cone) ? "FAIL" : "ok") << " refOps="
+                   << " boundarySeed=" << isBoundarySeed
+                   << " cone=" << (failed(cone) ? "FAIL" : "ok") << " refOps="
                    << (failed(cone) ? 0 : (int)cone->refOps.size()) << "\n";
     if (failed(cone))
       continue;
