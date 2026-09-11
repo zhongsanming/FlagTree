@@ -151,8 +151,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm)
         ascend.passes.ttir.add_triton_to_llvm(pm)
+
+        # Lower TensorView operations at the native bufferization boundary.
+        ascend.passes.ttir.add_tensor_view_lowering(pm)
+
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+
+        # Eliminate helper calls before single-function linalg conversion.
+        passes.common.add_inliner(pm)
+        passes.common.add_canonicalizer(pm)
 
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
                                                 compile_on_910_95)

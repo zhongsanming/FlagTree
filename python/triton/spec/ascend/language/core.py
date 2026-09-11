@@ -1448,6 +1448,81 @@ class tensor_descriptor_base(base_value):
         return _semantic.descriptor_scatter(self, value, x_offsets, y_offset)
 
 
+class tensor_view_type(base_type):
+    """Type of an N-dimensional logical TensorView."""
+
+    def __init__(self, element_ty: dtype, rank: int, view_kind=None, tile=(), traversal_strides=(), sparse_dims=(),
+                 padding_value="zero"):
+        self.element_ty = element_ty
+        self.rank = rank
+        self.view_kind = view_kind
+        self.tile = tuple(tile)
+        self.traversal_strides = tuple(traversal_strides)
+        self.sparse_dims = tuple(sparse_dims)
+        self.padding_value = padding_value
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[tensor_view, int]:
+        return tensor_view(handles[cursor], self.element_ty, self.rank, self.view_kind, self.tile,
+                           self.traversal_strides, self.sparse_dims, self.padding_value), cursor + 1
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(
+            builder.get_tensor_view_ty(self.element_ty.to_ir(builder), self.rank, self.view_kind or "", self.tile,
+                                       self.traversal_strides, self.sparse_dims, self.padding_value))
+
+    def __str__(self) -> str:
+        suffix = ("" if self.view_kind is None else
+                  f", {self.view_kind}, tile={self.tile}, padding={self.padding_value}")
+        return f"tensor_view<{self.element_ty}>[{self.rank}{suffix}]"
+
+    def __eq__(self, other) -> bool:
+        if type(other) is not type(self):
+            return False
+        return (self.element_ty == other.element_ty and self.rank == other.rank and self.view_kind == other.view_kind
+                and self.tile == other.tile and self.traversal_strides == other.traversal_strides
+                and self.sparse_dims == other.sparse_dims and self.padding_value == other.padding_value)
+
+    def __ne__(self, other) -> bool:
+        return not self.__eq__(other)
+
+    def mangle(self) -> str:
+        encoding = "B" if self.view_kind is None else self.view_kind.upper()
+        tile = "x".join(str(value) for value in self.tile)
+        traversal = "x".join(str(value) for value in self.traversal_strides)
+        sparse = "x".join(str(value) for value in self.sparse_dims)
+        padding = self.padding_value.upper().replace("-", "N")
+        return f"TV{self.element_ty.mangle()}R{self.rank}K{encoding}T{tile}V{traversal}S{sparse}P{padding}"
+
+
+class tensor_view(base_value):
+    """A logical tensor accessed by tiled `tl.load` and `tl.store` operations."""
+
+    def __init__(self, handle, element_ty: dtype, rank: int, view_kind=None, tile=(), traversal_strides=(),
+                 sparse_dims=(), padding_value="zero"):
+        """Internal constructor."""
+        super().__init__()
+        self.handle = handle
+        self.type = tensor_view_type(element_ty, rank, view_kind, tile, traversal_strides, sparse_dims, padding_value)
+
+    def _flatten_ir(self, handles: List[ir.value]) -> None:
+        handles.append(self.handle)
+
+    @property
+    def dtype(self):
+        return self.type.element_ty
+
+    @property
+    def rank(self):
+        return self.type.rank
+
+    @property
+    def tile(self):
+        return self.type.tile
+
+    def __str__(self) -> str:
+        return str(self.type)
+
+
 class tensor_descriptor_type(tensor_descriptor_base_type):
 
     def __init__(self, block_type: block_type, shape_type: tuple_type, strides_type: tuple_type):
@@ -2077,7 +2152,7 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 @builtin
 def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", cache_modifier="", eviction_policy="",
-         volatile=False, care_padding=True, _semantic=None):
+         volatile=False, care_padding=True, index=None, _semantic=None):
     """
     Return a tensor of data whose values are loaded from memory at location defined by `pointer`:
 
@@ -2101,10 +2176,16 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
             - `mask` and `other` must be `None`, and
             - `boundary_check` and `padding_option` can be specified to control the behavior of out-of-bound access.
 
+        (4) If `pointer` is an encoded `tl.tensor_view`, `index` selects the
+            tile to load. Construct the encoded view explicitly with
+            `make_partition_view`, `make_strided_view`, or
+            `make_gather_scatter_view`. Masks and boundary handling are not
+            supported for tensor views.
+
     :param pointer: Pointer to the data to be loaded
-    :type pointer: `triton.PointerType`, or block of `dtype=triton.PointerType`
+    :type pointer: `triton.PointerType`, block of `dtype=triton.PointerType`, or `tl.tensor_view`
     :param mask: if `mask[idx]` is false, do not load the data at address `pointer[idx]`
-        (must be `None` with block pointers)
+        (must be `None` with block pointers and tensor views)
     :type mask: Block of `triton.int1`, optional
     :param other: if `mask[idx]` is false, return `other[idx]`
     :type other: Block, optional
@@ -2125,7 +2206,16 @@ def load(pointer, mask=None, other=None, boundary_check=(), padding_option="", c
         2. if 'other' is None and 'care_padding' = True, loaded tensor will fill zeroes on masked places.
         3. if 'other' is None and 'care_padding' = False, masked places on loaded tensor will be random values, and tl.load may have a better performence.
     :type care_padding: bool, optional
+    :param index: (`tl.tensor_view` only) the tile's position, one entry per dimension
+    :type index: sequence of int or tensor, required with `pointer` a `tl.tensor_view`
     """
+    if isinstance(pointer, tensor_view):
+        if mask is not None or other is not None or boundary_check or padding_option:
+            raise ValueError("`mask`, `other`, `boundary_check`, and `padding_option` are not supported when loading a "
+                             "`tl.tensor_view`")
+        if index is None:
+            raise ValueError("`index` is required when loading a `tl.tensor_view`")
+        return _semantic.tensor_view_load(pointer, index)
     # `mask` and `other` can be constexpr
     mask = _unwrap_if_constexpr(mask)
     other = _unwrap_if_constexpr(other)
@@ -2158,7 +2248,8 @@ def store_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[cons
 
 @_tensor_member_fn
 @builtin
-def store(pointer, value, mask=None, boundary_check=(), cache_modifier="", eviction_policy="", _semantic=None):
+def store(pointer, value, mask=None, boundary_check=(), cache_modifier="", eviction_policy="", index=None,
+          _semantic=None):
     """
     Store a tensor of data into memory locations defined by `pointer`.
 
@@ -2180,13 +2271,20 @@ def store(pointer, value, mask=None, boundary_check=(), cache_modifier="", evict
             - `mask` must be None, and
             - `boundary_check` can be specified to control the behavior of out-of-bound access.
 
+        (4) If `pointer` is an encoded `tl.tensor_view`, `index` selects the
+            tile to store. Construct the encoded view explicitly with
+            `make_partition_view`, `make_strided_view`, or
+            `make_gather_scatter_view`. Masks and boundary handling are not
+            supported for tensor views.
+
     `value` is implicitly broadcast to `pointer.shape` and typecast to `pointer.dtype.element_ty`.
 
     :param pointer: The memory location where the elements of `value` are stored
-    :type pointer: `triton.PointerType`, or block of `dtype=triton.PointerType`
+    :type pointer: `triton.PointerType`, block of `dtype=triton.PointerType`, or `tl.tensor_view`
     :param value: The tensor of elements to be stored
     :type value: Block
     :param mask: If `mask[idx]` is false, do not store `value[idx]` at `pointer[idx]`
+        (must be `None` with block pointers and tensor views)
     :type mask: Block of triton.int1, optional
     :param boundary_check: tuple of integers, indicating the dimensions which should do the boundary check
     :type boundary_check: tuple of ints, optional
@@ -2196,9 +2294,17 @@ def store(pointer, value, mask=None, boundary_check=(), cache_modifier="", evict
         stands for cache write-through, see `cache operator <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators>`_ for more details.
     :param eviction_policy: changes eviction policy in NVIDIA PTX
     :type eviction_policy: str, optional, should be one of {"", "evict_first", "evict_last"}
+    :param index: (`tl.tensor_view` only) the tile's position, one entry per dimension
+    :type index: sequence of int or tensor, required with `pointer` a `tl.tensor_view`
     """
     # `value` can be constexpr
     value = _semantic.to_tensor(value)
+    if isinstance(pointer, tensor_view):
+        if mask is not None or boundary_check:
+            raise ValueError("`mask` and `boundary_check` are not supported when storing to a `tl.tensor_view`")
+        if index is None:
+            raise ValueError("`index` is required when storing to a `tl.tensor_view`")
+        return _semantic.tensor_view_store(pointer, value, index)
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:
         mask = _semantic.to_tensor(mask)
@@ -2235,6 +2341,35 @@ def advance(base, offsets, _semantic=None):
     :param offsets: the offsets to advance, a tuple by dimension
     """
     return _semantic.advance(base, offsets)
+
+
+@builtin
+def make_partition_view(base: tensor, shape, strides, tile, padding_value="zero", _semantic=None) -> tensor_view:
+    """Create a tiled partition view over a scalar base pointer.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_partition_view(base, shape, strides, tile, padding_value)
+
+
+@builtin
+def make_strided_view(base: tensor, shape, strides, tile, traversal_strides,
+                      padding_value="zero", _semantic=None) -> tensor_view:
+    """Create a tiled pointer view whose origins advance by ``traversal_strides``.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_strided_view(base, shape, strides, tile, traversal_strides, padding_value)
+
+
+@builtin
+def make_gather_scatter_view(base: tensor, shape, strides, tile, sparse_dim,
+                             padding_value="zero", _semantic=None) -> tensor_view:
+    """Create a pointer view with tensor-valued indices in selected dimensions.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_gather_scatter_view(base, shape, strides, tile, sparse_dim, padding_value)
 
 
 @builtin
@@ -2763,8 +2898,14 @@ def histogram(input, num_bins, mask=None, _semantic=None, _generator=None):
 
 @_tensor_member_fn
 @builtin
-def gather(src, index, axis, _semantic=None):
-    """Gather from a tensor along a given dimension.
+def gather(src, index, axis=None, *coordinates, _semantic=None):
+    """Gather values from a tensor.
+
+    For a tensor of pointers, ``index``, ``axis``, and ``coordinates`` are
+    interpreted as one Python compile-time ``list[int]`` per pointer-tensor
+    dimension. Entries at the same list position form one zipped N-D
+    coordinate. For a value tensor, this retains the existing
+    ``gather(src, index, axis)`` behavior.
 
     :param src: the source tensor
     :type src: Tensor
@@ -2774,8 +2915,29 @@ def gather(src, index, axis, _semantic=None):
     :type axis: int
 
     """
+    if src.type.is_block() and src.dtype.is_ptr():
+        pointer_coordinates = (index, )
+        if axis is not None:
+            pointer_coordinates += (axis, )
+        pointer_coordinates += coordinates
+        return _semantic.tensor_view_ptr_load(src, pointer_coordinates)
+    if coordinates:
+        raise ValueError("Additional coordinates are only supported when gathering from a tensor of pointers")
+    if axis is None:
+        raise ValueError("Expected `axis` when gathering from a value tensor")
     axis = _unwrap_if_constexpr(axis)
     return _semantic.gather(src, index, axis)
+
+
+@builtin
+def scatter(pointers, value, index, *coordinates, _semantic=None):
+    """Scatter a 1-D value tensor to zipped coordinates in an N-D pointer tensor.
+
+    ``index`` and every entry in ``coordinates`` must be Python compile-time
+    ``list[int]`` objects. Exactly one list is required for each dimension of
+    ``pointers``.
+    """
+    return _semantic.tensor_view_ptr_store(pointers, value, (index, ) + coordinates)
 
 
 @builtin
