@@ -564,7 +564,14 @@ struct Lifter {
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
-      Operation *oi = findLaneOp(reduce, i);
+      // Prefer the mapping computed by cone discovery: structurally identical
+      // siblings (e.g. several tt.splat of the same scalar) cannot be told
+      // apart by findLaneOp, so re-discovering here could pick the wrong one.
+      Operation *oi = nullptr;
+      if (Value img = laneImages[i].lookup(reduce->getResult(0)))
+        oi = img.getDefiningOp();
+      else
+        oi = findLaneOp(reduce, i);
       if (!oi) {
         if (lanePackDebug() && debugBudget-- > 0)
           llvm::errs() << "[lane-pack]     reduce findLaneOp fail lane=" << i
@@ -622,7 +629,12 @@ struct Lifter {
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
-      Operation *oi = findLaneOp(op, i);
+      // Prefer the discovery mapping (see liftLaneReduce).
+      Operation *oi = nullptr;
+      if (Value img = laneImages[i].lookup(op->getResult(0)))
+        oi = img.getDefiningOp();
+      else
+        oi = findLaneOp(op, i);
       if (!oi) {
         if (lanePackDebug() && debugBudget-- > 0)
           llvm::errs() << "[lane-pack]     findLaneOp fail lane=" << i
