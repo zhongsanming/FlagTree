@@ -298,7 +298,17 @@ static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
 // ---------------------------------------------------------------------------
 
 struct Lifter {
+  // Loop mode: the loop being packed. Block mode: null.
   scf::ForOp forOp;
+  // Operation whose body contains the packed computation. Values defined
+  // outside it are lane-invariant.
+  Operation *scope = nullptr;
+  // Block whose arguments are the lanes (loop body in loop mode, null in block
+  // mode).
+  Block *laneBody = nullptr;
+  // In block mode, values defined before this op are lane-invariant. Null in
+  // loop mode.
+  Operation *coneStart = nullptr;
   OpBuilder &builder;
   Location loc;
   unsigned n;
@@ -314,8 +324,14 @@ struct Lifter {
   SmallVector<DenseMap<Value, Value>> laneImages;
 
   Lifter(scf::ForOp forOp, OpBuilder &builder, unsigned n)
-      : forOp(forOp), builder(builder), loc(forOp.getLoc()), n(n),
-        laneImages(n) {}
+      : forOp(forOp), scope(forOp.getOperation()), laneBody(forOp.getBody()),
+        builder(builder), loc(forOp.getLoc()), n(n), laneImages(n) {}
+
+  // Block (straight-line) mode constructor.
+  Lifter(Operation *scope, Operation *coneStart, OpBuilder &builder,
+         unsigned n)
+      : scope(scope), coneStart(coneStart), builder(builder),
+        loc(scope->getLoc()), n(n), laneImages(n) {}
 
   void seed(Value packedCurrent, ArrayRef<unsigned> indices, scf::ForOp newFor) {
     laneIndices.assign(indices.begin(), indices.end());
@@ -340,8 +356,10 @@ struct Lifter {
 
   // A loop body block argument that is one of the lane iter args.
   bool isLaneArg(Value v) {
+    if (!laneBody)
+      return false;
     auto barg = dyn_cast<BlockArgument>(v);
-    if (!barg || barg.getOwner() != forOp.getBody())
+    if (!barg || barg.getOwner() != laneBody)
       return false;
     unsigned idx = barg.getArgNumber();
     if (idx == 0)
@@ -360,7 +378,12 @@ struct Lifter {
     Operation *def = v.getDefiningOp();
     if (!def)
       return true;
-    return !forOp->isAncestor(def);
+    if (!scope->isAncestor(def))
+      return true;
+    if (coneStart && def->getBlock() == coneStart->getBlock() &&
+        def->isBeforeInBlock(coneStart))
+      return true;
+    return false;
   }
 
   std::optional<PackedValue> getPacked(Value v) {
@@ -370,7 +393,7 @@ struct Lifter {
     if (isLaneArg(v))
       return std::nullopt;
     if (auto barg = dyn_cast<BlockArgument>(v)) {
-      if (barg.getOwner() == forOp.getBody() && barg.getArgNumber() >= 1) {
+      if (laneBody && barg.getOwner() == laneBody && barg.getArgNumber() >= 1) {
         auto rit = argRemap.find(v);
         if (rit != argRemap.end())
           return PackedValue{rit->second, true};
@@ -378,7 +401,12 @@ struct Lifter {
       return PackedValue{v, true};
     }
     Operation *def = v.getDefiningOp();
-    if (!def || !forOp->isAncestor(def))
+    if (!def)
+      return PackedValue{v, true};
+    if (!scope->isAncestor(def))
+      return PackedValue{v, true};
+    if (coneStart && def->getBlock() == coneStart->getBlock() &&
+        def->isBeforeInBlock(coneStart))
       return PackedValue{v, true};
     return std::nullopt;
   }
