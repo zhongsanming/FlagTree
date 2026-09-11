@@ -43,13 +43,11 @@ namespace mlir::triton {
 
 namespace {
 
-// Debug logging. On by default for the current diagnostic round; set
-// LANE_PACK_DEBUG=0 to silence it.
+// Debug logging, off unless LANE_PACK_DEBUG is set in the environment. This is
+// intentionally independent of LLVM_DEBUG so release builds can produce
+// diagnostics on request.
 static bool lanePackDebug() {
-  static const bool enabled = [] {
-    const char *v = ::getenv("LANE_PACK_DEBUG");
-    return !v || llvm::StringRef(v) != "0";
-  }();
+  static const bool enabled = ::getenv("LANE_PACK_DEBUG") != nullptr;
   return enabled;
 }
 
