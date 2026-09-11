@@ -248,17 +248,35 @@ static void eraseDeadTree(Value v) {
 
 // Ops that map to a single packed op when applied lane-wise. Shape ops are
 // allowed here but handled explicitly by the emitter.
+//
+// A compute value is a scalar, or a vector/tensor whose element type is a
+// number. Pointers, buffers, memrefs and tokens are addressing/memory, not
+// math, and the pass must never materialise them in packed form.
+static bool isComputeType(Type type) {
+  if (isa<BaseMemRefType>(type))
+    return false;
+  Type elem = type;
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    elem = shaped.getElementType();
+  return isa<IntegerType, FloatType, IndexType, ComplexType>(elem);
+}
+
+// Packable ops may only produce and consume compute values.
+static bool hasOnlyComputeTypes(Operation *op) {
+  return llvm::all_of(op->getOperands(),
+                      [](Value v) { return isComputeType(v.getType()); }) &&
+         llvm::all_of(op->getResultTypes(),
+                      [](Type t) { return isComputeType(t); });
+}
+
 static bool isPackableElementwise(Operation *op) {
-  // Pointer arithmetic (tt.addptr) is addressing, not math. Packing it would
-  // materialise pointer-typed tensors (via tensor.concat/reshape) that the
-  // downstream offset analysis cannot parse; leave addressing to other passes.
-  for (Type type : op->getResultTypes()) {
-    Type elem = type;
-    if (auto tensor = dyn_cast<RankedTensorType>(type))
-      elem = tensor.getElementType();
-    if (isa<triton::PointerType>(elem))
-      return false;
-  }
+  // Pure math on compute values only. This rejects addressing ops such as
+  // tt.addptr and tt.ptr_to_int (pointer operands/results) as well as buffer
+  // materialisations, so a packed cone can never contain pointer/buffer types.
+  if (!hasOnlyComputeTypes(op))
+    return false;
+  // An Elementwise op applies pointwise and broadcasts its operands to the
+  // result shape, so adding a leading lane dimension preserves the op.
   if (op->hasTrait<OpTrait::Elementwise>())
     return true;
   return isa<arith::SelectOp, arith::BitcastOp, triton::SplatOp,
@@ -876,8 +894,8 @@ struct Lifter {
     if (!isMemoryEffectFree(op)) {
       if (blockMode)
         return success(); // boundary: leave the op in place
-      LLVM_DEBUG(llvm::dbgs() << "[lane-pack] reject: effectful op " << *op
-                              << "\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[lane-pack] reject: effectful op " << *op << "\n");
       return failure();
     }
     if (allOperandsShared(op))
@@ -1175,9 +1193,10 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
                        << op0->getName() << "\n";
         return failure();
       }
-      if (!isa<RankedTensorType>(ref.getType())) {
+      if (!isa<RankedTensorType>(ref.getType()) ||
+          !isComputeType(ref.getType())) {
         if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: non-tensor leaf " << ref
+          llvm::errs() << "[lane-pack] cone fail: non-compute leaf " << ref
                        << "\n";
         return failure();
       }
