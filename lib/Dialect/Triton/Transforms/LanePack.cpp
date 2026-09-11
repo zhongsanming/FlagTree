@@ -139,6 +139,16 @@ static void eraseDeadTree(Value v) {
 // Math predicates
 // ---------------------------------------------------------------------------
 
+// Ops that map to a single packed op when applied lane-wise. Shape ops are
+// allowed here but handled explicitly by the emitter.
+static bool isPackableElementwise(Operation *op) {
+  if (op->hasTrait<OpTrait::Elementwise>())
+    return true;
+  return isa<arith::SelectOp, arith::BitcastOp, triton::SplatOp,
+             triton::BroadcastOp, triton::ExpandDimsOp, triton::TransOp,
+             triton::ReshapeOp, tensor::ReshapeOp>(op);
+}
+
 // Associative/commutative ops that can be realized as a tt.reduce over the
 // synthesized lane axis.
 static bool isAssociativeCombine(Operation *op) {
@@ -481,8 +491,7 @@ struct Lifter {
       return failure();
     if (isa<triton::ReduceOp>(op))
       return liftLaneReduce(cast<triton::ReduceOp>(op));
-    // Shape-changing / region ops need explicit lane-axis remapping; defer.
-    if (isa<triton::TransOp, tensor::ReshapeOp>(op) || op->getNumRegions() != 0)
+    if (op->getNumRegions() != 0 || !isPackableElementwise(op))
       return failure();
 
     SmallVector<PackedValue> pvs;
@@ -510,6 +519,28 @@ struct Lifter {
       packed = builder.create<triton::ExpandDimsOp>(loc, resultTy,
                                                     pvs[0].value,
                                                     expand.getAxis() + 1);
+    } else if (auto trans = dyn_cast<triton::TransOp>(op)) {
+      // The lane axis is inserted at 0, so every transposed axis shifts by one.
+      IRMapping mapping;
+      mapping.map(trans.getSrc(), pvs[0].value);
+      auto newTrans = cast<triton::TransOp>(builder.clone(*op, mapping));
+      newTrans.getResult().setType(resultTy);
+      SmallVector<int32_t> order{0};
+      for (int32_t axis : trans.getOrder())
+        order.push_back(axis + 1);
+      newTrans.setOrder(order);
+      packed = newTrans.getResult();
+    } else if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+      // Element reordering could move data across lanes.
+      if (reshape.getAllowReorder())
+        return failure();
+      packed = emitClonedOp(op, {pvs[0].value}, resultTy);
+    } else if (isa<tensor::ReshapeOp>(op)) {
+      // Rebuild the shape operand for the packed shape; the lane dimension is
+      // outermost so each lane's element order is preserved.
+      Value shape = buildShapeConst(builder, loc, resultTy.getShape());
+      packed = builder.create<tensor::ReshapeOp>(loc, resultTy, pvs[0].value,
+                                                 shape);
     } else {
       SmallVector<Value> operands;
       for (auto [a, pv] : llvm::zip(op->getOperands(), pvs)) {
