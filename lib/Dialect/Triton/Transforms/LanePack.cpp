@@ -244,9 +244,20 @@ static Value buildReduceFromRegion(OpBuilder &builder, Location loc,
                                    Value src, int64_t axis,
                                    triton::ReduceOp proto) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
+  OpBuilder::InsertionGuard guard(builder);
   Region &region = reduce.getCombineOp();
+  Block *block = builder.createBlock(&region);
+  auto elemTy = cast<RankedTensorType>(src.getType()).getElementType();
+  block->addArgument(elemTy, loc);
+  block->addArgument(elemTy, loc);
+  builder.setInsertionPointToStart(block);
+  Operation *combiner = proto.getSingleCombiner();
+  Block &protoBlock = proto.getCombineOp().front();
   IRMapping mapping;
-  proto.getCombineOp().cloneInto(&region, mapping);
+  mapping.map(protoBlock.getArgument(0), block->getArgument(0));
+  mapping.map(protoBlock.getArgument(1), block->getArgument(1));
+  Operation *c = builder.clone(*combiner, mapping);
+  builder.create<triton::ReduceReturnOp>(loc, c->getResult(0));
   return reduce->getResult(0);
 }
 
@@ -256,12 +267,12 @@ static Value buildReduceFromRegion(OpBuilder &builder, Location loc,
 static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
                                  int64_t axis, Operation *kind) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
+  OpBuilder::InsertionGuard guard(builder);
   Region &region = reduce.getCombineOp();
   Block *block = builder.createBlock(&region);
   auto elemTy = cast<RankedTensorType>(src.getType()).getElementType();
   block->addArgument(elemTy, loc);
   block->addArgument(elemTy, loc);
-  OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(block);
   OperationState state(loc, kind->getName());
   state.addOperands({block->getArgument(0), block->getArgument(1)});
