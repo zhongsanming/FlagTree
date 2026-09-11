@@ -738,4 +738,18 @@ module {
 
   // CHECK-LABEL: tt.func @external_use_before_emission(
   // CHECK: tensor.concat
+
+  // Addressing is not math: pointer arithmetic must never be packed into
+  // pointer-typed tensors (the offset analysis cannot parse those).
+  tt.func @no_pack_addptr(%ptrs: tensor<8x!tt.ptr<f32>>) -> (tensor<8x!tt.ptr<f32>>, tensor<8x!tt.ptr<f32>>) {
+    %r0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %r1 = tt.make_range {end = 16 : i32, start = 8 : i32} : tensor<8xi32>
+    %p0 = tt.addptr %ptrs, %r0 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
+    %p1 = tt.addptr %ptrs, %r1 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
+    tt.return %p0, %p1 : tensor<8x!tt.ptr<f32>>, tensor<8x!tt.ptr<f32>>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_addptr(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
 }
