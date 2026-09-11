@@ -147,7 +147,7 @@ static bool isPackableElementwise(Operation *op) {
     return true;
   return isa<arith::SelectOp, arith::BitcastOp, triton::SplatOp,
              triton::BroadcastOp, triton::ExpandDimsOp, triton::TransOp,
-             triton::ReshapeOp, tensor::ReshapeOp>(op);
+             triton::ReshapeOp>(op);
 }
 
 // Associative/commutative ops that can be realized as a tt.reduce over the
@@ -586,12 +586,6 @@ struct Lifter {
       if (reshape.getAllowReorder())
         return failure();
       packed = emitClonedOp(op, {pvs[0].value}, resultTy);
-    } else if (isa<tensor::ReshapeOp>(op)) {
-      // Rebuild the shape operand for the packed shape; the lane dimension is
-      // outermost so each lane's element order is preserved.
-      Value shape = buildShapeConst(builder, loc, resultTy.getShape());
-      packed = builder.create<tensor::ReshapeOp>(loc, resultTy, pvs[0].value,
-                                                 shape);
     } else {
       SmallVector<Value> operands;
       for (auto [a, pv] : llvm::zip(op->getOperands(), pvs)) {
@@ -759,7 +753,8 @@ struct Lifter {
 // Rewrite
 // ---------------------------------------------------------------------------
 
-static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
+static LogicalResult rewriteLanePackLoop(scf::ForOp forOp,
+                                         SmallPtrSetImpl<Block *> &packedBodies) {
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
 
@@ -852,6 +847,7 @@ static LogicalResult rewriteLanePackLoop(scf::ForOp forOp) {
 
   for (unsigned j = 0; j < m; ++j)
     forOp.getResult(j).replaceAllUsesWith(newResults[j]);
+  packedBodies.insert(newFor.getBody());
   forOp.erase();
   return success();
 }
@@ -971,15 +967,48 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
   return cone;
 }
 
+// A packing boundary (tensor.concat created by the loop rewrite, or by an
+// explicit pack) exposes exactly the lane values of a cone: use the values
+// feeding the concat (looking through the per-lane reshapes) as the seed.
+static SmallVector<Value> findConcatSeed(Block *block) {
+  for (Operation &op : *block) {
+    auto concat = dyn_cast<tensor::ConcatOp>(&op);
+    if (!concat)
+      continue;
+    SmallVector<Value> seed;
+    for (Value input : concat.getInputs()) {
+      Value src = input;
+      if (auto reshape = input.getDefiningOp<tensor::ReshapeOp>())
+        src = reshape.getSource();
+      seed.push_back(src);
+    }
+    if (seed.size() < 2)
+      continue;
+    Type ty = seed.front().getType();
+    if (!isa<RankedTensorType>(ty))
+      continue;
+    if (!llvm::all_of(seed, [&](Value v) { return v.getType() == ty; }))
+      continue;
+    return seed;
+  }
+  return {};
+}
+
 // Packs one lane cone in a straight-line block. Returns true if anything was
 // rewritten.
 static bool rewriteBlock(Block *block, Operation *scope) {
-  SmallVector<SmallVector<Value>> candidates = findSiblingGroups(block);
-  llvm::stable_sort(candidates,
+  SmallVector<SmallVector<Value>> candidates;
+  SmallVector<Value> concatSeed = findConcatSeed(block);
+  if (!concatSeed.empty())
+    candidates.push_back(concatSeed);
+  SmallVector<SmallVector<Value>> siblingGroups = findSiblingGroups(block);
+  llvm::stable_sort(siblingGroups,
                     [](const SmallVector<Value> &a,
                        const SmallVector<Value> &b) {
                       return a.size() > b.size();
                     });
+  for (SmallVector<Value> &g : siblingGroups)
+    candidates.push_back(std::move(g));
 
   for (SmallVector<Value> &seed : candidates) {
     FailureOr<Cone> cone = discoverCone(seed);
@@ -1096,17 +1125,24 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
   using TritonLanePackBase::TritonLanePackBase;
 
   void runOnOperation() override {
+    SmallPtrSet<Block *, 16> packedBodies;
     getOperation().walk([&](scf::ForOp forOp) {
-      if (succeeded(rewriteLanePackLoop(forOp)))
+      if (succeeded(rewriteLanePackLoop(forOp, packedBodies)))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed loop\n");
     });
 
+    // Straight-line packing runs on every block (the lane-parallel prologue is
+    // often inside an outer loop body), except the loop bodies already produced
+    // by the loop rewrite.
     SmallVector<Block *> blocks;
-    getOperation().walk([&](triton::FuncOp funcOp) {
-      for (Block &block : funcOp.getBody())
-        blocks.push_back(&block);
+    getOperation().walk([&](Operation *op) {
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          blocks.push_back(&block);
     });
     for (Block *block : blocks) {
+      if (packedBodies.contains(block))
+        continue;
       if (rewriteBlock(block, block->getParentOp()))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
     }
