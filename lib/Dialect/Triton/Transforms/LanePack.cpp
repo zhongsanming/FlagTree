@@ -154,9 +154,19 @@ static bool isPackableElementwise(Operation *op) {
 // synthesized lane axis.
 static bool isAssociativeCombine(Operation *op) {
   return isa<arith::AddFOp, arith::AddIOp, arith::MulFOp, arith::MulIOp,
-             arith::MaximumFOp, arith::MinimumFOp, arith::MaxSIOp,
-             arith::MaxUIOp, arith::MinSIOp, arith::MinUIOp, arith::AndIOp,
-             arith::OrIOp, arith::XOrIOp>(op);
+             arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp,
+             arith::MinNumFOp, arith::MaxSIOp, arith::MaxUIOp, arith::MinSIOp,
+             arith::MinUIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op);
+}
+
+// Ops the lifter can emit for a lane group: elementwise/shape ops and
+// tt.reduce with an associative combiner.
+static bool isLiftableOp(Operation *op) {
+  if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
+    Operation *combiner = reduce.getSingleCombiner();
+    return combiner && isAssociativeCombine(combiner);
+  }
+  return isPackableElementwise(op) && op->getNumRegions() == 0;
 }
 
 static void collectAssociativeLeaves(Value v, StringRef opName,
@@ -703,11 +713,8 @@ struct Lifter {
   }
 
   LogicalResult liftOp(Operation *op) {
-    if (allOperandsShared(op)) {
-      if (blockMode)
-        return success(); // don't clone unrelated lane-invariant ops
+    if (allOperandsShared(op))
       return liftSharedOp(op);
-    }
     if (allOperandsResolved(op))
       return liftPerLaneOp(op);
     if (succeeded(liftCrossLane(op)))
@@ -930,8 +937,7 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       cone.laneImages[i][ref] = group[i];
 
     Operation *op0 = ref.getDefiningOp();
-    bool isLeaf =
-        !op0 || !isPackableElementwise(op0) || op0->getNumRegions() != 0;
+    bool isLeaf = !op0 || !isLiftableOp(op0);
     if (!isLeaf) {
       for (unsigned i = 1; i < cone.n; ++i) {
         Operation *oi = group[i].getDefiningOp();
@@ -1132,13 +1138,27 @@ static bool rewriteBlock(Block *block, Operation *scope) {
     for (Operation *op : lifter.liftedOps)
       if (op->getBlock() == block)
         toErase.push_back(op);
-    // Erase users before defs so uses among the erased ops drop first.
     llvm::stable_sort(toErase, [](Operation *a, Operation *b) {
       return a->isBeforeInBlock(b);
     });
     for (Operation *op : llvm::reverse(toErase))
       if (op->use_empty())
         op->erase();
+
+    // Sweep up any original ops that became dead (e.g. the sibling lanes of a
+    // value that escaped only through an erased reshape).
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (Operation &op : llvm::make_early_inc_range(*block)) {
+        if (&op == block->getTerminator())
+          continue;
+        if (op.use_empty() && isMemoryEffectFree(&op)) {
+          op.erase();
+          changed = true;
+        }
+      }
+    }
     return true;
   }
   return false;
@@ -1170,6 +1190,12 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
     for (Block *block : blocks) {
       if (packedBodies.contains(block))
         continue;
+      // Loop bodies with iter args are the loop rewrite's job; only pack
+      // straight-line code (e.g. the body of the outer token loop, which has no
+      // iter args).
+      if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp()))
+        if (forOp.getNumRegionIterArgs() > 0)
+          continue;
       if (rewriteBlock(block, block->getParentOp()))
         LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed block\n");
     }
