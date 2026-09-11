@@ -856,6 +856,10 @@ struct Lifter {
   }
 
   LogicalResult liftOp(Operation *op) {
+    // A value already seeded as a leaf (or otherwise handled) needs no lifting;
+    // re-cloning it as a shared op would be wrong.
+    if (op->getNumResults() == 1 && packedOf.contains(op->getResult(0)))
+      return success();
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
@@ -1315,6 +1319,13 @@ static bool rewriteBlock(Block *block, Operation *scope,
       for (auto &entry : lifter.laneImages[i])
         lifter.laneVarying.insert(entry.second);
 
+    // Snapshot the ops to visit before emitting anything: emitted ops are
+    // inserted before emissionPoint, which lies inside [processStart, end), so
+    // walking getNextNode() live would also visit (and re-lift) them.
+    SmallVector<Operation *> worklist;
+    for (Operation *op = processStart; op; op = op->getNextNode())
+      worklist.push_back(op);
+
     DenseSet<Value> leafRefs;
     for (SmallVector<Value> &g : cone->leafGroups) {
       Value packed = buildPackedLanes(builder, loc, g);
@@ -1327,11 +1338,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     }
 
     // Lift the cone plus any forward lane-parallel extension.
-    for (Operation *op = processStart; op;) {
-      Operation *next = op->getNextNode();
+    for (Operation *op : worklist)
       (void)lifter.liftOp(op);
-      op = next;
-    }
     if (lanePackDebug())
       llvm::errs() << "[lane-pack]   lifted=" << lifter.liftedOps.size()
                    << "\n";

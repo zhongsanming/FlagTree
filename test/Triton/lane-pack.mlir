@@ -704,4 +704,22 @@ module {
   // CHECK-LABEL: tt.func @unrolled_families(
   // CHECK-NOT: tensor<8x
   // CHECK: tensor<4x4xf32>
+
+  // A leaf defined after the first cone op makes the emission point differ
+  // from the cone start; the lifter must not walk into its own emitted ops.
+  tt.func @interleaved_leaf_cone(%a0: tensor<8xf32>, %a1: tensor<8xf32>, %b0: tensor<8xf32>, %b1: tensor<8xf32>) -> (tensor<8xf32>, tensor<8xf32>) {
+    %r0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %cst = arith.constant dense<0> : tensor<8xi32>
+    %c0 = arith.cmpi slt, %r0, %cst : tensor<8xi32>
+    %r1 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+    %c1 = arith.cmpi slt, %r1, %cst : tensor<8xi32>
+    %s0 = arith.select %c0, %a0, %b0 : tensor<8xi1>, tensor<8xf32>
+    %s1 = arith.select %c1, %a1, %b1 : tensor<8xi1>, tensor<8xf32>
+    tt.return %s0, %s1 : tensor<8xf32>, tensor<8xf32>
+  }
+
+  // CHECK-LABEL: tt.func @interleaved_leaf_cone(
+  // CHECK: tensor.concat
+  // CHECK: arith.cmpi
+  // CHECK: arith.select
 }
