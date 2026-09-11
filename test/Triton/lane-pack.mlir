@@ -448,7 +448,7 @@ module {
 
   // CHECK-LABEL: tt.func @trans_lanes(
   // CHECK: tensor.concat
-  // CHECK: "tt.trans"(%{{.*}}) <{order = array<i32: 0, 2, 1>}>
+  // CHECK: tt.trans %{{.*}} {order = array<i32: 0, 2, 1>}
 
   tt.func @straight_line(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %y0: tensor<4xf32>, %y1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
     %r0 = arith.addf %x0, %y0 : tensor<4xf32>
@@ -499,6 +499,36 @@ module {
   }
 
   // CHECK-LABEL: tt.func @prologue_in_outer_loop(
+  // CHECK: tensor.concat
+  // CHECK: arith.addf
+
+  tt.func @prologue_feeds_packed_loop(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %y0: tensor<4xf32>, %y1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %r0 = arith.addf %x0, %y0 : tensor<4xf32>
+    %r1 = arith.addf %x1, %y1 : tensor<4xf32>
+    %cst = arith.constant dense<[1, 4]> : tensor<2xi64>
+    %reshape0 = tensor.reshape %r0(%cst) : (tensor<4xf32>, tensor<2xi64>) -> tensor<1x4xf32>
+    %reshape1 = tensor.reshape %r1(%cst) : (tensor<4xf32>, tensor<2xi64>) -> tensor<1x4xf32>
+    %concat = tensor.concat dim(0) %reshape0, %reshape1 : (tensor<1x4xf32>, tensor<1x4xf32>) -> tensor<2x4xf32>
+    %0 = scf.for %i = %lb to %ub step %step iter_args(%acc = %concat) -> (tensor<2x4xf32>) {
+      %rd = "tt.reduce"(%acc) <{axis = 1 : i32}> ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b : f32
+        tt.reduce.return %s : f32
+      }) : (tensor<2x4xf32>) -> tensor<2xf32>
+      %ed = tt.expand_dims %rd {axis = 1 : i32} : tensor<2xf32> -> tensor<2x1xf32>
+      %bc = tt.broadcast %ed : tensor<2x1xf32> -> tensor<2x4xf32>
+      %d = arith.divf %acc, %bc : tensor<2x4xf32>
+      scf.yield %d : tensor<2x4xf32>
+    }
+    %cst2 = arith.constant dense<4> : tensor<1xi64>
+    %e0 = tensor.extract_slice %0[0, 0] [1, 4] [1, 1] : tensor<2x4xf32> to tensor<1x4xf32>
+    %res0 = tensor.reshape %e0(%cst2) : (tensor<1x4xf32>, tensor<1xi64>) -> tensor<4xf32>
+    %e1 = tensor.extract_slice %0[1, 0] [1, 4] [1, 1] : tensor<2x4xf32> to tensor<1x4xf32>
+    %res1 = tensor.reshape %e1(%cst2) : (tensor<1x4xf32>, tensor<1xi64>) -> tensor<4xf32>
+    tt.return %res0, %res1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @prologue_feeds_packed_loop(
   // CHECK: tensor.concat
   // CHECK: arith.addf
 }
