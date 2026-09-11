@@ -249,6 +249,16 @@ static void eraseDeadTree(Value v) {
 // Ops that map to a single packed op when applied lane-wise. Shape ops are
 // allowed here but handled explicitly by the emitter.
 static bool isPackableElementwise(Operation *op) {
+  // Pointer arithmetic (tt.addptr) is addressing, not math. Packing it would
+  // materialise pointer-typed tensors (via tensor.concat/reshape) that the
+  // downstream offset analysis cannot parse; leave addressing to other passes.
+  for (Type type : op->getResultTypes()) {
+    Type elem = type;
+    if (auto tensor = dyn_cast<RankedTensorType>(type))
+      elem = tensor.getElementType();
+    if (isa<triton::PointerType>(elem))
+      return false;
+  }
   if (op->hasTrait<OpTrait::Elementwise>())
     return true;
   return isa<arith::SelectOp, arith::BitcastOp, triton::SplatOp,
