@@ -1135,6 +1135,17 @@ static bool rewriteBlock(Block *block, Operation *scope) {
         llvm::errs() << "[lane-pack]   skip: leaf after cone start\n";
       continue;
     }
+    if (lanePackDebug()) {
+      llvm::errs() << "[lane-pack]   insertBefore: " << *insertBefore
+                   << "\n[lane-pack]   leafGroups=" << cone->leafGroups.size()
+                   << "\n";
+      for (SmallVector<Value> &g : cone->leafGroups) {
+        llvm::errs() << "[lane-pack]     leaf:";
+        for (Value v : g)
+          llvm::errs() << " " << v;
+        llvm::errs() << "\n";
+      }
+    }
 
     OpBuilder builder(insertBefore);
     Location loc = insertBefore->getLoc();
