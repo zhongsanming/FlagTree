@@ -1347,6 +1347,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     // If this cone is the producer of a pack boundary, hand the packed result
     // straight to the concat's users instead of unpacking and re-packing.
     if (isBoundarySeed) {
+      // Never retry this boundary, consumed or not.
+      skip.insert(boundary->concat);
       auto it = lifter.packedOf.find(boundary->sources.front());
       if (it != lifter.packedOf.end() && !it->second.shared &&
           it->second.value.getType() ==
