@@ -530,7 +530,9 @@ module {
 
   // CHECK-LABEL: tt.func @prologue_feeds_packed_loop(
   // CHECK: tensor.concat
-  // CHECK: arith.addf
+  // CHECK: tensor.concat
+  // CHECK: %[[PACKED:.*]] = arith.addf
+  // CHECK: scf.for {{.*}} iter_args(%{{.*}} = %[[PACKED]])
 
   tt.func @softmax_prologue_feeds_packed_loop(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
     %m0 = "tt.reduce"(%x0) <{axis = 0 : i32}> ({
