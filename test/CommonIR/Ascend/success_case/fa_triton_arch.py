@@ -240,9 +240,12 @@ def _vec1_softmax(
     sync_block_wait("cube", "vector", SEM_P_FREE + ring_slot, PIPE.PIPE_MTE2, PIPE.PIPE_MTE3)
 
     # reset running max at the first task of each output tile
+    # NOTE: kept 2-D (1, BLOCK_M) rather than (BLOCK_M,) so LanePack's packed
+    # lane views stay 2-D with a statically unit innermost stride, which keeps
+    # hivm-mark-stride-align / hivm-enable-stride-align from padding the allocs.
     if idx_in_conbine == 0:
-        neg_max_even = tl.full((BLOCK_M, ), 2**30, tl.float32)
-        neg_max_odd = tl.full((BLOCK_M, ), 2**30, tl.float32)
+        neg_max_even = tl.full((1, BLOCK_M), 2**30, tl.float32)
+        neg_max_odd = tl.full((1, BLOCK_M), 2**30, tl.float32)
 
     for cb_idx in range(CB):
         kv_idx = idx_in_conbine * CB + cb_idx
@@ -265,11 +268,11 @@ def _vec1_softmax(
 
         # online softmax: compute new running -max*scale (ping-pong)
         block_row_max = tl.max(attn_score_block, axis=-1, keep_dims=False)
-        neg_max_new = tl.minimum(-block_row_max * sm_scale, tl.where(cur_parity == 0, neg_max_even, neg_max_odd))
+        neg_max_new = tl.minimum(-block_row_max[None, :] * sm_scale, tl.where(cur_parity == 0, neg_max_even, neg_max_odd))
         neg_max_prv = tl.where(cur_parity == 0, neg_max_odd, neg_max_even)
 
         # softmax_p = exp(sm_scale * score + neg_max_new)
-        softmax_p = tl.exp(sm_scale * attn_score_block + neg_max_new[:, None])
+        softmax_p = tl.exp(sm_scale * attn_score_block + tl.reshape(neg_max_new, (BLOCK_M, 1)))
 
         # rescale = exp(neg_max_new - neg_max_prv): correction factor for Vec2
         rescale = tl.exp(neg_max_new - neg_max_prv)
@@ -281,7 +284,7 @@ def _vec1_softmax(
         rescale_offset = (cid * RING * CB * BLOCK_M + ring_slot * CB * BLOCK_M + cb_idx * BLOCK_M)
         rescale_store_bp = tl.make_block_ptr(workspace_rescale + rescale_offset, (BLOCK_M, 1), (1, 1), (0, 0),
                                              (BLOCK_M, 1), (1, 0))
-        tl.store(rescale_store_bp, rescale[:, None])
+        tl.store(rescale_store_bp, tl.reshape(rescale, (BLOCK_M, 1)))
         expsum_store_bp = tl.make_block_ptr(workspace_expsum + rescale_offset, (BLOCK_M, 1), (1, 1), (0, 0),
                                             (BLOCK_M, 1), (1, 0))
         tl.store(expsum_store_bp, block_expsum[:, None])
@@ -447,8 +450,9 @@ def flash_attention_fwd_3task_kernel(
     acc_o = tl.zeros((BLOCK_M, DIM), tl.float32)
     softmax_denom = tl.zeros((BLOCK_M, ), tl.float32)  # running denominator l
     # neg_max_even/odd: running -max*scale for even/odd kv index, reset each tile
-    neg_max_even = tl.full((BLOCK_M, ), 2**30, tl.float32)
-    neg_max_odd = tl.full((BLOCK_M, ), 2**30, tl.float32)
+    # kept 2-D (1, BLOCK_M); see the note in _vec1_softmax.
+    neg_max_even = tl.full((1, BLOCK_M), 2**30, tl.float32)
+    neg_max_odd = tl.full((1, BLOCK_M), 2**30, tl.float32)
 
     # =========================================================================
     #  3-task pipeline: Cube (MM1/MM2) and Vector (Vec1/Vec2) scopes
