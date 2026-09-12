@@ -279,9 +279,15 @@ static bool isPackableElementwise(Operation *op) {
   // result shape, so adding a leading lane dimension preserves the op.
   if (op->hasTrait<OpTrait::Elementwise>())
     return true;
-  return isa<arith::SelectOp, arith::BitcastOp, triton::SplatOp,
-             triton::BroadcastOp, triton::ExpandDimsOp, triton::TransOp,
-             triton::ReshapeOp>(op);
+  // NOTE: arith.select (tl.where) is deliberately not packable. It is only
+  // used to select between the arms of a conditional ping-pong
+  // (`tl.where(parity, a, b)` plus `if/else a = ...` updates), and packing such
+  // a lane pair makes the emitter materialise the lanes as non-zero-offset
+  // subviews -> dynamic-stride memrefs. The downstream stride-align, PlanMemory
+  // and hivmc stages cannot handle those. Everything allowed below is
+  // offset-free, so its lane views keep statically unit striding.
+  return isa<arith::BitcastOp, triton::SplatOp, triton::BroadcastOp,
+             triton::ExpandDimsOp, triton::TransOp, triton::ReshapeOp>(op);
 }
 
 // Associative/commutative ops that can be realized as a tt.reduce over the
