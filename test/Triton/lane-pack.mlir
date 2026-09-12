@@ -600,17 +600,19 @@ module {
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
 
-  // A scalar (lane-invariant) select condition must be broadcast to the packed
-  // value shape, not packed to its own lane shape, or arith.select fails.
-  tt.func @select_scalar_condition(%c: i1, %a0: tensor<4xf32>, %a1: tensor<4xf32>, %b0: tensor<4xf32>, %b1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  // arith.select (tl.where) is deliberately not packable: it is only used to
+  // select between the arms of a conditional ping-pong, and packing those arms
+  // yields non-zero-offset lane views (dynamic strides) that the downstream
+  // stride-align / PlanMemory / hivmc stages cannot handle.
+  tt.func @no_pack_select(%c: i1, %a0: tensor<4xf32>, %a1: tensor<4xf32>, %b0: tensor<4xf32>, %b1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
     %r0 = arith.select %c, %a0, %b0 : tensor<4xf32>
     %r1 = arith.select %c, %a1, %b1 : tensor<4xf32>
     tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
   }
 
-  // CHECK-LABEL: tt.func @select_scalar_condition(
-  // CHECK: %[[COND:.*]] = tt.splat %{{.*}} : i1 -> tensor<2x4xi1>
-  // CHECK: arith.select %[[COND]],
+  // CHECK-LABEL: tt.func @no_pack_select(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
 
   // Two independent lane families in the same block must both be packed.
   tt.func @two_families(%a0: tensor<4xf32>, %a1: tensor<4xf32>, %b0: tensor<4xf32>, %b1: tensor<4xf32>, %c0: tensor<4xf32>, %c1: tensor<4xf32>, %d0: tensor<4xf32>, %d1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
