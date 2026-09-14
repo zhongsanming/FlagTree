@@ -21,8 +21,9 @@
 //
 // Scope / hard boundaries (kept deliberately conservative):
 //   * Only side-effect-free "math" ops are lifted. Loads/stores/copies/barriers
-//     are boundaries, left for other passes to vectorize (memory vectorization
-//     is out of scope).
+//     and any view of their results (e.g. extract_slice of a load, or of a
+//     tile.to_tensor buffer view) are boundaries, left for other passes to
+//     vectorize (memory vectorization is out of scope).
 //   * Only "compute" types are packed: scalar/vector/tensor of integer, float,
 //     index or complex. Pointer/buffer/memref/token types are never packed, so
 //     a cone can never materialize a pointer-typed tensor.
@@ -315,6 +316,35 @@ static bool hasOnlyComputeTypes(Operation *op) {
                       [](Value v) { return isComputeType(v.getType()); }) &&
          llvm::all_of(op->getResultTypes(),
                       [](Type t) { return isComputeType(t); });
+}
+
+// True if `v` is produced by a memory operation (tt.load, tile.to_tensor,
+// tle.dsa.*, ...), possibly through pure view ops (extract_slice, reshape, ...).
+//
+// The pass lifts pure math only, and a view of a memory-backed value is still
+// memory-backed. Packing it makes the packer reshape/subview memory data, i.e.
+// memory vectorization, which is out of scope -- and on Ascend it breaks
+// address-space inference: a reshape of a UB-buffer tensor is lowered to a
+// memref.collapse_shape that changes address space, which BiShengHIR rejects
+// (the mhc_post `hr_vec` failure).
+static bool isMemoryDerived(Value v) {
+  DenseSet<Value> seen;
+  SmallVector<Value> worklist{v};
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (!seen.insert(cur).second)
+      continue;
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      continue; // block argument or constant
+    if (!isMemoryEffectFree(def))
+      return true;
+    // Follow pure view ops to their source; anything else ends the walk.
+    if (isa<tensor::ExtractSliceOp, tensor::ReshapeOp, tensor::ExpandShapeOp,
+            tensor::CollapseShapeOp, tensor::CastOp>(def))
+      llvm::append_range(worklist, def->getOperands());
+  }
+  return false;
 }
 
 static bool isPackableElementwise(Operation *op) {
@@ -1011,6 +1041,11 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp,
   SmallVector<Value> initLanes;
   for (unsigned idx : laneIndices)
     initLanes.push_back(initArgs[idx]);
+  // Refuse memory-derived lanes: packing them would reshape memory-backed
+  // values (see isMemoryDerived).
+  for (Value lane : initLanes)
+    if (isMemoryDerived(lane))
+      return failure();
   Value packedInit = packLanes(builder, loc, initLanes);
   dumpLaneGroup("loop init", initLanes, packedInit);
 
@@ -1219,10 +1254,10 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       if (!isa<RankedTensorType>(ref.getType()) ||
           !isComputeType(ref.getType()))
         return failure();
-      // An effectful leaf is a hard boundary: packing it would concat memory
-      // results (memory vectorization), which is left to other passes.
-      if (Operation *def = ref.getDefiningOp();
-          def && !isMemoryEffectFree(def))
+      // A memory-derived leaf (a load, or a view of one) is a hard boundary:
+      // packing it would reshape/subview memory-backed data, which is left to
+      // other passes (and breaks Ascend address-space inference).
+      if (isMemoryDerived(ref))
         return failure();
       cone.leafGroups.push_back(group);
       continue;

@@ -786,6 +786,41 @@ module {
   // CHECK-NOT: tensor.concat
   // CHECK: tt.return
 
+  // A leaf that is a view of a memory operation is still memory-derived and
+  // must not be packed: packing would reshape/subview memory-backed data,
+  // which the Ascend address-space inference cannot lower (the mhc_post
+  // `hr_vec` failure). The slices are non-contiguous so the concat fallback
+  // would otherwise fire.
+  tt.func @no_pack_view_of_load(%p: tensor<16x!tt.ptr<f32>>, %x0: tensor<4xf32>, %x1: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %v = tt.load %p : tensor<16x!tt.ptr<f32>>
+    %s0 = tensor.extract_slice %v[0] [4] [1] : tensor<16xf32> to tensor<4xf32>
+    %s1 = tensor.extract_slice %v[8] [4] [1] : tensor<16xf32> to tensor<4xf32>
+    %r0 = arith.addf %s0, %x0 : tensor<4xf32>
+    %r1 = arith.addf %s1, %x1 : tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_view_of_load(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
+
+  // Loop mode must refuse memory-derived iter args for the same reason.
+  tt.func @no_pack_loop_memory_lanes(%p: tensor<16x!tt.ptr<f32>>, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %v = tt.load %p : tensor<16x!tt.ptr<f32>>
+    %a0 = tensor.extract_slice %v[0] [4] [1] : tensor<16xf32> to tensor<4xf32>
+    %a1 = tensor.extract_slice %v[8] [4] [1] : tensor<16xf32> to tensor<4xf32>
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%l0 = %a0, %l1 = %a1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %r0 = arith.mulf %l0, %l0 : tensor<4xf32>
+      %r1 = arith.mulf %l1, %l1 : tensor<4xf32>
+      scf.yield %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_loop_memory_lanes(
+  // CHECK-NOT: tensor.concat
+  // CHECK: scf.for
+
   // A contiguous run of tensor.extract_slice leaves from one source is packed
   // with a single wider slice + reshape, not a tensor.concat.
   tt.func @straight_line_contiguous_slices(%src: tensor<8xf32>, %y: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
