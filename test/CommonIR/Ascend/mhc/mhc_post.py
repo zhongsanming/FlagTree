@@ -63,6 +63,29 @@ except (ImportError, AttributeError):
     _HAS_DSA = False
 
 
+@triton.jit
+def _load_h_coeffs(h_post_ptr, h_res_ptr, hpost_base, hres_base):
+    """Load the per-token h_post[4] and h_res[4,4] coefficient vectors.
+
+    These are loaded as regular tensors with ``tl.load`` rather than via
+    ``tle.dsa.to_tensor`` of a UB buffer. Broadcasting a view of a UB buffer
+    makes the Ascend reshape propagation materialise an ``expand_shape`` of the
+    UB allocation; the resulting ``memref.expand_shape`` loses the
+    ``#hivm.address_space<ub>`` on its result type, so the inverse
+    ``memref.collapse_shape`` it emits is rejected by BiShengHIR.
+
+    Returns (hp, hr0, hr1, hr2, hr3), each [4] fp32, where hrj is row j of
+    h_res[t] (the coefficients of input row xj for the four output heads).
+    """
+    idx = tl.arange(0, 4)
+    hp = tl.load(h_post_ptr + hpost_base + idx)  # h_post[t, :]
+    hr0 = tl.load(h_res_ptr + hres_base + 0 + idx)  # h_res[t, 0, :]
+    hr1 = tl.load(h_res_ptr + hres_base + 4 + idx)  # h_res[t, 1, :]
+    hr2 = tl.load(h_res_ptr + hres_base + 8 + idx)  # h_res[t, 2, :]
+    hr3 = tl.load(h_res_ptr + hres_base + 12 + idx)  # h_res[t, 3, :]
+    return hp, hr0, hr1, hr2, hr3
+
+
 # ===========================================================================
 # HC_MULT=4 kernel -- maps MhcPostKernel<..., USE_PERMANENT_X=1>::Process.
 # Pipeline version: 1D grid over T, iterates D-chunks internally with
@@ -89,22 +112,9 @@ def _mhc_post_kernel_tle(
 
     x_dt = x_ptr.dtype.element_ty
 
-    # ---- Bulk DMA: load coefficients (constant across D-chunks) ---------------
-    hpost_ub = tle.dsa.alloc([4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    hres_ub = tle.dsa.alloc([16], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-
-    with tle.dsa.hint(inter_no_alias=True):
-        tle.dsa.copy(h_post_ptr + hpost_base + tl.arange(0, 4), hpost_ub, [4])
-        tle.dsa.copy(h_res_ptr + hres_base + tl.arange(0, 16), hres_ub, [16])
-
-    # ---- Extract coefficient vectors (reused across all D-chunks) -------------
-    hp = tle.dsa.to_tensor(hpost_ub)  # [4] f32
-
-    hr_vec = tle.dsa.to_tensor(hres_ub)  # [16] f32
-    hr0 = tl.reshape(tle.dsa.extract_slice(hr_vec, (0, ), (4, ), (1, )), [4])
-    hr1 = tl.reshape(tle.dsa.extract_slice(hr_vec, (4, ), (4, ), (1, )), [4])
-    hr2 = tl.reshape(tle.dsa.extract_slice(hr_vec, (8, ), (4, ), (1, )), [4])
-    hr3 = tl.reshape(tle.dsa.extract_slice(hr_vec, (12, ), (4, ), (1, )), [4])
+    # ---- Load coefficient vectors (reused across all D-chunks) --------------
+    hp, hr0, hr1, hr2, hr3 = _load_h_coeffs(
+        h_post_ptr, h_res_ptr, hpost_base, hres_base)
 
     # ---- Allocate double-buffered UB for x[4,BLOCK_D] and h_out[BLOCK_D] ------
     ho_ub = tle.dsa.alloc([BLOCK_D], dtype=x_dt, mem_addr_space=tle.dsa.ascend.UB)
@@ -182,28 +192,9 @@ def _mhc_post_kernel_tle_rows(
 
     x_dt = x_ptr.dtype.element_ty
 
-    # ---- Bulk DMA: merge all tl.load into large tensor DSA copies -----------
-    # h_post[t, :] -> UB [4] fp32 (exact size, no tail issue)
-    hpost_ub = tle.dsa.alloc([4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    # h_res[t, :, :] -> UB [16] fp32 (exact size, no tail issue)
-    hres_ub = tle.dsa.alloc([16], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-
-    with tle.dsa.hint(inter_no_alias=True):
-        tle.dsa.copy(h_post_ptr + hpost_base + tl.arange(0, 4), hpost_ub, [4])
-        tle.dsa.copy(h_res_ptr + hres_base + tl.arange(0, 16), hres_ub, [16])
-
-    # ---- Extract coefficient vectors from UB ----------------------------------
-    # h_post: [4] f32 — broadcast coeff for h_out
-    hp = tle.dsa.to_tensor(hpost_ub)  # [4] f32
-
-    # h_res flat [16] layout: [r00,r01,r02,r03, r10,r11,r12,r13, r20,..., r30,...]
-    # Row j of h_res[j,i] contains the coefficients of x[j] for all 4 output heads.
-    # Extract contiguous [4] slices — one per input x row:
-    hr_vec = tle.dsa.to_tensor(hres_ub)  # [16] f32
-    hr0 = tl.reshape(tle.dsa.extract_slice(hr_vec, (0, ), (4, ), (1, )), [4])  # [r00,r01,r02,r03]
-    hr1 = tl.reshape(tle.dsa.extract_slice(hr_vec, (4, ), (4, ), (1, )), [4])  # [r10,r11,r12,r13]
-    hr2 = tl.reshape(tle.dsa.extract_slice(hr_vec, (8, ), (4, ), (1, )), [4])  # [r20,r21,r22,r23]
-    hr3 = tl.reshape(tle.dsa.extract_slice(hr_vec, (12, ), (4, ), (1, )), [4])  # [r30,r31,r32,r33]
+    # ---- Load coefficient vectors (reused across all D-chunks) ---------------
+    hp, hr0, hr1, hr2, hr3 = _load_h_coeffs(
+        h_post_ptr, h_res_ptr, hpost_base, hres_base)
 
     # ---- Load x, h_out with mask (handles non-power-of-2 D correctly) ---------
     ho = tl.load(h_out_ptr + hout_base + d_off, mask=d_mask, other=0.0).to(tl.float32)
@@ -262,24 +253,9 @@ def _mhc_post_kernel_tle_rows_pipeline(
 
     x_dt = x_ptr.dtype.element_ty
 
-    # ---- Bulk DMA: load coefficients (constant across D-chunks) ---------------
-    # h_post[t, :] -> UB [4] fp32 (exact size, no tail issue)
-    hpost_ub = tle.dsa.alloc([4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    # h_res[t, :, :] -> UB [16] fp32 (exact size, no tail issue)
-    hres_ub = tle.dsa.alloc([16], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-
-    with tle.dsa.hint(inter_no_alias=True):
-        tle.dsa.copy(h_post_ptr + hpost_base + tl.arange(0, 4), hpost_ub, [4])
-        tle.dsa.copy(h_res_ptr + hres_base + tl.arange(0, 16), hres_ub, [16])
-
-    # ---- Extract coefficient vectors (reused across all D-chunks) -------------
-    hp = tle.dsa.to_tensor(hpost_ub)  # [4] f32
-
-    hr_vec = tle.dsa.to_tensor(hres_ub)  # [16] f32
-    hr0 = tl.reshape(tle.dsa.extract_slice(hr_vec, (0, ), (4, ), (1, )), [4])
-    hr1 = tl.reshape(tle.dsa.extract_slice(hr_vec, (4, ), (4, ), (1, )), [4])
-    hr2 = tl.reshape(tle.dsa.extract_slice(hr_vec, (8, ), (4, ), (1, )), [4])
-    hr3 = tl.reshape(tle.dsa.extract_slice(hr_vec, (12, ), (4, ), (1, )), [4])
+    # ---- Load coefficient vectors (reused across all D-chunks) ---------------
+    hp, hr0, hr1, hr2, hr3 = _load_h_coeffs(
+        h_post_ptr, h_res_ptr, hpost_base, hres_base)
 
     # ---- Allocate double-buffered UB for x[4,BLOCK_D] and h_out[BLOCK_D] ------
     # tle.dsa.pipeline with num_stages=2 enables MTE2/V overlap via double buffer.
@@ -357,21 +333,9 @@ def _mhc_post_kernel_tle_concat_reduce(
 
     x_dt = x_ptr.dtype.element_ty
 
-    # ---- Bulk DMA: load coefficients (constant across D-chunks) ---------------
-    hpost_ub = tle.dsa.alloc([4], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    hres_ub = tle.dsa.alloc([16], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-
-    with tle.dsa.hint(inter_no_alias=True):
-        tle.dsa.copy(h_post_ptr + hpost_base + tl.arange(0, 4), hpost_ub, [4])
-        tle.dsa.copy(h_res_ptr + hres_base + tl.arange(0, 16), hres_ub, [16])
-
-    # ---- Extract coefficient vectors (keep in FP32) --------------------------------------
-    hp = tle.dsa.to_tensor(hpost_ub)  # [4] f32
-    hr_vec = tle.dsa.to_tensor(hres_ub)  # [16] f32
-    hr0 = tl.reshape(tle.dsa.extract_slice(hr_vec, (0, ), (4, ), (1, )), [4])
-    hr1 = tl.reshape(tle.dsa.extract_slice(hr_vec, (4, ), (4, ), (1, )), [4])
-    hr2 = tl.reshape(tle.dsa.extract_slice(hr_vec, (8, ), (4, ), (1, )), [4])
-    hr3 = tl.reshape(tle.dsa.extract_slice(hr_vec, (12, ), (4, ), (1, )), [4])
+    # ---- Load coefficient vectors (keep in FP32) -----------------------------
+    hp, hr0, hr1, hr2, hr3 = _load_h_coeffs(
+        h_post_ptr, h_res_ptr, hpost_base, hres_base)
 
     # ---- Allocate double-buffered UB ----------------------------------------
     ho_ub = tle.dsa.alloc([BLOCK_D], dtype=x_dt, mem_addr_space=tle.dsa.ascend.UB)
