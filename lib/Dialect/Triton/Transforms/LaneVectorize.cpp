@@ -74,6 +74,37 @@ static bool debugEnabled() {
   return enabled;
 }
 
+// Prints a compact before/after view of a lane group and its packed result:
+//
+//   [lane-vectorize] lift: 2 lanes -> tensor<2x4xf32>
+//   [lane-vectorize]   | lane0: %r0 = arith.addf %l0, %y : tensor<4xf32>
+//   [lane-vectorize]   | lane1: %r1 = arith.addf %l1, %y : tensor<4xf32>
+//   [lane-vectorize]   v
+//   [lane-vectorize]   %rp = arith.addf %lp, %yb : tensor<2x4xf32>
+//
+// Only emits output when LANE_VECTORIZE_DEBUG is set.
+static void dumpLaneGroup(StringRef label, ArrayRef<Value> lanes,
+                          Value packed) {
+  if (!debugEnabled())
+    return;
+  llvm::errs() << "[lane-vectorize] " << label << ": " << lanes.size()
+               << " lanes -> " << packed.getType() << "\n";
+  for (auto [i, lane] : llvm::enumerate(lanes)) {
+    llvm::errs() << "  | lane" << i << ": ";
+    if (Operation *def = lane.getDefiningOp())
+      llvm::errs() << *def;
+    else
+      llvm::errs() << lane << " : " << lane.getType();
+    llvm::errs() << "\n";
+  }
+  llvm::errs() << "  v\n  ";
+  if (Operation *def = packed.getDefiningOp())
+    llvm::errs() << *def;
+  else
+    llvm::errs() << packed << " : " << packed.getType();
+  llvm::errs() << "\n";
+}
+
 // ---------------------------------------------------------------------------
 // Packing / unpacking primitives
 // ---------------------------------------------------------------------------
@@ -237,6 +268,14 @@ static SmallVector<Value> unpackLanes(OpBuilder &builder, Location loc,
     Value lane = builder.create<tensor::ReshapeOp>(
         loc, laneTy, slice, buildShapeConst(builder, loc, laneShape));
     lanes.push_back(lane);
+  }
+  if (debugEnabled()) {
+    llvm::errs() << "[lane-vectorize] unpack: ";
+    if (Operation *def = packed.getDefiningOp())
+      llvm::errs() << *def;
+    else
+      llvm::errs() << packed;
+    llvm::errs() << "\n";
   }
   return lanes;
 }
@@ -679,6 +718,7 @@ struct Packer {
     lanes.push_back(op->getResult(0));
     for (Operation *oi : laneOps)
       lanes.push_back(oi->getResult(0));
+    dumpLaneGroup("lift", lanes, packedValue);
 
     lanesOf[op->getResult(0)] = lanes;
     laneVarying.insert(lanes.begin() + 1, lanes.end());
@@ -841,6 +881,9 @@ struct Packer {
       // Reduce over the lane axis, then fold the lane-invariant leaves back in.
       Value reduced =
           buildReduceFromKind(builder, loc, pvIt->second.value, 0, op);
+      if (debugEnabled())
+        llvm::errs() << "[lane-vectorize] cross-lane reduce: " << *op << "\n"
+                     << "  v\n  " << *reduced.getDefiningOp() << "\n";
       SmallVector<Operation *> treeOps;
       collectAssociativeTreeOps(op->getResult(0), op->getName().getStringRef(),
                                 treeOps);
@@ -969,6 +1012,7 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp,
   for (unsigned idx : laneIndices)
     initLanes.push_back(initArgs[idx]);
   Value packedInit = packLanes(builder, loc, initLanes);
+  dumpLaneGroup("loop init", initLanes, packedInit);
 
   SmallVector<unsigned> otherIndices;
   SmallVector<Value> newInitArgs{packedInit};
@@ -1308,6 +1352,7 @@ static bool rewriteBlock(Block *block, Operation *scope,
     DenseSet<Value> leafRefs;
     for (SmallVector<Value> &g : cone->leafGroups) {
       Value packedLeaf = packLanes(builder, loc, g);
+      dumpLaneGroup("leaf", g, packedLeaf);
       // Seed every lane of the leaf, not just the reference: otherwise the
       // sibling lanes (defined before the cone start) are misclassified as
       // lane-invariant and their whole chain is skipped.
