@@ -265,20 +265,20 @@ def _heads_sinkhorn_kernel_tle(mixes_ptr,  # (T, 24) fp32
         r3 = r3 / col_sum
 
         # ---- remaining (ITERS-1) Sinkhorn iterations ----
-        for _ in tl.range(ITERS - 1):
-            cs = r0 + r1 + r2 + r3
-            r0 = r0 / cs
-            r1 = r1 / cs
-            r2 = r2 / cs
-            r3 = r3 / cs
-            rs0 = tl.sum(r0, axis=0)
-            rs1 = tl.sum(r1, axis=0)
-            rs2 = tl.sum(r2, axis=0)
-            rs3 = tl.sum(r3, axis=0)
+        for _ in tl.static_range(ITERS - 1):
+            rs0 = tl.sum(r0, axis=0) + HC_EPS
+            rs1 = tl.sum(r1, axis=0) + HC_EPS
+            rs2 = tl.sum(r2, axis=0) + HC_EPS
+            rs3 = tl.sum(r3, axis=0) + HC_EPS
             r0 = r0 / rs0
             r1 = r1 / rs1
             r2 = r2 / rs2
             r3 = r3 / rs3
+            cs = r0 + r1 + r2 + r3 + HC_EPS
+            r0 = r0 / cs
+            r1 = r1 / cs
+            r2 = r2 / cs
+            r3 = r3 / cs
 
         # ---- store results via vectorized store ----
         offs4 = tl.arange(0, 4)
@@ -570,8 +570,8 @@ def mhc_pre_clamp_sinkhorn_ref(
     M = M / M.sum(dim=-1, keepdim=True) + hc_eps
     M = M / (M.sum(dim=-2, keepdim=True) + hc_eps)
     for _ in range(iter_times - 1):
-        M = M / (M.sum(dim=-2, keepdim=True) + hc_eps)
         M = M / (M.sum(dim=-1, keepdim=True) + hc_eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + hc_eps)
 
     # hin = sum_n (x * pre) -> (T, D)
     y = (xf.float() * pre.unsqueeze(-1)).sum(dim=-2).to(orig_dtype)

@@ -53,6 +53,7 @@
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
@@ -1098,6 +1099,23 @@ static bool sameOpStructure(Operation *a, Operation *b) {
       OperationEquivalence::IgnoreLocations);
 }
 
+// A cheap structural signature of an op: its name, operand/result types and
+// attributes (all uniqued). Two ops can only be sameOpStructure if their
+// signatures match, so bucketing by this keeps the partition linear instead of
+// doing O(n^2) OperationEquivalence comparisons. Regions are not part of the
+// signature, so sameOpStructure is still applied within each bucket.
+static uint64_t structureHash(Operation *op) {
+  llvm::hash_code h = llvm::hash_value(op->getName().getStringRef());
+  for (Type t : op->getOperandTypes())
+    h = llvm::hash_combine(h, t.getAsOpaquePointer());
+  for (Type t : op->getResultTypes())
+    h = llvm::hash_combine(h, t.getAsOpaquePointer());
+  for (NamedAttribute a : op->getAttrs())
+    h = llvm::hash_combine(h, a.getName().str(),
+                           a.getValue().getAsOpaquePointer());
+  return h;
+}
+
 // Candidate lane groups in a block: single-result liftable tensor ops grouped
 // by shallow structure, then refined by operand congruence.
 static SmallVector<SmallVector<Value>>
@@ -1118,21 +1136,26 @@ findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
     candidates.push_back(op.getResult(0));
   }
 
-  // Initial partition by shallow structure (op + operand/result types +
-  // attributes).
+  // Initial partition by a cheap structural signature (op name + operand/result
+  // types + attributes), then split each signature bucket by sameOpStructure
+  // (which also compares regions).
   SmallVector<SmallVector<Value>> groups;
+  DenseMap<uint64_t, SmallVector<unsigned>> bySignature;
   for (Value v : candidates) {
     Operation *op = v.getDefiningOp();
+    uint64_t sig = structureHash(op);
     bool added = false;
-    for (SmallVector<Value> &g : groups) {
-      if (sameOpStructure(op, g.front().getDefiningOp())) {
-        g.push_back(v);
+    for (unsigned gi : bySignature[sig]) {
+      if (sameOpStructure(op, groups[gi].front().getDefiningOp())) {
+        groups[gi].push_back(v);
         added = true;
         break;
       }
     }
-    if (!added)
+    if (!added) {
       groups.push_back({v});
+      bySignature[sig].push_back(groups.size() - 1);
+    }
   }
 
   // Refine by operand congruence: two values stay together only if their
@@ -1281,32 +1304,45 @@ findConcatBoundary(Block *block, const DenseSet<Operation *> &skip) {
   return std::nullopt;
 }
 
-// Packs one lane cone in a straight-line block. Returns true if anything was
-// rewritten.
+// A candidate lane group for block mode. The seed values are kept alongside
+// their defining ops (captured while live), so a candidate invalidated by an
+// earlier rewrite can be dropped by pointer comparison without dereferencing a
+// dangling Value.
+struct Candidate {
+  SmallVector<Value> seed;
+  SmallVector<Operation *> ops;
+  bool boundary = false;
+};
+
+// Packs one lane cone in a straight-line block. `candidates`, `boundary` and
+// `before` are computed once per block by the caller, so the O(n^2)-prone
+// discovery is not repeated on every fixpoint iteration; `liveOps` is the set
+// of ops currently in the block, refreshed after every successful rewrite.
+// Returns true if anything was rewritten.
 static bool rewriteBlock(Block *block, Operation *scope,
-                         DenseSet<Operation *> &skip) {
-  // Snapshot so that, on success, every op the rewrite emitted can be marked
-  // and excluded from later fixpoint iterations in the same block.
-  SmallPtrSet<Operation *, 32> before;
-  for (Operation &op : *block)
-    before.insert(&op);
-
-  SmallVector<SmallVector<Value>> candidates;
-  std::optional<ConcatBoundary> boundary = findConcatBoundary(block, skip);
-  if (boundary)
-    candidates.push_back(boundary->sources);
-  SmallVector<SmallVector<Value>> siblingGroups =
-      findSiblingGroups(block, skip);
-  llvm::stable_sort(siblingGroups, [](const SmallVector<Value> &a,
-                                      const SmallVector<Value> &b) {
-    return a.size() > b.size();
-  });
-  for (SmallVector<Value> &g : siblingGroups)
-    candidates.push_back(std::move(g));
-
+                         DenseSet<Operation *> &skip,
+                         ArrayRef<Candidate> candidates,
+                         const std::optional<ConcatBoundary> &boundary,
+                         const llvm::SmallPtrSetImpl<Operation *> &liveOps,
+                         const llvm::SmallPtrSetImpl<Operation *> &before) {
   for (unsigned ci = 0; ci < candidates.size(); ++ci) {
-    SmallVector<Value> &seed = candidates[ci];
-    bool isBoundarySeed = boundary && ci == 0;
+    const Candidate &cand = candidates[ci];
+    if (cand.boundary && !boundary)
+      continue;
+    // Drop candidates whose ops an earlier rewrite in this block erased. A
+    // block-argument seed (e.g. a concat boundary over function arguments) has
+    // no defining op and is always live.
+    bool live = true;
+    for (Operation *op : cand.ops)
+      if (op && !liveOps.contains(op)) {
+        live = false;
+        break;
+      }
+    if (!live)
+      continue;
+
+    const SmallVector<Value> &seed = cand.seed;
+    bool isBoundarySeed = cand.boundary;
     FailureOr<Cone> cone = discoverCone(seed);
     if (failed(cone))
       continue;
@@ -1518,11 +1554,56 @@ struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePas
         if (forOp.getNumRegionIterArgs() > 0)
           continue;
       }
+      // Discover the lane groups once; the fixpoint below then only drops the
+      // groups a rewrite invalidated instead of recomputing the partition on
+      // every iteration.
+      SmallPtrSet<Operation *, 32> before;
+      for (Operation &op : *block)
+        before.insert(&op);
+
+      std::optional<ConcatBoundary> boundary =
+          findConcatBoundary(block, packedOps);
+      SmallVector<Candidate> candidates;
+      auto addCandidate = [&](ArrayRef<Value> seed, bool isBoundary) {
+        Candidate c;
+        c.seed.assign(seed.begin(), seed.end());
+        for (Value v : seed)
+          c.ops.push_back(v.getDefiningOp());
+        c.boundary = isBoundary;
+        candidates.push_back(std::move(c));
+      };
+      if (boundary)
+        addCandidate(boundary->sources, /*isBoundary=*/true);
+      SmallVector<SmallVector<Value>> siblingGroups =
+          findSiblingGroups(block, packedOps);
+      llvm::stable_sort(siblingGroups, [](const SmallVector<Value> &a,
+                                          const SmallVector<Value> &b) {
+        return a.size() > b.size();
+      });
+      for (SmallVector<Value> &g : siblingGroups)
+        addCandidate(g, /*isBoundary=*/false);
+
+      SmallPtrSet<Operation *, 32> liveOps;
+      auto refreshLive = [&]() {
+        liveOps.clear();
+        for (Operation &op : *block)
+          liveOps.insert(&op);
+      };
+      refreshLive();
+
       // Bound the fixpoint; a block with many families still gets several of
       // them packed without risking an unbounded rewrite loop.
       unsigned rewrites = 0;
-      while (rewrites < 64 && rewriteBlock(block, parent, packedOps))
+      while (rewrites < 64 &&
+             rewriteBlock(block, parent, packedOps, candidates, boundary,
+                          liveOps, before)) {
         ++rewrites;
+        refreshLive();
+        // The concat boundary is consumed by its rewrite; drop it so the cached
+        // boundary candidate is not retried.
+        if (boundary && packedOps.contains(boundary->concat))
+          boundary.reset();
+      }
     }
   }
 };
