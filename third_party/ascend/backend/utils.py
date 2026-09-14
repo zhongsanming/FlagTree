@@ -316,6 +316,12 @@ def _is_debug_line_info_disabled() -> bool:
     return os.getenv("TRITON_DISABLE_LINE_INFO", "true").lower() in ("true", "1")
 
 
+def _is_lane_vectorize_disabled() -> bool:
+    # Gate the triton-lane-vectorize TTIR pass (see LaneVectorize.cpp). Used by
+    # benchmarks to measure the pass's impact; off by default.
+    return os.getenv("TRITON_DISABLE_LANE_VECTORIZE", "false").lower() in ("true", "1")
+
+
 def _is_auto_map_parallel_blocks_enabled() -> bool:
     return os.getenv("TRITON_ALL_BLOCKS_PARALLEL", "false").lower() in ("true", "1")
 
