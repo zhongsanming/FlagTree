@@ -3,27 +3,37 @@
 //
 // Recognizes groups of loop-carried Triton tensor "lanes" (for example four
 // independent tensor<Mxf32> values updated by the same computation) and
-// rewrites the loop so the lanes are packed into a single tensor with a new
+// rewrites them so the lanes are packed into a single tensor with a new
 // leading dimension.
 //
-// The transform is purely structural. An operation is lifted to the packed
-// form when each of its per-lane instances computes the same math and its
-// operands are either already packed or lane-invariant. An associative combine
-// across the lanes (e.g. an add tree over all lanes) is recognized as a
-// reduction over the synthesized lane axis. No semantic pattern (row/column
-// normalization, softmax, ...) is hard-coded; anything whose packed form is
-// mathematically equivalent is allowed.
+// The transform is purely structural: an operation is lifted to packed form
+// when each of its per-lane instances computes the same math and its operands
+// are either already packed or lane-invariant. An associative combine across
+// the lanes (e.g. an add tree over all lanes) is recognized as a reduction
+// over the synthesized lane axis. No semantic pattern (softmax, norms, ...) is
+// hard-coded; anything whose packed form is mathematically equivalent is
+// allowed.
 //
-// Scope: only side-effect-free "math" ops are lifted. Ops with side effects
-// (loads/stores, copies, barriers, ...) are treated as boundaries and left for
-// other passes to vectorize. Leaf lane groups are packed either with a concat
-// or, when they are a contiguous run of tensor.extract_slice of one source,
-// with a single wider slice + reshape.
-//
-// Two modes share one lifter:
+// Two modes share one packer:
 //   * loop mode packs the iter args of an scf.for and replays its body once,
-//   * block mode (SLP) discovers a lane cone in straight-line code, seeded by a
-//     tensor.concat packing boundary or by shallow structural signatures.
+//   * block mode (SLP) discovers a "lane cone" in straight-line code, seeded
+//     by a tensor.concat packing boundary or by shallow structural signatures.
+//
+// Scope / hard boundaries (kept deliberately conservative):
+//   * Only side-effect-free "math" ops are lifted. Loads/stores/copies/barriers
+//     are boundaries, left for other passes to vectorize (memory vectorization
+//     is out of scope).
+//   * Only "compute" types are packed: scalar/vector/tensor of integer, float,
+//     index or complex. Pointer/buffer/memref/token types are never packed, so
+//     a cone can never materialize a pointer-typed tensor.
+//   * arith.select (tl.where) is NOT packable even though it is elementwise.
+//     It is used to select between the arms of a conditional ping-pong, and
+//     packing those arms makes the (Ascend) emitter produce non-zero-offset
+//     lane subviews -> dynamic-stride memrefs that the downstream stride-align,
+//     PlanMemory and hivmc stages cannot handle. Everything else allowed is
+//     offset-free, so its lane views keep statically unit striding.
+//   * tt.reshape with allow_reorder is rejected: element reordering could move
+//     data across lanes.
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -41,16 +51,14 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <map>
 #include <vector>
-
-#define DEBUG_TYPE "lane-vectorize"
 
 namespace mlir::triton {
 
@@ -59,16 +67,15 @@ namespace mlir::triton {
 
 namespace {
 
-// Debug logging, off unless LANE_VECTORIZE_DEBUG is set in the environment. This is
-// intentionally independent of LLVM_DEBUG so release builds can produce
-// diagnostics on request.
-static bool laneVectorizeDebug() {
+// Diagnostics go to stderr regardless of build type when LANE_VECTORIZE_DEBUG
+// is set in the environment. This is intentionally independent of LLVM_DEBUG.
+static bool debugEnabled() {
   static const bool enabled = ::getenv("LANE_VECTORIZE_DEBUG") != nullptr;
   return enabled;
 }
 
 // ---------------------------------------------------------------------------
-// Small helpers
+// Packing / unpacking primitives
 // ---------------------------------------------------------------------------
 
 static Value buildShapeConst(OpBuilder &builder, Location loc,
@@ -78,10 +85,10 @@ static Value buildShapeConst(OpBuilder &builder, Location loc,
 }
 
 // If the lanes are a contiguous run of tensor.extract_slice of one source
-// (e.g. mix_l0..3 = src[8,12,16,20]), pack them with a single wider slice +
-// reshape instead of a concat. Returns null when the pattern does not apply.
-static Value buildPackedContiguousSlices(OpBuilder &builder, Location loc,
-                                         ArrayRef<Value> lanes) {
+// (e.g. src[8], src[12], src[16], src[20]), pack them with a single wider
+// slice + reshape instead of a concat. Returns null when it does not apply.
+static Value packContiguousSlices(OpBuilder &builder, Location loc,
+                                  ArrayRef<Value> lanes) {
   auto toStatic =
       [](ArrayRef<OpFoldResult> ofrs) -> std::optional<SmallVector<int64_t>> {
     SmallVector<int64_t> out;
@@ -108,6 +115,8 @@ static Value buildPackedContiguousSlices(OpBuilder &builder, Location loc,
   if (laneExtent <= 0)
     return Value();
 
+  // Every lane must be the same slice shape/strides, offset only in dim 0 by
+  // exactly one lane extent each step, and identical in all other dims.
   for (auto [i, lane] : llvm::enumerate(lanes.drop_front())) {
     auto slice = lane.getDefiningOp<tensor::ExtractSliceOp>();
     if (!slice || slice.getSource() != source)
@@ -158,10 +167,9 @@ static Value buildPackedContiguousSlices(OpBuilder &builder, Location loc,
 
 // Packs `lanes` (all of the same ranked tensor type) into one tensor with a new
 // leading dimension of size lanes.size().
-static Value buildPackedLanes(OpBuilder &builder, Location loc,
-                              ArrayRef<Value> lanes) {
+static Value packLanes(OpBuilder &builder, Location loc, ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
-  if (Value coalesced = buildPackedContiguousSlices(builder, loc, lanes))
+  if (Value coalesced = packContiguousSlices(builder, loc, lanes))
     return coalesced;
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
 
@@ -190,8 +198,10 @@ static Value buildPackedLanes(OpBuilder &builder, Location loc,
   return builder.create<tensor::ConcatOp>(loc, packedTy, 0, concatOperands);
 }
 
-static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
-                                            Value packed, unsigned laneCount) {
+// Inverse of packLanes: slices the leading lane dimension back into `laneCount`
+// individual lane tensors.
+static SmallVector<Value> unpackLanes(OpBuilder &builder, Location loc,
+                                      Value packed, unsigned laneCount) {
   SmallVector<Value> lanes;
   lanes.reserve(laneCount);
   auto packedTy = dyn_cast<RankedTensorType>(packed.getType());
@@ -231,6 +241,8 @@ static SmallVector<Value> unpackPackedLanes(OpBuilder &builder, Location loc,
   return lanes;
 }
 
+// Recursively erases the defining op of `v` (and its dead operands) once it has
+// no remaining uses.
 static void eraseDeadTree(Value v) {
   Operation *op = v.getDefiningOp();
   if (!op || !op->use_empty())
@@ -243,15 +255,12 @@ static void eraseDeadTree(Value v) {
 }
 
 // ---------------------------------------------------------------------------
-// Math predicates
+// Packability predicates
 // ---------------------------------------------------------------------------
 
-// Ops that map to a single packed op when applied lane-wise. Shape ops are
-// allowed here but handled explicitly by the emitter.
-//
-// A compute value is a scalar, or a vector/tensor whose element type is a
+// A "compute" value is a scalar, or a vector/tensor whose element type is a
 // number. Pointers, buffers, memrefs and tokens are addressing/memory, not
-// math, and the pass must never materialise them in packed form.
+// math, and must never be materialized in packed form.
 static bool isComputeType(Type type) {
   if (isa<BaseMemRefType>(type))
     return false;
@@ -270,23 +279,18 @@ static bool hasOnlyComputeTypes(Operation *op) {
 }
 
 static bool isPackableElementwise(Operation *op) {
-  // Pure math on compute values only. This rejects addressing ops such as
-  // tt.addptr and tt.ptr_to_int (pointer operands/results) as well as buffer
-  // materialisations, so a packed cone can never contain pointer/buffer types.
+  // Reject addressing/buffer ops (tt.addptr, tt.ptr_to_int, buffer
+  // materializations) so a packed cone can never contain pointer/buffer types.
   if (!hasOnlyComputeTypes(op))
     return false;
-  // NOTE: arith.select (tl.where) is deliberately not packable even though it
-  // carries the generic Elementwise trait (Arith_Op adds ElementwiseMappable).
-  // It is only used to select between the arms of a conditional ping-pong
-  // (`tl.where(parity, a, b)` plus `if/else a = ...` updates), and packing such
-  // a lane pair makes the emitter materialise the lanes as non-zero-offset
-  // subviews -> dynamic-stride memrefs. The downstream stride-align, PlanMemory
-  // and hivmc stages cannot handle those. Everything allowed below is
-  // offset-free, so its lane views keep statically unit striding.
+
+  // See the file header: packing tl.where breaks the Ascend backend's
+  // stride-align / PlanMemory / hivmc stages (dynamic-stride lane views).
   if (isa<arith::SelectOp>(op))
     return false;
-  // An Elementwise op applies pointwise and broadcasts its operands to the
-  // result shape, so adding a leading lane dimension preserves the op.
+
+  // An elementwise op applies pointwise and broadcasts operands to the result
+  // shape, so adding a leading lane dimension preserves it.
   if (op->hasTrait<OpTrait::Elementwise>())
     return true;
   return isa<arith::BitcastOp, triton::SplatOp, triton::BroadcastOp,
@@ -302,8 +306,8 @@ static bool isAssociativeCombine(Operation *op) {
              arith::MinUIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op);
 }
 
-// Ops the lifter can emit for a lane group: elementwise/shape ops and
-// tt.reduce with an associative combiner.
+// Ops the packer can lift for a lane group: elementwise/shape ops and tt.reduce
+// with an associative single combiner.
 static bool isLiftableOp(Operation *op) {
   if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
     Operation *combiner = reduce.getSingleCombiner();
@@ -312,6 +316,8 @@ static bool isLiftableOp(Operation *op) {
   return isPackableElementwise(op) && op->getNumRegions() == 0;
 }
 
+// Collects the leaves of an associative tree rooted at `v` (recursing through
+// same-name ops only).
 static void collectAssociativeLeaves(Value v, StringRef opName,
                                      SmallVectorImpl<Value> &leaves) {
   if (Operation *def = v.getDefiningOp()) {
@@ -324,6 +330,7 @@ static void collectAssociativeLeaves(Value v, StringRef opName,
   leaves.push_back(v);
 }
 
+// Collects every op of the associative tree rooted at `v`.
 static void collectAssociativeTreeOps(Value v, StringRef opName,
                                       SmallVectorImpl<Operation *> &ops) {
   Operation *def = v.getDefiningOp();
@@ -338,10 +345,11 @@ static void collectAssociativeTreeOps(Value v, StringRef opName,
 // Packed value bookkeeping
 // ---------------------------------------------------------------------------
 
-struct PackedValue {
+// The packed form of a value.
+struct Packing {
   Value value;
   // A shared value is lane-invariant: it has the shape of a single lane (or is
-  // a scalar) and must be broadcast along the synthesized lane axis at use.
+  // a scalar) and must be broadcast along the lane axis at each use.
   bool shared = false;
 };
 
@@ -376,7 +384,7 @@ static RankedTensorType packedOperandType(Value operand,
                                resultPackedTy.getEncoding());
 }
 
-// Grows an already packed value to dstTy by appending size-1 dims and
+// Grows an already packed value to `dstTy` by appending size-1 dims and
 // broadcasting. Used when a scalar-lane packed value meets a tensor-lane one.
 static Value widenPacked(OpBuilder &builder, Location loc, Value v,
                          RankedTensorType dstTy) {
@@ -404,7 +412,7 @@ static Value widenPacked(OpBuilder &builder, Location loc, Value v,
 }
 
 // Brings a packed/shared value to the packed shape `dstTy`.
-static Value materialize(OpBuilder &builder, Location loc, PackedValue pv,
+static Value materialize(OpBuilder &builder, Location loc, Packing pv,
                          RankedTensorType dstTy) {
   if (!pv.shared)
     return widenPacked(builder, loc, pv.value, dstTy);
@@ -423,12 +431,12 @@ static Value materialize(OpBuilder &builder, Location loc, PackedValue pv,
     return builder.create<triton::BroadcastOp>(loc, dstTy, expanded);
   }
 
-  // Scalar value: broadcast to the packed shape.
+  // Lane-invariant scalar: broadcast to the packed shape.
   return builder.create<triton::SplatOp>(loc, dstTy, pv.value);
 }
 
-// Builds a tt.reduce over `src` whose combine region is cloned from `proto`.
-// Used for per-lane reduces, where `proto` is the original reduce op.
+// Builds a tt.reduce over `src` whose combine region is cloned from `proto`
+// (a per-lane reduce).
 static Value buildReduceFromRegion(OpBuilder &builder, Location loc, Value src,
                                    int64_t axis, triton::ReduceOp proto) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
@@ -450,8 +458,7 @@ static Value buildReduceFromRegion(OpBuilder &builder, Location loc, Value src,
 }
 
 // Builds a tt.reduce over `src` whose combine region computes a single instance
-// of `kind`. Used for cross-lane tree reductions, where `kind` is a top-level
-// associative op rather than an op nested in a reduce region.
+// of `kind` (a cross-lane associative combine).
 static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
                                  int64_t axis, Operation *kind) {
   auto reduce = builder.create<triton::ReduceOp>(loc, src, axis);
@@ -472,67 +479,68 @@ static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
 }
 
 // ---------------------------------------------------------------------------
-// Structural lifter
+// Structural packer
 // ---------------------------------------------------------------------------
+//
+// Lifts per-lane operations into packed form. State:
+//   * lanesOf[ref] — the n per-lane values corresponding to the lane-0
+//                    reference `ref` (lanesOf[ref][0] == ref). Built by cone
+//                    discovery (block mode) or incrementally as ops are lifted.
+//   * packed[ref]  — the packed form of `ref`, or the value itself with
+//                    shared==true when `ref` is lane-invariant.
+//   * laneVarying  — every value known to vary per lane, for a fast resolve().
+//
+// resolve(v) is the single classification entry point for operands of a lifted
+// op: it returns the packing to use for `v`, or nullopt when `v` is
+// lane-varying but not yet lifted.
 
-struct Lifter {
-  // Loop mode: the loop being packed. Block mode: null.
-  scf::ForOp forOp;
-  // Operation whose body contains the packed computation. Values defined
-  // outside it are lane-invariant.
-  Operation *scope = nullptr;
-  // Block whose arguments are the lanes (loop body in loop mode, null in block
-  // mode).
-  Block *laneBody = nullptr;
-  // In block mode, values defined before this op are lane-invariant. Null in
-  // loop mode.
-  Operation *coneStart = nullptr;
+struct Packer {
+  // -- configuration --
+  scf::ForOp forOp;               // loop mode: the loop; block mode: null
+  Operation *scope = nullptr;     // values defined outside it are lane-invariant
+  Block *laneBody = nullptr;      // loop body (loop mode); null in block mode
+  Operation *coneStart = nullptr; // block mode: values before this are shared
+  bool blockMode = false;
   OpBuilder &builder;
   Location loc;
   unsigned n;
-  DenseMap<Value, PackedValue> packedOf;
-  // Old loop body block args (induction var and non-lane iter args) remapped to
-  // the corresponding args of the new loop.
-  DenseMap<Value, Value> argRemap;
-  SmallVector<Value> referenceOrder;
-  // Indices (into the loop iter args) that form the packed lane group.
-  SmallVector<unsigned> laneIndices;
-  // Block mode does not clone lane-invariant ops and does not abort on
-  // effectful/unmatched ops.
-  bool blockMode = false;
-  // Results of cross-lane reductions (shared across lanes).
-  SmallVector<Value> sharedRefs;
-  // Original operations replaced by the packed computation.
-  SmallPtrSet<Operation *, 32> liftedOps;
-  // Values known to be lane-varying (members/images of a lane group).
-  DenseSet<Value> laneVarying;
-  // laneImages[i][ref] is the lane-i value corresponding to reference value
-  // `ref` (lane 0). laneImages[0] is unused (identity).
-  SmallVector<DenseMap<Value, Value>> laneImages;
 
-  Lifter(scf::ForOp forOp, OpBuilder &builder, unsigned n)
+  // -- state --
+  DenseMap<Value, SmallVector<Value>> lanesOf; // ref -> {lane0..laneN-1}
+  DenseMap<Value, Packing> packed;             // ref -> packed/shared form
+  DenseSet<Value> laneVarying;                 // every lane-varying value
+  DenseMap<Value, Value> argRemap;             // old loop args -> new loop args
+  SmallVector<unsigned> laneIndices;           // iter-arg indices of the lanes
+  SmallVector<Value> packedRefs;   // lane-varying refs in lift order
+  SmallVector<Value> sharedRefs;   // cross-lane reduce results (shared)
+  SmallPtrSet<Operation *, 32> liftedOps;      // original ops replaced
+
+  Packer(scf::ForOp forOp, OpBuilder &builder, unsigned n)
       : forOp(forOp), scope(forOp.getOperation()), laneBody(forOp.getBody()),
-        builder(builder), loc(forOp.getLoc()), n(n), laneImages(n) {}
+        builder(builder), loc(forOp.getLoc()), n(n) {}
 
   // Block (straight-line) mode constructor.
-  Lifter(Operation *scope, Operation *coneStart, OpBuilder &builder, unsigned n)
+  Packer(Operation *scope, Operation *coneStart, OpBuilder &builder, unsigned n)
       : scope(scope), coneStart(coneStart), builder(builder),
-        loc(scope->getLoc()), n(n), laneImages(n) {
-    blockMode = true;
-  }
+        loc(scope->getLoc()), n(n), blockMode(true) {}
 
+  // Seeds the lane group from the loop's iter args, and remaps the induction
+  // variable and every non-lane iter arg to the new loop's args.
   void seed(Value packedCurrent, ArrayRef<unsigned> indices,
             scf::ForOp newFor) {
     laneIndices.assign(indices.begin(), indices.end());
     auto iterArgs = forOp.getRegionIterArgs();
-    Value ref = iterArgs[laneIndices[0]];
-    packedOf[ref] = {packedCurrent, false};
-    referenceOrder.push_back(ref);
-    for (unsigned i = 1; i < n; ++i)
-      laneImages[i][ref] = iterArgs[laneIndices[i]];
 
-    // Remap the induction variable and every non-lane iter arg to the new
-    // loop's corresponding argument.
+    SmallVector<Value> lanes;
+    lanes.reserve(n);
+    for (unsigned idx : laneIndices)
+      lanes.push_back(iterArgs[idx]);
+    Value ref = lanes[0];
+    lanesOf[ref] = lanes;
+    laneVarying.insert(lanes.begin(), lanes.end());
+    packed[ref] = {packedCurrent, /*shared=*/false};
+    packedRefs.push_back(ref);
+
     argRemap[forOp.getInductionVar()] = newFor.getInductionVar();
     auto newIterArgs = newFor.getRegionIterArgs();
     unsigned nextNew = 1; // newIterArgs[0] is the packed lane group
@@ -543,67 +551,41 @@ struct Lifter {
     }
   }
 
-  // A loop body block argument that is one of the lane iter args.
-  bool isLaneArg(Value v) {
-    if (!laneBody)
-      return false;
-    auto barg = dyn_cast<BlockArgument>(v);
-    if (!barg || barg.getOwner() != laneBody)
-      return false;
-    unsigned idx = barg.getArgNumber();
-    if (idx == 0)
-      return false; // induction variable
-    return llvm::is_contained(laneIndices, idx - 1);
-  }
-
-  bool isShared(Value v) {
-    auto it = packedOf.find(v);
-    if (it != packedOf.end())
-      return it->second.shared;
-    // A lane-varying value is never lane-invariant, even if it is defined
-    // before the cone start (e.g. a per-lane splat or a leaf lane).
-    if (laneVarying.contains(v))
-      return false;
-    if (isLaneArg(v))
-      return false;
-    if (auto barg = dyn_cast<BlockArgument>(v))
-      return true; // induction var, non-lane iter arg, or an outer arg
-    Operation *def = v.getDefiningOp();
-    if (!def)
-      return true;
-    if (!scope->isAncestor(def))
-      return true;
-    if (coneStart && def->getBlock() == coneStart->getBlock() &&
-        def->isBeforeInBlock(coneStart))
-      return true;
-    return false;
-  }
-
-  std::optional<PackedValue> getPacked(Value v) {
-    auto it = packedOf.find(v);
-    if (it != packedOf.end())
+  // Classifies `v` as an operand of a lifted op:
+  //   - packed/seeded:      returns its Packing,
+  //   - lane-invariant:     returns {remappedValue, shared=true},
+  //   - lane-varying, unresolved: nullopt.
+  std::optional<Packing> resolve(Value v) {
+    if (auto it = packed.find(v); it != packed.end())
       return it->second;
     if (laneVarying.contains(v))
       return std::nullopt;
-    if (isLaneArg(v))
-      return std::nullopt;
-    if (auto barg = dyn_cast<BlockArgument>(v)) {
-      if (laneBody && barg.getOwner() == laneBody && barg.getArgNumber() >= 1) {
-        auto rit = argRemap.find(v);
-        if (rit != argRemap.end())
-          return PackedValue{rit->second, true};
-      }
-      return PackedValue{v, true};
+
+    // Block arguments are lane-invariant. Loop body args (induction var and
+    // non-lane iter args) are remapped to the new loop so the packed ops they
+    // feed dominate their uses.
+    if (isa<BlockArgument>(v)) {
+      if (auto it = argRemap.find(v); it != argRemap.end())
+        return Packing{it->second, /*shared=*/true};
+      return Packing{v, /*shared=*/true};
     }
+
+    // Constants and values defined outside the packed scope are lane-invariant.
     Operation *def = v.getDefiningOp();
-    if (!def)
-      return PackedValue{v, true};
-    if (!scope->isAncestor(def))
-      return PackedValue{v, true};
+    if (!def || !scope->isAncestor(def))
+      return Packing{v, /*shared=*/true};
+
+    // Block mode: values defined before the cone start are lane-invariant.
     if (coneStart && def->getBlock() == coneStart->getBlock() &&
         def->isBeforeInBlock(coneStart))
-      return PackedValue{v, true};
+      return Packing{v, /*shared=*/true};
+
     return std::nullopt;
+  }
+
+  bool isShared(Value v) {
+    auto p = resolve(v);
+    return p.has_value() && p->shared;
   }
 
   bool allOperandsShared(Operation *op) {
@@ -613,42 +595,55 @@ struct Lifter {
 
   bool allOperandsResolved(Operation *op) {
     return llvm::all_of(op->getOperands(),
-                        [&](Value a) { return getPacked(a).has_value(); });
+                        [&](Value a) { return resolve(a).has_value(); });
   }
 
-  Operation *findLaneOp(Operation *refOp, unsigned lane) {
+  // Finds the lane-`lane` counterpart of `op`. Prefers the structural mapping
+  // recorded by cone discovery: findLaneOp cannot tell apart structurally
+  // identical siblings (e.g. two tt.splat of the same scalar).
+  Operation *findSiblingOp(Operation *op, unsigned lane) {
+    if (auto it = lanesOf.find(op->getResult(0)); it != lanesOf.end()) {
+      Value img = it->second[lane];
+      if (img)
+        return img.getDefiningOp();
+    }
+    return findLaneOp(op, lane);
+  }
+
+  // Structural search for the lane-`lane` counterpart of `op`, matching by
+  // operand list (with lane-varying operands mapped to their lane images).
+  Operation *findLaneOp(Operation *op, unsigned lane) {
     SmallVector<Value> expected;
-    for (Value a : refOp->getOperands()) {
+    for (Value a : op->getOperands()) {
       if (isShared(a)) {
         expected.push_back(a);
         continue;
       }
-      Value img = laneImages[lane].lookup(a);
-      if (!img)
+      auto it = lanesOf.find(a);
+      if (it == lanesOf.end())
         return nullptr;
-      expected.push_back(img);
+      expected.push_back(it->second[lane]);
     }
     if (expected.empty())
       return nullptr;
 
     for (Operation *u : expected.front().getUsers()) {
-      if (u->getName() != refOp->getName())
-        continue;
-      if (u->getNumOperands() != refOp->getNumOperands())
-        continue;
-      if (u->getNumResults() != refOp->getNumResults())
-        continue;
-      if (!OperationEquivalence::isEquivalentTo(
-              refOp, u, OperationEquivalence::ignoreValueEquivalence, nullptr,
-              OperationEquivalence::Flags::IgnoreLocations))
+      if (u->getName() != op->getName() ||
+          u->getNumOperands() != op->getNumOperands() ||
+          u->getNumResults() != op->getNumResults())
         continue;
       if (!llvm::equal(u->getOperands(), expected))
+        continue;
+      if (!OperationEquivalence::isEquivalentTo(
+              op, u, OperationEquivalence::ignoreValueEquivalence, nullptr,
+              OperationEquivalence::Flags::IgnoreLocations))
         continue;
       return u;
     }
     return nullptr;
   }
 
+  // Clones `op` with `operands` substituted and retypes the results.
   Value emitClonedOp(Operation *op, ValueRange operands,
                      TypeRange resultTypes) {
     IRMapping mapping;
@@ -660,45 +655,55 @@ struct Lifter {
     return newOp->getResult(0);
   }
 
-  // Lane-invariant op inside the loop: clone it (with already packed operands)
-  // and treat the result as shared.
+  // Lane-invariant op inside the loop: clone it (with packed operands) and
+  // treat the result as shared.
   LogicalResult liftSharedOp(Operation *op) {
     if (op->getNumResults() != 1)
       return failure();
     SmallVector<Value> operands;
     for (Value a : op->getOperands()) {
-      auto pv = getPacked(a);
+      auto pv = resolve(a);
       if (!pv)
         return failure();
       operands.push_back(pv->value);
     }
     Value result = emitClonedOp(op, operands, op->getResult(0).getType());
-    packedOf[op->getResult(0)] = {result, true};
+    packed[op->getResult(0)] = {result, /*shared=*/true};
     return success();
   }
 
-  // A tt.reduce applied independently to every lane.
+  // Records the lifted op `op` (reference) with its per-lane sibling ops.
+  void recordLifted(Operation *op, Value packedValue,
+                    ArrayRef<Operation *> laneOps) {
+    SmallVector<Value> lanes;
+    lanes.push_back(op->getResult(0));
+    for (Operation *oi : laneOps)
+      lanes.push_back(oi->getResult(0));
+
+    lanesOf[op->getResult(0)] = lanes;
+    laneVarying.insert(lanes.begin() + 1, lanes.end());
+    packed[op->getResult(0)] = {packedValue, /*shared=*/false};
+    packedRefs.push_back(op->getResult(0));
+    liftedOps.insert(op);
+    for (Operation *oi : laneOps)
+      liftedOps.insert(oi);
+  }
+
+  // A tt.reduce applied independently to every lane -> one tt.reduce over the
+  // same axis + 1 (the new lane axis is 0).
   LogicalResult liftLaneReduce(triton::ReduceOp reduce) {
     if (reduce->getNumOperands() != 1 || reduce->getNumResults() != 1)
       return failure();
     Operation *combiner = reduce.getSingleCombiner();
     if (!combiner || !isAssociativeCombine(combiner))
       return failure();
-    Value src = reduce.getOperand(0);
-    auto pv = getPacked(src);
+    auto pv = resolve(reduce.getOperand(0));
     if (!pv || pv->shared)
       return failure();
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
-      // Prefer the mapping computed by cone discovery: structurally identical
-      // siblings (e.g. several tt.splat of the same scalar) cannot be told
-      // apart by findLaneOp, so re-discovering here could pick the wrong one.
-      Operation *oi = nullptr;
-      if (Value img = laneImages[i].lookup(reduce->getResult(0)))
-        oi = img.getDefiningOp();
-      else
-        oi = findLaneOp(reduce, i);
+      Operation *oi = findSiblingOp(reduce, i);
       if (!oi)
         return failure();
       auto other = dyn_cast<triton::ReduceOp>(oi);
@@ -708,20 +713,13 @@ struct Lifter {
       laneOps.push_back(oi);
     }
 
-    Value packed = buildReduceFromRegion(builder, loc, pv->value,
-                                         reduce.getAxis() + 1, reduce);
-    packedOf[reduce->getResult(0)] = {packed, false};
-    referenceOrder.push_back(reduce->getResult(0));
-    liftedOps.insert(reduce.getOperation());
-    for (unsigned i = 1; i < n; ++i) {
-      laneImages[i][reduce->getResult(0)] = laneOps[i - 1]->getResult(0);
-      laneVarying.insert(laneOps[i - 1]->getResult(0));
-      liftedOps.insert(laneOps[i - 1]);
-    }
+    Value packedValue = buildReduceFromRegion(builder, loc, pv->value,
+                                              reduce.getAxis() + 1, reduce);
+    recordLifted(reduce, packedValue, laneOps);
     return success();
   }
 
-  // A pointwise/shape op applied independently to every lane.
+  // A pointwise/shape op applied independently to every lane -> one packed op.
   LogicalResult liftPerLaneOp(Operation *op) {
     if (op->getNumResults() != 1)
       return failure();
@@ -730,9 +728,9 @@ struct Lifter {
     if (op->getNumRegions() != 0 || !isPackableElementwise(op))
       return failure();
 
-    SmallVector<PackedValue> pvs;
+    SmallVector<Packing> pvs;
     for (Value a : op->getOperands()) {
-      auto pv = getPacked(a);
+      auto pv = resolve(a);
       if (!pv)
         return failure();
       pvs.push_back(*pv);
@@ -740,25 +738,20 @@ struct Lifter {
 
     SmallVector<Operation *> laneOps;
     for (unsigned i = 1; i < n; ++i) {
-      // Prefer the discovery mapping (see liftLaneReduce).
-      Operation *oi = nullptr;
-      if (Value img = laneImages[i].lookup(op->getResult(0)))
-        oi = img.getDefiningOp();
-      else
-        oi = findLaneOp(op, i);
+      Operation *oi = findSiblingOp(op, i);
       if (!oi)
         return failure();
       laneOps.push_back(oi);
     }
 
     auto resultTy = packedTypeOf(op->getResult(0), n);
-    Value packed;
+    Value packedValue;
     if (auto splat = dyn_cast<triton::SplatOp>(op)) {
       // Scalar-lane -> tensor-lane: widen the packed source.
-      packed = widenPacked(builder, loc, pvs[0].value, resultTy);
+      packedValue = widenPacked(builder, loc, pvs[0].value, resultTy);
     } else if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
-      packed = builder.create<triton::ExpandDimsOp>(loc, resultTy, pvs[0].value,
-                                                    expand.getAxis() + 1);
+      packedValue = builder.create<triton::ExpandDimsOp>(
+          loc, resultTy, pvs[0].value, expand.getAxis() + 1);
     } else if (auto trans = dyn_cast<triton::TransOp>(op)) {
       // The lane axis is inserted at 0, so every transposed axis shifts by one.
       IRMapping mapping;
@@ -769,12 +762,12 @@ struct Lifter {
       for (int32_t axis : trans.getOrder())
         order.push_back(axis + 1);
       newTrans.setOrder(order);
-      packed = newTrans.getResult();
+      packedValue = newTrans.getResult();
     } else if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
       // Element reordering could move data across lanes.
       if (reshape.getAllowReorder())
         return failure();
-      packed = emitClonedOp(op, {pvs[0].value}, resultTy);
+      packedValue = emitClonedOp(op, {pvs[0].value}, resultTy);
     } else {
       SmallVector<Value> operands;
       for (auto [a, pv] : llvm::zip(op->getOperands(), pvs)) {
@@ -783,24 +776,17 @@ struct Lifter {
           return failure();
         operands.push_back(v);
       }
-      packed = emitClonedOp(op, operands, resultTy);
+      packedValue = emitClonedOp(op, operands, resultTy);
     }
-    if (!packed)
+    if (!packedValue)
       return failure();
 
-    packedOf[op->getResult(0)] = {packed, false};
-    referenceOrder.push_back(op->getResult(0));
-    liftedOps.insert(op);
-    for (unsigned i = 1; i < n; ++i) {
-      laneImages[i][op->getResult(0)] = laneOps[i - 1]->getResult(0);
-      laneVarying.insert(laneOps[i - 1]->getResult(0));
-      liftedOps.insert(laneOps[i - 1]);
-    }
+    recordLifted(op, packedValue, laneOps);
     return success();
   }
 
-  // An associative combine over the lane values (e.g. an add tree). Emitted as
-  // a reduction over the lane axis, plus any lane-invariant leaves.
+  // An associative combine over the lanes (e.g. an add tree) -> a tt.reduce
+  // over lane axis 0, plus any lane-invariant leaves folded back in.
   LogicalResult liftCrossLane(Operation *op) {
     if (op->getNumResults() != 1 || !isAssociativeCombine(op))
       return failure();
@@ -809,27 +795,20 @@ struct Lifter {
     collectAssociativeLeaves(op->getResult(0), op->getName().getStringRef(),
                              leaves);
 
-    for (Value r : referenceOrder) {
-      auto pvIt = packedOf.find(r);
-      if (pvIt == packedOf.end() || pvIt->second.shared)
+    for (Value r : packedRefs) {
+      auto pvIt = packed.find(r);
+      if (pvIt == packed.end() || pvIt->second.shared)
         continue;
       if (!isa<RankedTensorType>(r.getType()))
         continue;
 
-      SmallVector<Value> expected;
-      bool complete = true;
-      for (unsigned i = 0; i < n; ++i) {
-        Value e = (i == 0) ? r : laneImages[i].lookup(r);
-        if (!e) {
-          complete = false;
-          break;
-        }
-        expected.push_back(e);
-      }
-      if (!complete)
+      auto lanesIt = lanesOf.find(r);
+      if (lanesIt == lanesOf.end() || lanesIt->second.size() != n)
         continue;
+      const SmallVector<Value> &expected = lanesIt->second;
 
-      // Every expected lane leaf must appear exactly once.
+      // Every expected lane leaf must appear exactly once among the tree's
+      // leaves.
       llvm::SmallDenseMap<Value, unsigned> counts;
       for (Value l : leaves)
         counts[l]++;
@@ -845,6 +824,7 @@ struct Lifter {
       if (!matched)
         continue;
 
+      // All remaining leaves must be lane-invariant.
       SmallPtrSet<void *, 8> expectedSet;
       for (Value e : expected)
         expectedSet.insert(e.getAsOpaquePointer());
@@ -858,6 +838,7 @@ struct Lifter {
       if (!restShared)
         continue;
 
+      // Reduce over the lane axis, then fold the lane-invariant leaves back in.
       Value reduced =
           buildReduceFromKind(builder, loc, pvIt->second.value, 0, op);
       SmallVector<Operation *> treeOps;
@@ -868,7 +849,7 @@ struct Lifter {
       for (Value l : leaves) {
         if (expectedSet.contains(l.getAsOpaquePointer()))
           continue;
-        auto lp = getPacked(l);
+        auto lp = resolve(l);
         if (!lp)
           return failure();
         Value operand = lp->value;
@@ -885,7 +866,7 @@ struct Lifter {
         foldMapping.map(op->getOperand(1), operand);
         reduced = builder.clone(*op, foldMapping)->getResult(0);
       }
-      packedOf[op->getResult(0)] = {reduced, true};
+      packed[op->getResult(0)] = {reduced, /*shared=*/true};
       sharedRefs.push_back(op->getResult(0));
       return success();
     }
@@ -893,73 +874,74 @@ struct Lifter {
   }
 
   LogicalResult liftOp(Operation *op) {
-    // A value already seeded as a leaf (or otherwise handled) needs no lifting;
-    // re-cloning it as a shared op would be wrong.
-    if (op->getNumResults() == 1 && packedOf.contains(op->getResult(0)))
+    // Values already seeded as leaves need no lifting.
+    if (op->getNumResults() == 1 && packed.contains(op->getResult(0)))
       return success();
-    // Effectful ops are hard boundaries: never lift or clone them. This must
-    // precede the shared/per-lane attempts, which would otherwise clone e.g. a
-    // load whose operands happen to be resolved.
+
+    // Effectful ops are hard boundaries: in loop mode this aborts the whole
+    // rewrite; in block mode the cone simply stops here.
     if (!isMemoryEffectFree(op)) {
       if (blockMode)
-        return success(); // boundary: leave the op in place
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[lane-vectorize] reject: effectful op " << *op << "\n");
+        return success();
+      if (debugEnabled())
+        llvm::errs() << "[lane-vectorize] reject: effectful op " << *op << "\n";
       return failure();
     }
+
     if (allOperandsShared(op))
       return liftSharedOp(op);
     if (allOperandsResolved(op))
       return liftPerLaneOp(op);
     if (succeeded(liftCrossLane(op)))
       return success();
-    // Unmatched pure op: drop it from the packed loop.
-    LLVM_DEBUG(llvm::dbgs()
-               << "[lane-vectorize] dropping unmatched pure op " << *op << "\n");
+
+    // An unmatched pure op is simply dropped from the packed loop.
+    if (debugEnabled())
+      llvm::errs() << "[lane-vectorize] drop: unmatched pure op " << *op
+                   << "\n";
     return success();
   }
 
+  // Loop mode: lifts the whole body and validates the yield.
   FailureOr<Value> run() {
-    for (Operation &op : forOp.getBody()->without_terminator()) {
+    for (Operation &op : forOp.getBody()->without_terminator())
       if (failed(liftOp(&op)))
         return failure();
-    }
 
     auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     if (!yield)
       return failure();
     Value y0 = yield.getOperand(laneIndices[0]);
-    auto it = packedOf.find(y0);
-    if (it == packedOf.end() || it->second.shared)
+    auto it = packed.find(y0);
+    if (it == packed.end() || it->second.shared)
       return failure();
-    for (unsigned i = 1; i < n; ++i) {
-      auto img = laneImages[i].find(y0);
-      if (img == laneImages[i].end() ||
-          img->second != yield.getOperand(laneIndices[i]))
+    auto lanesIt = lanesOf.find(y0);
+    if (lanesIt == lanesOf.end())
+      return failure();
+    for (unsigned i = 1; i < n; ++i)
+      if (lanesIt->second[i] != yield.getOperand(laneIndices[i]))
         return failure();
-    }
     return it->second.value;
   }
 };
 
 // ---------------------------------------------------------------------------
-// Rewrite
+// Loop mode
 // ---------------------------------------------------------------------------
 
 static LogicalResult
-rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodies) {
+rewriteLaneVectorizeLoop(scf::ForOp forOp,
+                         SmallPtrSetImpl<Block *> &packedBodies) {
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
 
   auto initArgs = forOp.getInitArgs();
   unsigned m = initArgs.size();
-  if (laneVectorizeDebug())
-    llvm::errs() << "[lane-vectorize] loop: iterArgs=" << m << "\n";
   if (m < 2)
     return failure();
 
-  // Pick the largest group of same-typed tensor iter args to pack. Other iter
-  // args are carried through unchanged.
+  // Pick the largest group of same-typed tensor iter args to pack; the rest
+  // are carried through unchanged.
   unsigned bestSize = 0;
   Type bestTy;
   for (unsigned i = 0; i < m; ++i) {
@@ -986,7 +968,7 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodie
   SmallVector<Value> initLanes;
   for (unsigned idx : laneIndices)
     initLanes.push_back(initArgs[idx]);
-  Value packedInit = buildPackedLanes(builder, loc, initLanes);
+  Value packedInit = packLanes(builder, loc, initLanes);
 
   SmallVector<unsigned> otherIndices;
   SmallVector<Value> newInitArgs{packedInit};
@@ -1002,18 +984,20 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodie
                                            forOp.getStep(), newInitArgs);
   newFor->setAttrs(forOp->getAttrs());
 
+  // The loop rewrite is all-or-nothing: any failure rolls back to the original
+  // loop.
   auto fail = [&]() -> LogicalResult {
     newFor.erase();
     eraseDeadTree(packedInit);
     return failure();
   };
 
-  Lifter lifter(forOp, builder, n);
+  Packer packer(forOp, builder, n);
   // The body must start from the loop-carried packed value, not the pre-loop
   // packed init.
-  lifter.seed(newFor.getRegionIterArg(0), laneIndices, newFor);
+  packer.seed(newFor.getRegionIterArg(0), laneIndices, newFor);
   builder.setInsertionPointToStart(newFor.getBody());
-  FailureOr<Value> packedYield = lifter.run();
+  FailureOr<Value> packedYield = packer.run();
   if (failed(packedYield))
     return fail();
 
@@ -1021,7 +1005,7 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodie
   builder.setInsertionPointToEnd(newFor.getBody());
   SmallVector<Value> newYieldOperands{*packedYield};
   for (unsigned j : otherIndices) {
-    auto pv = lifter.getPacked(oldYield.getOperand(j));
+    auto pv = packer.resolve(oldYield.getOperand(j));
     if (!pv)
       return fail();
     newYieldOperands.push_back(pv->value);
@@ -1030,7 +1014,7 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodie
 
   builder.setInsertionPointAfter(newFor);
   SmallVector<Value> unpacked =
-      unpackPackedLanes(builder, loc, newFor.getResult(0), n);
+      unpackLanes(builder, loc, newFor.getResult(0), n);
   if (unpacked.size() != n)
     return fail();
 
@@ -1043,14 +1027,14 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodie
   for (unsigned j = 0; j < m; ++j)
     forOp.getResult(j).replaceAllUsesWith(newResults[j]);
   packedBodies.insert(newFor.getBody());
-  if (laneVectorizeDebug())
-    llvm::errs() << "[lane-vectorize] loop packed: lanes=" << n << "\n";
+  if (debugEnabled())
+    llvm::errs() << "[lane-vectorize] packed loop: lanes=" << n << "\n";
   forOp.erase();
   return success();
 }
 
 // ---------------------------------------------------------------------------
-// Straight-line (SLP) packing
+// Block mode (SLP)
 // ---------------------------------------------------------------------------
 
 // Two ops are structurally identical if they have the same op, operand types,
@@ -1070,27 +1054,21 @@ static bool sameOpStructure(Operation *a, Operation *b) {
       OperationEquivalence::IgnoreLocations);
 }
 
-// Candidate lane groups in a block: single-result packable tensor ops grouped
-// by shallow structure.
+// Candidate lane groups in a block: single-result liftable tensor ops grouped
+// by shallow structure, then refined by operand congruence.
 static SmallVector<SmallVector<Value>>
 findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
   // Largest lane group we are willing to synthesize. A real family is small;
-  // anything larger is almost certainly a mistaken merge and would blow up the
-  // cone/lifter.
+  // anything larger is almost certainly a mistaken merge.
   constexpr unsigned kMaxLanes = 32;
 
   SmallVector<Value> candidates;
   for (Operation &op : *block) {
     if (skip.contains(&op))
       continue;
-    if (op.getNumResults() != 1)
+    if (op.getNumResults() != 1 || !isLiftableOp(&op))
       continue;
-    // Reduces (and scalar results, e.g. a per-lane reduce) take part in the
-    // lane structure but cannot seed a cone, so include them in the congruence
-    // refinement even though the final groups are filtered to tensors below.
-    if (!isLiftableOp(&op))
-      continue;
-    // These are the pack/unpack scaffolding used by this pass itself.
+    // The pack/unpack scaffolding used by this pass itself.
     if (isa<tensor::ReshapeOp, tensor::ExtractSliceOp>(&op))
       continue;
     candidates.push_back(op.getResult(0));
@@ -1114,10 +1092,9 @@ findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
   }
 
   // Refine by operand congruence: two values stay together only if their
-  // corresponding operands live in the same group. A shallow signature merges
-  // every independent instance of the same structure (e.g. all iterations of
-  // an unrolled loop); congruence separates them because iteration N consumes
-  // iteration N-1's results, which are a different group.
+  // corresponding operands live in the same group. This separates e.g.
+  // different iterations of an unrolled loop that share a shallow signature
+  // (iteration N consumes iteration N-1's results).
   bool changed = true;
   while (changed) {
     changed = false;
@@ -1154,17 +1131,16 @@ findSiblingGroups(Block *block, const DenseSet<Operation *> &skip) {
 struct Cone {
   unsigned n = 0;
   SmallVector<SmallVector<Value>> leafGroups;
-  SmallVector<DenseMap<Value, Value>> laneImages;
-  // Reference (lane 0) intermediate ops.
-  SmallVector<Operation *> refOps;
+  DenseMap<Value, SmallVector<Value>> lanesOf; // ref -> {lane0..laneN-1}
+  SmallVector<Operation *> refOps;             // reference (lane 0) ops
 };
 
-// Groups the operands of `seed` recursively. Every group has the same size as
-// the seed; groups whose members are not structurally identical become leaves.
+// Discovers a lane cone from a seed group, recursing into operands. Every group
+// has the same size as the seed; groups whose members are not structurally
+// identical become leaves.
 static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
   Cone cone;
   cone.n = seed.size();
-  cone.laneImages.resize(cone.n);
   DenseSet<Value> seen;
   SmallVector<SmallVector<Value>> worklist;
   worklist.push_back(SmallVector<Value>(seed.begin(), seed.end()));
@@ -1174,8 +1150,7 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
     if (!seen.insert(ref).second)
       continue;
 
-    for (unsigned i = 1; i < cone.n; ++i)
-      cone.laneImages[i][ref] = group[i];
+    cone.lanesOf[ref] = group;
 
     Operation *op0 = ref.getDefiningOp();
     bool isLeaf = !op0 || !isLiftableOp(op0);
@@ -1192,34 +1167,19 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
     }
 
     if (isLeaf) {
-      // A group of liftable ops that are not structurally identical is not a
-      // lane family, just unrelated ops that happen to share a shallow
-      // signature. Packing them would be correct but pointless and can blow up
-      // the fixpoint, so reject the whole cone.
-      if (mismatchedComputational) {
-        if (laneVectorizeDebug())
-          llvm::errs() << "[lane-vectorize] cone fail: mixed computational leaf at "
-                       << op0->getName() << "\n";
+      // Liftable but structurally different ops are not a lane family, just
+      // unrelated ops sharing a shallow signature; packing them would be
+      // pointless and can blow up the fixpoint.
+      if (mismatchedComputational)
         return failure();
-      }
       if (!isa<RankedTensorType>(ref.getType()) ||
-          !isComputeType(ref.getType())) {
-        if (laneVectorizeDebug())
-          llvm::errs() << "[lane-vectorize] cone fail: non-compute leaf " << ref
-                       << "\n";
+          !isComputeType(ref.getType()))
         return failure();
-      }
-      // A leaf produced by a side-effecting op is a hard boundary: packing it
-      // would concatenate memory results, i.e. memory vectorization, which is
-      // left to other passes. With correct op effects this covers loads,
-      // copies and buffer materialisations such as tile.to_tensor.
+      // An effectful leaf is a hard boundary: packing it would concat memory
+      // results (memory vectorization), which is left to other passes.
       if (Operation *def = ref.getDefiningOp();
-          def && !isMemoryEffectFree(def)) {
-        if (laneVectorizeDebug())
-          llvm::errs() << "[lane-vectorize] cone fail: effectful leaf " << ref
-                       << "\n";
+          def && !isMemoryEffectFree(def))
         return failure();
-      }
       cone.leafGroups.push_back(group);
       continue;
     }
@@ -1234,22 +1194,17 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
                        [&](Value v) { return v == operands.front(); }))
         continue; // lane-invariant
       Type ty = operands.front().getType();
-      if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; })) {
-        if (laneVectorizeDebug())
-          llvm::errs() << "[lane-vectorize] cone fail: operand type mismatch at "
-                       << op0->getName() << " operand " << k << "\n";
+      if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; }))
         return failure();
-      }
       worklist.push_back(operands);
     }
   }
   return cone;
 }
 
-// A packing boundary (tensor.concat created by the loop rewrite, or by an
-// explicit pack) exposes exactly the lane values of a cone: use the values
-// feeding the concat (looking through the per-lane reshapes) as the seed, and
-// remember the concat so it can be replaced by the packed result.
+// A packing boundary (tensor.concat created by a previous pack) exposes the
+// lane values of a cone: its inputs (through per-lane reshapes) seed the cone,
+// and the concat itself is replaced by the packed result.
 struct ConcatBoundary {
   Operation *concat;
   SmallVector<Value> sources;
@@ -1305,35 +1260,21 @@ static bool rewriteBlock(Block *block, Operation *scope,
   for (SmallVector<Value> &g : siblingGroups)
     candidates.push_back(std::move(g));
 
-  if (laneVectorizeDebug())
-    llvm::errs() << "[lane-vectorize] rewriteBlock("
-                 << block->getParentOp()->getName()
-                 << ") boundary=" << (boundary ? boundary->sources.size() : 0)
-                 << " candidates=" << candidates.size() << "\n";
-
   for (unsigned ci = 0; ci < candidates.size(); ++ci) {
     SmallVector<Value> &seed = candidates[ci];
     bool isBoundarySeed = boundary && ci == 0;
     FailureOr<Cone> cone = discoverCone(seed);
-    if (laneVectorizeDebug())
-      llvm::errs() << "[lane-vectorize]   cand " << ci << " n=" << seed.size()
-                   << " boundarySeed=" << isBoundarySeed
-                   << " cone=" << (failed(cone) ? "FAIL" : "ok") << " refOps="
-                   << (failed(cone) ? 0 : (int)cone->refOps.size()) << "\n";
     if (failed(cone))
       continue;
 
-    // Earliest cone ref op: the lifter scans from here so every cone op is
+    // Earliest cone ref op: the packer scans from here so every cone op is
     // visited, regardless of where the packed ops are emitted.
     Operation *processStart = nullptr;
     for (Operation *op : cone->refOps)
       if (!processStart || op->isBeforeInBlock(processStart))
         processStart = op;
-    if (!processStart) {
-      if (laneVectorizeDebug())
-        llvm::errs() << "[lane-vectorize]   skip: no ref op\n";
+    if (!processStart)
       continue;
-    }
 
     // Emit the packed ops after the last leaf defined in this block so every
     // leaf dominates them, even when leaves are interleaved with cone ops.
@@ -1349,26 +1290,13 @@ static bool rewriteBlock(Block *block, Operation *scope,
           emissionPoint = next;
       }
     }
-    if (laneVectorizeDebug()) {
-      llvm::errs() << "[lane-vectorize]   processStart: " << *processStart
-                   << "\n[lane-vectorize]   emissionPoint: " << *emissionPoint
-                   << "\n[lane-vectorize]   leafGroups=" << cone->leafGroups.size()
-                   << "\n";
-      for (SmallVector<Value> &g : cone->leafGroups) {
-        llvm::errs() << "[lane-vectorize]     leaf:";
-        for (Value v : g)
-          llvm::errs() << " " << v;
-        llvm::errs() << "\n";
-      }
-    }
 
     OpBuilder builder(emissionPoint);
     Location loc = emissionPoint->getLoc();
-    Lifter lifter(scope, processStart, builder, cone->n);
-    lifter.laneImages = std::move(cone->laneImages);
-    for (unsigned i = 1; i < cone->n; ++i)
-      for (auto &entry : lifter.laneImages[i])
-        lifter.laneVarying.insert(entry.second);
+    Packer packer(scope, processStart, builder, cone->n);
+    packer.lanesOf = std::move(cone->lanesOf);
+    for (auto &entry : packer.lanesOf)
+      packer.laneVarying.insert(entry.second.begin(), entry.second.end());
 
     // Snapshot the ops to visit before emitting anything: emitted ops are
     // inserted before emissionPoint, which lies inside [processStart, end), so
@@ -1379,29 +1307,24 @@ static bool rewriteBlock(Block *block, Operation *scope,
 
     DenseSet<Value> leafRefs;
     for (SmallVector<Value> &g : cone->leafGroups) {
-      Value packed = buildPackedLanes(builder, loc, g);
+      Value packedLeaf = packLanes(builder, loc, g);
       // Seed every lane of the leaf, not just the reference: otherwise the
       // sibling lanes (defined before the cone start) are misclassified as
-      // lane-invariant by isShared and their whole chain is skipped.
+      // lane-invariant and their whole chain is skipped.
       for (Value v : g)
-        lifter.packedOf[v] = {packed, false};
+        packer.packed[v] = {packedLeaf, /*shared=*/false};
       leafRefs.insert(g.front());
     }
 
-    // Lift the cone plus any forward lane-parallel extension.
     for (Operation *op : worklist)
-      (void)lifter.liftOp(op);
-    if (laneVectorizeDebug())
-      llvm::errs() << "[lane-vectorize]   lifted=" << lifter.liftedOps.size()
-                   << "\n";
+      (void)packer.liftOp(op);
 
     // If this cone is the producer of a pack boundary, hand the packed result
     // straight to the concat's users instead of unpacking and re-packing.
     if (isBoundarySeed) {
-      // Never retry this boundary, consumed or not.
-      skip.insert(boundary->concat);
-      auto it = lifter.packedOf.find(boundary->sources.front());
-      if (it != lifter.packedOf.end() && !it->second.shared &&
+      skip.insert(boundary->concat); // never retry this boundary
+      auto it = packer.packed.find(boundary->sources.front());
+      if (it != packer.packed.end() && !it->second.shared &&
           it->second.value.getType() ==
               boundary->concat->getResult(0).getType()) {
         boundary->concat->getResult(0).replaceAllUsesWith(it->second.value);
@@ -1416,67 +1339,66 @@ static bool rewriteBlock(Block *block, Operation *scope,
       }
     }
 
-    // The unpacked values are materialised at the emission point, so only uses
+    // The unpacked values are materialized at the emission point, so only uses
     // at or after it can be served; earlier uses keep the original (unpacked)
     // computation, which therefore is not erased.
     auto canServe = [&](Operation *user) {
       return user->getBlock() != block || !user->isBeforeInBlock(emissionPoint);
     };
 
-    // Materialise escaping lane values, then erase the original computation.
-    for (Value ref : lifter.referenceOrder) {
-      auto it = lifter.packedOf.find(ref);
-      if (it == lifter.packedOf.end() || it->second.shared ||
+    // Materialize escaping lane values, then erase the original computation.
+    for (Value ref : packer.packedRefs) {
+      auto it = packer.packed.find(ref);
+      if (it == packer.packed.end() || it->second.shared ||
           leafRefs.contains(ref))
         continue;
-      SmallVector<Value> lanes(cone->n);
-      lanes[0] = ref;
-      for (unsigned i = 1; i < cone->n; ++i)
-        lanes[i] = lifter.laneImages[i].lookup(ref);
+      auto lanesIt = packer.lanesOf.find(ref);
+      if (lanesIt == packer.lanesOf.end())
+        continue;
+      const SmallVector<Value> &lanes = lanesIt->second;
+
       bool external = false;
       for (Value lane : lanes) {
-        if (!lane)
-          continue;
-        for (OpOperand &use : lane.getUses())
-          if (!lifter.liftedOps.contains(use.getOwner()) &&
+        for (OpOperand &use : lane.getUses()) {
+          if (!packer.liftedOps.contains(use.getOwner()) &&
               canServe(use.getOwner())) {
             external = true;
             break;
           }
+        }
         if (external)
           break;
       }
       if (!external)
         continue;
+
       SmallVector<Value> unpacked =
-          unpackPackedLanes(builder, loc, it->second.value, cone->n);
+          unpackLanes(builder, loc, it->second.value, cone->n);
       if (unpacked.size() != cone->n)
         continue;
       for (unsigned i = 0; i < cone->n; ++i) {
         if (!lanes[i])
           continue;
         for (OpOperand &use : llvm::make_early_inc_range(lanes[i].getUses()))
-          if (!lifter.liftedOps.contains(use.getOwner()) &&
+          if (!packer.liftedOps.contains(use.getOwner()) &&
               canServe(use.getOwner()))
             use.set(unpacked[i]);
       }
     }
-    for (Value ref : lifter.sharedRefs) {
-      auto it = lifter.packedOf.find(ref);
-      if (it == lifter.packedOf.end())
+    for (Value ref : packer.sharedRefs) {
+      auto it = packer.packed.find(ref);
+      if (it == packer.packed.end())
         continue;
       for (OpOperand &use : llvm::make_early_inc_range(ref.getUses()))
-        if (!lifter.liftedOps.contains(use.getOwner()) &&
+        if (!packer.liftedOps.contains(use.getOwner()) &&
             canServe(use.getOwner()))
           use.set(it->second.value);
     }
 
     SmallVector<Operation *> toErase;
-    for (Operation *op : lifter.liftedOps)
+    for (Operation *op : packer.liftedOps)
       if (op->getBlock() == block)
         toErase.push_back(op);
-    // Anything this rewrite consumed or emitted must not become a candidate
-    // again, even if it survives (still used) instead of being erased.
     for (Operation *op : toErase)
       skip.insert(op);
     llvm::stable_sort(toErase, [](Operation *a, Operation *b) {
@@ -1486,8 +1408,7 @@ static bool rewriteBlock(Block *block, Operation *scope,
       if (op->use_empty())
         op->erase();
 
-    // Sweep up any original ops that became dead (e.g. the sibling lanes of a
-    // value that escaped only through an erased reshape).
+    // Sweep up any original ops that became dead.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -1500,13 +1421,11 @@ static bool rewriteBlock(Block *block, Operation *scope,
         }
       }
     }
-    // If nothing was actually lifted this candidate was a no-op (e.g. the
-    // boundary seed failed); roll forward to the next candidate.
-    if (lifter.liftedOps.empty()) {
-      if (laneVectorizeDebug())
-        llvm::errs() << "[lane-vectorize]   no-op candidate, trying next\n";
+
+    // A no-op candidate (e.g. the boundary seed failed) rolls to the next one.
+    if (packer.liftedOps.empty())
       continue;
-    }
+
     // Mark every op this rewrite emitted so later fixpoint iterations in the
     // same block do not re-pack them.
     for (Operation &op : *block)
@@ -1528,7 +1447,8 @@ struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePas
     SmallPtrSet<Block *, 16> packedBodies;
     getOperation().walk([&](scf::ForOp forOp) {
       if (succeeded(rewriteLaneVectorizeLoop(forOp, packedBodies)))
-        LLVM_DEBUG(llvm::dbgs() << "[lane-vectorize] packed loop\n");
+        if (debugEnabled())
+          llvm::errs() << "[lane-vectorize] packed loop\n";
     });
 
     // Straight-line packing runs on every block (the lane-parallel prologue is
@@ -1541,34 +1461,20 @@ struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePas
         for (Block &block : region)
           blocks.push_back(&block);
     });
-    if (laneVectorizeDebug())
-      llvm::errs() << "[lane-vectorize] run: blocks=" << blocks.size()
-                   << " packedBodies=" << packedBodies.size() << "\n";
     DenseSet<Operation *> packedOps;
     for (Block *block : blocks) {
       Operation *parent = block->getParentOp();
-      if (packedBodies.contains(block)) {
-        if (laneVectorizeDebug())
-          llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
-                       << " skip=packedBody\n";
+      if (packedBodies.contains(block))
         continue;
-      }
       // Loop bodies with iter args are the loop rewrite's job; only pack
       // straight-line code (e.g. the body of the outer token loop, which has no
       // iter args).
       if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
-        if (forOp.getNumRegionIterArgs() > 0) {
-          if (laneVectorizeDebug())
-            llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
-                         << " skip=loopWithIterArgs\n";
+        if (forOp.getNumRegionIterArgs() > 0)
           continue;
-        }
       }
-      if (laneVectorizeDebug())
-        llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
-                     << " visiting\n";
-      // Bound the fixpoint; a block with a great many families still gets
-      // several of them packed without risking an unbounded rewrite loop.
+      // Bound the fixpoint; a block with many families still gets several of
+      // them packed without risking an unbounded rewrite loop.
       unsigned rewrites = 0;
       while (rewrites < 64 && rewriteBlock(block, parent, packedOps))
         ++rewrites;
