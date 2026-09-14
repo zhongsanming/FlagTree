@@ -339,9 +339,14 @@ static bool isMemoryDerived(Value v) {
       continue; // block argument or constant
     if (!isMemoryEffectFree(def))
       return true;
-    // Follow pure view ops to their source; anything else ends the walk.
+    // Follow pure view/cast ops to their source; anything else ends the walk.
+    // Casts matter because a buffer-backed tensor is commonly cast before being
+    // viewed (e.g. to_tensor(x_ub).to(f32) -> arith.extf, then sliced), and the
+    // slice is still a view of the buffer.
     if (isa<tensor::ExtractSliceOp, tensor::ReshapeOp, tensor::ExpandShapeOp,
-            tensor::CollapseShapeOp, tensor::CastOp>(def))
+            tensor::CollapseShapeOp, tensor::CastOp, arith::ExtFOp,
+            arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::SIToFPOp,
+            arith::FPToSIOp, arith::IndexCastOp, arith::BitcastOp>(def))
       llvm::append_range(worklist, def->getOperands());
   }
   return false;
