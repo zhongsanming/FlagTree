@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// LanePack.cpp - Lane-parallel operation packing
+// LaneVectorize.cpp - Lane-parallel operation vectorization
 //
 // Recognizes groups of loop-carried Triton tensor "lanes" (for example four
 // independent tensor<Mxf32> values updated by the same computation) and
@@ -50,20 +50,20 @@
 #include <map>
 #include <vector>
 
-#define DEBUG_TYPE "lane-pack"
+#define DEBUG_TYPE "lane-vectorize"
 
 namespace mlir::triton {
 
-#define GEN_PASS_DEF_TRITONLANEPACK
+#define GEN_PASS_DEF_TRITONLANEVECTORIZE
 #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
 
 namespace {
 
-// Debug logging, off unless LANE_PACK_DEBUG is set in the environment. This is
+// Debug logging, off unless LANE_VECTORIZE_DEBUG is set in the environment. This is
 // intentionally independent of LLVM_DEBUG so release builds can produce
 // diagnostics on request.
-static bool lanePackDebug() {
-  static const bool enabled = ::getenv("LANE_PACK_DEBUG") != nullptr;
+static bool laneVectorizeDebug() {
+  static const bool enabled = ::getenv("LANE_VECTORIZE_DEBUG") != nullptr;
   return enabled;
 }
 
@@ -904,7 +904,7 @@ struct Lifter {
       if (blockMode)
         return success(); // boundary: leave the op in place
       LLVM_DEBUG(llvm::dbgs()
-                 << "[lane-pack] reject: effectful op " << *op << "\n");
+                 << "[lane-vectorize] reject: effectful op " << *op << "\n");
       return failure();
     }
     if (allOperandsShared(op))
@@ -915,7 +915,7 @@ struct Lifter {
       return success();
     // Unmatched pure op: drop it from the packed loop.
     LLVM_DEBUG(llvm::dbgs()
-               << "[lane-pack] dropping unmatched pure op " << *op << "\n");
+               << "[lane-vectorize] dropping unmatched pure op " << *op << "\n");
     return success();
   }
 
@@ -947,14 +947,14 @@ struct Lifter {
 // ---------------------------------------------------------------------------
 
 static LogicalResult
-rewriteLanePackLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodies) {
+rewriteLaneVectorizeLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodies) {
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
 
   auto initArgs = forOp.getInitArgs();
   unsigned m = initArgs.size();
-  if (lanePackDebug())
-    llvm::errs() << "[lane-pack] loop: iterArgs=" << m << "\n";
+  if (laneVectorizeDebug())
+    llvm::errs() << "[lane-vectorize] loop: iterArgs=" << m << "\n";
   if (m < 2)
     return failure();
 
@@ -1043,8 +1043,8 @@ rewriteLanePackLoop(scf::ForOp forOp, SmallPtrSetImpl<Block *> &packedBodies) {
   for (unsigned j = 0; j < m; ++j)
     forOp.getResult(j).replaceAllUsesWith(newResults[j]);
   packedBodies.insert(newFor.getBody());
-  if (lanePackDebug())
-    llvm::errs() << "[lane-pack] loop packed: lanes=" << n << "\n";
+  if (laneVectorizeDebug())
+    llvm::errs() << "[lane-vectorize] loop packed: lanes=" << n << "\n";
   forOp.erase();
   return success();
 }
@@ -1197,15 +1197,15 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       // signature. Packing them would be correct but pointless and can blow up
       // the fixpoint, so reject the whole cone.
       if (mismatchedComputational) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: mixed computational leaf at "
+        if (laneVectorizeDebug())
+          llvm::errs() << "[lane-vectorize] cone fail: mixed computational leaf at "
                        << op0->getName() << "\n";
         return failure();
       }
       if (!isa<RankedTensorType>(ref.getType()) ||
           !isComputeType(ref.getType())) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: non-compute leaf " << ref
+        if (laneVectorizeDebug())
+          llvm::errs() << "[lane-vectorize] cone fail: non-compute leaf " << ref
                        << "\n";
         return failure();
       }
@@ -1215,8 +1215,8 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       // copies and buffer materialisations such as tile.to_tensor.
       if (Operation *def = ref.getDefiningOp();
           def && !isMemoryEffectFree(def)) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: effectful leaf " << ref
+        if (laneVectorizeDebug())
+          llvm::errs() << "[lane-vectorize] cone fail: effectful leaf " << ref
                        << "\n";
         return failure();
       }
@@ -1235,8 +1235,8 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
         continue; // lane-invariant
       Type ty = operands.front().getType();
       if (!llvm::all_of(operands, [&](Value v) { return v.getType() == ty; })) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] cone fail: operand type mismatch at "
+        if (laneVectorizeDebug())
+          llvm::errs() << "[lane-vectorize] cone fail: operand type mismatch at "
                        << op0->getName() << " operand " << k << "\n";
         return failure();
       }
@@ -1305,8 +1305,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
   for (SmallVector<Value> &g : siblingGroups)
     candidates.push_back(std::move(g));
 
-  if (lanePackDebug())
-    llvm::errs() << "[lane-pack] rewriteBlock("
+  if (laneVectorizeDebug())
+    llvm::errs() << "[lane-vectorize] rewriteBlock("
                  << block->getParentOp()->getName()
                  << ") boundary=" << (boundary ? boundary->sources.size() : 0)
                  << " candidates=" << candidates.size() << "\n";
@@ -1315,8 +1315,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     SmallVector<Value> &seed = candidates[ci];
     bool isBoundarySeed = boundary && ci == 0;
     FailureOr<Cone> cone = discoverCone(seed);
-    if (lanePackDebug())
-      llvm::errs() << "[lane-pack]   cand " << ci << " n=" << seed.size()
+    if (laneVectorizeDebug())
+      llvm::errs() << "[lane-vectorize]   cand " << ci << " n=" << seed.size()
                    << " boundarySeed=" << isBoundarySeed
                    << " cone=" << (failed(cone) ? "FAIL" : "ok") << " refOps="
                    << (failed(cone) ? 0 : (int)cone->refOps.size()) << "\n";
@@ -1330,8 +1330,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
       if (!processStart || op->isBeforeInBlock(processStart))
         processStart = op;
     if (!processStart) {
-      if (lanePackDebug())
-        llvm::errs() << "[lane-pack]   skip: no ref op\n";
+      if (laneVectorizeDebug())
+        llvm::errs() << "[lane-vectorize]   skip: no ref op\n";
       continue;
     }
 
@@ -1349,13 +1349,13 @@ static bool rewriteBlock(Block *block, Operation *scope,
           emissionPoint = next;
       }
     }
-    if (lanePackDebug()) {
-      llvm::errs() << "[lane-pack]   processStart: " << *processStart
-                   << "\n[lane-pack]   emissionPoint: " << *emissionPoint
-                   << "\n[lane-pack]   leafGroups=" << cone->leafGroups.size()
+    if (laneVectorizeDebug()) {
+      llvm::errs() << "[lane-vectorize]   processStart: " << *processStart
+                   << "\n[lane-vectorize]   emissionPoint: " << *emissionPoint
+                   << "\n[lane-vectorize]   leafGroups=" << cone->leafGroups.size()
                    << "\n";
       for (SmallVector<Value> &g : cone->leafGroups) {
-        llvm::errs() << "[lane-pack]     leaf:";
+        llvm::errs() << "[lane-vectorize]     leaf:";
         for (Value v : g)
           llvm::errs() << " " << v;
         llvm::errs() << "\n";
@@ -1391,8 +1391,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     // Lift the cone plus any forward lane-parallel extension.
     for (Operation *op : worklist)
       (void)lifter.liftOp(op);
-    if (lanePackDebug())
-      llvm::errs() << "[lane-pack]   lifted=" << lifter.liftedOps.size()
+    if (laneVectorizeDebug())
+      llvm::errs() << "[lane-vectorize]   lifted=" << lifter.liftedOps.size()
                    << "\n";
 
     // If this cone is the producer of a pack boundary, hand the packed result
@@ -1503,8 +1503,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     // If nothing was actually lifted this candidate was a no-op (e.g. the
     // boundary seed failed); roll forward to the next candidate.
     if (lifter.liftedOps.empty()) {
-      if (lanePackDebug())
-        llvm::errs() << "[lane-pack]   no-op candidate, trying next\n";
+      if (laneVectorizeDebug())
+        llvm::errs() << "[lane-vectorize]   no-op candidate, trying next\n";
       continue;
     }
     // Mark every op this rewrite emitted so later fixpoint iterations in the
@@ -1521,14 +1521,14 @@ static bool rewriteBlock(Block *block, Operation *scope,
 // Pass
 // ---------------------------------------------------------------------------
 
-struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
-  using TritonLanePackBase::TritonLanePackBase;
+struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePass> {
+  using TritonLaneVectorizeBase::TritonLaneVectorizeBase;
 
   void runOnOperation() override {
     SmallPtrSet<Block *, 16> packedBodies;
     getOperation().walk([&](scf::ForOp forOp) {
-      if (succeeded(rewriteLanePackLoop(forOp, packedBodies)))
-        LLVM_DEBUG(llvm::dbgs() << "[lane-pack] packed loop\n");
+      if (succeeded(rewriteLaneVectorizeLoop(forOp, packedBodies)))
+        LLVM_DEBUG(llvm::dbgs() << "[lane-vectorize] packed loop\n");
     });
 
     // Straight-line packing runs on every block (the lane-parallel prologue is
@@ -1541,15 +1541,15 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
         for (Block &block : region)
           blocks.push_back(&block);
     });
-    if (lanePackDebug())
-      llvm::errs() << "[lane-pack] run: blocks=" << blocks.size()
+    if (laneVectorizeDebug())
+      llvm::errs() << "[lane-vectorize] run: blocks=" << blocks.size()
                    << " packedBodies=" << packedBodies.size() << "\n";
     DenseSet<Operation *> packedOps;
     for (Block *block : blocks) {
       Operation *parent = block->getParentOp();
       if (packedBodies.contains(block)) {
-        if (lanePackDebug())
-          llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+        if (laneVectorizeDebug())
+          llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
                        << " skip=packedBody\n";
         continue;
       }
@@ -1558,14 +1558,14 @@ struct LanePackPass : public impl::TritonLanePackBase<LanePackPass> {
       // iter args).
       if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
         if (forOp.getNumRegionIterArgs() > 0) {
-          if (lanePackDebug())
-            llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+          if (laneVectorizeDebug())
+            llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
                          << " skip=loopWithIterArgs\n";
           continue;
         }
       }
-      if (lanePackDebug())
-        llvm::errs() << "[lane-pack] block parent=" << parent->getName()
+      if (laneVectorizeDebug())
+        llvm::errs() << "[lane-vectorize] block parent=" << parent->getName()
                      << " visiting\n";
       // Bound the fixpoint; a block with a great many families still gets
       // several of them packed without risking an unbounded rewrite loop.
