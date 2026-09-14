@@ -785,4 +785,93 @@ module {
   // CHECK-LABEL: tt.func @no_pack_ptr_to_int(
   // CHECK-NOT: tensor.concat
   // CHECK: tt.return
+
+  // A contiguous run of tensor.extract_slice leaves from one source is packed
+  // with a single wider slice + reshape, not a tensor.concat.
+  tt.func @straight_line_contiguous_slices(%src: tensor<8xf32>, %y: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %l0 = tensor.extract_slice %src[0] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %l1 = tensor.extract_slice %src[4] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %r0 = arith.addf %l0, %y : tensor<4xf32>
+    %r1 = arith.addf %l1, %y : tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line_contiguous_slices(
+  // CHECK: tensor.extract_slice %{{.*}}[0] [8] [1]
+  // CHECK: tensor.reshape
+  // CHECK-NOT: tensor.concat
+  // CHECK: arith.addf
+
+  // Same coalescing path, but triggered from the loop init args in loop mode.
+  tt.func @loop_contiguous_slice_init(%src: tensor<8xf32>, %eps: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
+    %l0 = tensor.extract_slice %src[0] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %l1 = tensor.extract_slice %src[4] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %0:2 = scf.for %iv = %lb to %ub step %step iter_args(%a = %l0, %b = %l1) -> (tensor<4xf32>, tensor<4xf32>) {
+      %r0 = "tt.reduce"(%a) <{axis = 0 : i32}> ({
+      ^bb0(%p: f32, %q: f32):
+        %s0 = arith.addf %p, %q : f32
+        tt.reduce.return %s0 : f32
+      }) : (tensor<4xf32>) -> f32
+      %d0s = arith.addf %r0, %eps : f32
+      %d0 = tt.splat %d0s : f32 -> tensor<4xf32>
+      %row0 = arith.divf %a, %d0 : tensor<4xf32>
+
+      %r1 = "tt.reduce"(%b) <{axis = 0 : i32}> ({
+      ^bb0(%p: f32, %q: f32):
+        %s1 = arith.addf %p, %q : f32
+        tt.reduce.return %s1 : f32
+      }) : (tensor<4xf32>) -> f32
+      %d1s = arith.addf %r1, %eps : f32
+      %d1 = tt.splat %d1s : f32 -> tensor<4xf32>
+      %row1 = arith.divf %b, %d1 : tensor<4xf32>
+      scf.yield %row0, %row1 : tensor<4xf32>, tensor<4xf32>
+    }
+    tt.return %0#0, %0#1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @loop_contiguous_slice_init(
+  // CHECK: tensor.extract_slice %{{.*}}[0] [8] [1]
+  // CHECK: tensor.reshape
+  // CHECK-NOT: tensor.concat
+  // CHECK: scf.for
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
+
+  // A cross-lane combine in straight-line code is rewritten as a tt.reduce
+  // over the synthesized lane axis (axis 0), not lifted as an elementwise op.
+  tt.func @straight_line_cross_lane(%x0: tensor<4xf32>, %x1: tensor<4xf32>, %c: f32) -> tensor<4xf32> {
+    %cs = tt.splat %c : f32 -> tensor<4xf32>
+    %r0 = arith.mulf %x0, %cs : tensor<4xf32>
+    %r1 = arith.mulf %x1, %cs : tensor<4xf32>
+    %s = arith.addf %r0, %r1 : tensor<4xf32>
+    tt.return %s : tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line_cross_lane(
+  // CHECK: tensor.concat
+  // CHECK: arith.mulf
+  // CHECK: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
+  // CHECK: tt.return
+
+  // Per-lane expand_dims shifts its axis by one (the new lane axis is 0).
+  tt.func @straight_line_expand_dims(%x0: tensor<4xf32>, %x1: tensor<4xf32>) -> (tensor<1x4xf32>, tensor<1x4xf32>) {
+    %e0 = tt.expand_dims %x0 {axis = 0 : i32} : tensor<4xf32> -> tensor<1x4xf32>
+    %e1 = tt.expand_dims %x1 {axis = 0 : i32} : tensor<4xf32> -> tensor<1x4xf32>
+    tt.return %e0, %e1 : tensor<1x4xf32>, tensor<1x4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @straight_line_expand_dims(
+  // CHECK: tensor.concat
+  // CHECK: tt.expand_dims %{{.*}} {axis = 1 : i32} : tensor<2x4xf32> -> tensor<2x1x4xf32>
+
+  // tt.reshape with allow_reorder may move data across lanes, so it must not
+  // be packed.
+  tt.func @no_pack_reshape_reorder(%x0: tensor<2x2xf32>, %x1: tensor<2x2xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %r0 = tt.reshape %x0 allow_reorder : tensor<2x2xf32> -> tensor<4xf32>
+    %r1 = tt.reshape %x1 allow_reorder : tensor<2x2xf32> -> tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_reshape_reorder(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
 }
