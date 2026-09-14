@@ -1,4 +1,4 @@
-// RUN: triton-opt --triton-lane-pack %s | FileCheck %s
+// RUN: triton-opt --triton-lane-vectorize %s | FileCheck %s
 
 module {
   tt.func @row_col_row(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %eps: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
