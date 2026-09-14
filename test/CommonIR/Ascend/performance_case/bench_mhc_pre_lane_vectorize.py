@@ -1,7 +1,7 @@
 """Benchmark mhc_pre_clamp_sinkhorn with and without the triton-lane-vectorize pass.
 
 The ``triton-lane-vectorize`` TTIR pass (see
-``lib/Dialect/Triton/Transforms/LaneVectorize.cpp``) packs lane-parallel
+``lib/flagtree/Transforms/LaneVectorize.cpp``) packs lane-parallel
 tensors into a leading dimension. This script measures its performance impact
 on the ``mhc_pre_clamp_sinkhorn`` TLE kernel by running it twice:
 

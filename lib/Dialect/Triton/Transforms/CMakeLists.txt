@@ -4,7 +4,7 @@ add_public_tablegen_target(TritonCombineIncGen)
 
 add_triton_library(TritonTransforms
   Combine.cpp
-  LaneVectorize.cpp
+  ${PROJECT_SOURCE_DIR}/lib/flagtree/Transforms/LaneVectorize.cpp
   LoopAwareCSE.cpp
   LoopInvariantCodeMotion.cpp
   LoopPeeling.cpp
