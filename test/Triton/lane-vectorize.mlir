@@ -837,6 +837,22 @@ module {
   // CHECK-NOT: tensor.concat
   // CHECK: arith.addf
 
+  // A leaf that is a view of a computed value (or an on-chip buffer) is a
+  // boundary, so the whole cone is left unpacked (packing would reshape a
+  // non-argument buffer).
+  tt.func @no_pack_computed_source(%a: tensor<8xf32>, %b: tensor<8xf32>, %z: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+    %s = arith.addf %a, %b : tensor<8xf32>
+    %l0 = tensor.extract_slice %s[0] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %l1 = tensor.extract_slice %s[4] [4] [1] : tensor<8xf32> to tensor<4xf32>
+    %r0 = arith.addf %l0, %z : tensor<4xf32>
+    %r1 = arith.addf %l1, %z : tensor<4xf32>
+    tt.return %r0, %r1 : tensor<4xf32>, tensor<4xf32>
+  }
+
+  // CHECK-LABEL: tt.func @no_pack_computed_source(
+  // CHECK-NOT: tensor.concat
+  // CHECK: tt.return
+
   // Same coalescing path, but triggered from the loop init args in loop mode.
   tt.func @loop_contiguous_slice_init(%src: tensor<8xf32>, %eps: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {
     %l0 = tensor.extract_slice %src[0] [4] [1] : tensor<8xf32> to tensor<4xf32>

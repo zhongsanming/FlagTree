@@ -138,6 +138,17 @@ static Value packContiguousSlices(OpBuilder &builder, Location loc,
     return Value();
   auto firstView = cast<OffsetSizeAndStrideOpInterface>(first.getOperation());
   Value source = first.getSource();
+  // Only coalesce through a function-argument source. A contiguous-slice
+  // coalesce reshapes the *source* (one wide slice + a reshape). When that
+  // source is a computed value or a buffer view it becomes a memref alloc, and
+  // BiShengHIR's PropagateMemrefExpandUp materialises the reshape as an
+  // expand_shape of that allocation and drops its address space, emitting an
+  // invalid memref.collapse_shape. The concat fallback instead reshapes the
+  // per-lane slices, which lowers through the subview path and keeps the
+  // address space. Slices of a function argument also lower to a plain memref
+  // argument, so coalescing them is safe.
+  if (!isa<BlockArgument>(source))
+    return Value();
   auto sizes = toStatic(firstView.getMixedSizes());
   auto strides = toStatic(firstView.getMixedStrides());
   auto base = toStatic(firstView.getMixedOffsets());
@@ -1264,6 +1275,13 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       // other passes (and breaks Ascend address-space inference).
       if (isMemoryDerived(ref))
         return failure();
+      // A leaf that is a view of a non-argument value (a computed value or an
+      // on-chip buffer) is also a boundary: packing it reshapes that value's
+      // buffer, which BiShengHIR's reshape propagation mis-compiles (see
+      // packContiguousSlices). Views of a function argument are safe.
+      if (auto slice = ref.getDefiningOp<tensor::ExtractSliceOp>())
+        if (!isa<BlockArgument>(slice.getSource()))
+          return failure();
       cone.leafGroups.push_back(group);
       continue;
     }
