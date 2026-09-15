@@ -43,6 +43,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -55,8 +56,27 @@ import time
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MHC_DIR = os.path.abspath(os.path.join(_HERE, "..", "mhc"))
-sys.path.insert(0, _HERE)     # testing.py
 sys.path.insert(0, _MHC_DIR)  # mhc_pre_clamp_sinkhorn.py
+
+
+# The Ascend backend ships the maintained do_bench_npu; load it by explicit
+# path (the module name `testing` is generic and easily shadowed on sys.path).
+_ASCEND_TESTING = os.path.abspath(
+    os.path.join(_HERE, "..", "..", "..", "..", "third_party", "ascend",
+                 "backend", "testing.py"))
+
+
+def _load_do_bench_npu():
+    """Load ``do_bench_npu`` from third_party/ascend/backend/testing.py."""
+    if not os.path.exists(_ASCEND_TESTING):
+        raise ImportError(f"cannot find {_ASCEND_TESTING}")
+    spec = importlib.util.spec_from_file_location("_mhc_bench_testing",
+                                                  _ASCEND_TESTING)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load testing.py from {_ASCEND_TESTING}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.do_bench_npu
 
 # Marker printed by a child process so the driver can find its JSON result.
 _MARK = "@@MHC_PRE_LV_RESULT@@"
@@ -202,7 +222,7 @@ def _run_child(args) -> int:
 
     import torch  # noqa: E402  (import after env is set)
     from mhc_pre_clamp_sinkhorn import mhc_pre_clamp_sinkhorn, mhc_pre_clamp_sinkhorn_ref  # noqa: E402
-    from testing import do_bench_npu  # noqa: E402
+    do_bench_npu = _load_do_bench_npu()  # noqa: E402
 
     device = _device(torch)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
