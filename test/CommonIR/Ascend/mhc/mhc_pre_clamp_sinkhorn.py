@@ -164,7 +164,7 @@ def _heads_sinkhorn_kernel_tle(mixes_ptr,  # (T, 24) fp32
                                HC_EPS: tl.constexpr, CLAMP_MIN: tl.constexpr, CLAMP_MAX: tl.constexpr,
                                APPLY_CLAMP: tl.constexpr, ITERS: tl.constexpr, SAVE_INTERMEDIATES: tl.constexpr,
                                NUM_TOKENS: tl.constexpr,  # tokens per program (pipeline depth)
-                               USE_STATIC_RANGE: tl.constexpr = True, APPLY_EPS: tl.constexpr = True,
+                               USE_STATIC_RANGE: tl.constexpr = False, APPLY_EPS: tl.constexpr = True,
                                NORM_ORDER: tl.constexpr = 0,
                                ):
     """Pipeline version: each program processes NUM_TOKENS tokens sequentially.
