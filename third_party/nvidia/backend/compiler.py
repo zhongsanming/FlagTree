@@ -2,6 +2,7 @@ from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, nvidia
 from triton._C.libtriton import tle
 from triton import knobs
+from triton.flagtree_env import is_lane_vectorize_disabled
 from triton.runtime.errors import PTXASError
 
 from dataclasses import dataclass
@@ -253,7 +254,8 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
-        passes.ttir.add_lane_vectorize(pm)
+        if not is_lane_vectorize_disabled():
+            passes.ttir.add_lane_vectorize(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)

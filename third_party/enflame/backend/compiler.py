@@ -26,6 +26,7 @@ import functools
 from typing import Any, Tuple
 import hashlib
 from triton._C.libtriton import ir, passes, llvm
+from triton.flagtree_env import is_lane_vectorize_disabled
 from typing import Dict
 from types import ModuleType
 from triton.runtime.errors import OutOfResources
@@ -68,7 +69,8 @@ def make_ttir(mod, metadata, options):
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
-    passes.ttir.add_lane_vectorize(pm)
+    if not is_lane_vectorize_disabled():
+        passes.ttir.add_lane_vectorize(pm)
     passes.common.add_cse(pm)
     passes.common.add_licm(pm)
     passes.common.add_symbol_dce(pm)

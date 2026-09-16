@@ -1,6 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes
 from triton.runtime.cache import get_cache_manager
+from triton.flagtree_env import is_lane_vectorize_disabled
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
@@ -389,7 +390,8 @@ class TXDABackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_reorder_broadcast(pm)
-        passes.ttir.add_lane_vectorize(pm)
+        if not is_lane_vectorize_disabled():
+            passes.ttir.add_lane_vectorize(pm)
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
