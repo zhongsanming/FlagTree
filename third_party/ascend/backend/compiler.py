@@ -33,7 +33,7 @@ from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, Union
 
 from flagtree import _flagprism  # FlagPrism
-from triton._C.libtriton import ir, passes, ascend
+from triton._C.libtriton import ir, passes, ascend, tle
 from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
@@ -52,6 +52,7 @@ from triton.backends.ascend.utils import (
     _get_bishengir_opt_path,
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
+    _is_lane_vectorize_disabled,
     _is_auto_map_parallel_blocks_enabled,
     downgrade_llir,
     force_disable_ffts,
@@ -89,6 +90,8 @@ def make_ttir(mod, metadata, opt):
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
+    if not _is_lane_vectorize_disabled():
+        passes.ttir.add_lane_vectorize(pm)
     passes.common.add_cse(pm)
     # commonir: NOTE: LICM is intentionally omitted — it hoists tile.to_tensor above
     # tile.copy in loops, breaking the read-after-write ordering required by
@@ -569,6 +572,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
+        if os.environ.get("BISHENGIR_DUMP_IR_AFTER_ALL") == "1":
+            _compile_option_list += ["--mlir-print-ir-after-all"]
+
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None and vf_merge_level != 1:
@@ -590,6 +596,16 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+
+        if "--mlir-print-ir-after-all" in _compile_option_list:
+            dump_path = os.environ.get("BISHENGIR_DUMP_PATH")
+            if dump_path is None:
+                dump_dir = os.environ.get("BISHENGIR_DUMP_DIR", "bishengir_dump")
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_path = os.path.join(dump_dir, f"hivmir_{metadata['hash']}.log")
+            with open(dump_path, "w") as f:
+                f.write(ret.stderr.decode("utf-8", errors="replace"))
+            print(f"[bishengir] Pass IR dump written to: {dump_path}")
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -814,6 +830,10 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
+
+        if os.environ.get("BISHENGIR_DUMP_IR_AFTER_ALL") == "1":
+            _compile_option_list += ["--mlir-print-ir-after-all"]
+
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         if opt.debug:
             print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
@@ -832,7 +852,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
 
         if "--mlir-print-ir-after-all" in _compile_option_list:
-            dump_path = os.environ.get("BISHENGIR_DUMP_PATH", os.path.join(tmpdir, "bishengir_pass_dump.log"))
+            dump_path = os.environ.get("BISHENGIR_DUMP_PATH")
+            if dump_path is None:
+                dump_dir = os.environ.get("BISHENGIR_DUMP_DIR", "bishengir_dump")
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_path = os.path.join(dump_dir, f"hivmir_{metadata['hash']}.log")
             with open(dump_path, "w") as f:
                 f.write(ret.stderr.decode("utf-8", errors="replace"))
             print(f"[bishengir] Pass IR dump written to: {dump_path}")

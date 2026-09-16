@@ -79,6 +79,26 @@ def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
+def TritonLaneVectorize : Pass<"triton-lane-vectorize", "mlir::ModuleOp"> {
+  let summary = "Recognize lane-parallel tensor update patterns";
+  let description = [{
+    This pass recognizes groups of loop-carried Triton tensors that represent
+    independent lanes of the same computation and packs them into a single
+    tensor with a synthesized leading lane dimension.
+
+    Matching is structural rather than semantic: an operation is lifted when
+    each of its per-lane instances computes the same math and its operands are
+    either already packed or lane-invariant. Associative combines across the
+    lanes (for example an add tree over all lanes) are recognized as reductions
+    over the lane axis. Any operation whose packed form is mathematically
+    equivalent is allowed.
+  }];
+
+  let dependentDialects = ["mlir::scf::SCFDialect",
+                           "mlir::tensor::TensorDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   let summary = "CSE within loop bodies";
 
