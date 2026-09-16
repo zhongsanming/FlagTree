@@ -55,8 +55,8 @@ def _make_inputs(B: int, S: int, N: int, D: int, dtype: torch.dtype, device: str
 
     x = torch.randn((B, S, N, D), dtype=dtype, device=device)
     phi = torch.randn((hc_mix, hc_d), dtype=torch.float32, device=device)
-    alpha = torch.randn((3,), dtype=torch.float32, device=device)
-    base = torch.randn((hc_mix,), dtype=torch.float32, device=device)
+    alpha = torch.randn((3, ), dtype=torch.float32, device=device)
+    base = torch.randn((hc_mix, ), dtype=torch.float32, device=device)
     return x, phi, alpha, base
 
 
@@ -79,8 +79,7 @@ def _variants(args):
             for order_name, norm_order in _pick(args.norm_order, _ORDER_VARIANTS):
                 out.append((
                     f"loop={loop_name:<12} eps={eps_name:<3} order={order_name}",
-                    dict(use_static_range=use_static_range, apply_eps=apply_eps,
-                         norm_order=norm_order),
+                    dict(use_static_range=use_static_range, apply_eps=apply_eps, norm_order=norm_order),
                     dict(apply_eps=apply_eps, norm_order=norm_order),
                 ))
     return out
@@ -141,8 +140,13 @@ def main() -> None:
     for label, kernel_kw, ref_kw in variants:
         try:
             out = mhc_pre_clamp_sinkhorn(
-                x, phi, alpha, base,
-                need_backward=args.need_backward, **common, **kernel_kw,
+                x,
+                phi,
+                alpha,
+                base,
+                need_backward=args.need_backward,
+                **common,
+                **kernel_kw,
             )
             _sync(device)
         except Exception as exc:  # noqa: BLE001

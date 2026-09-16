@@ -145,7 +145,6 @@ def _rms_scale_kernel_tle(
 # across the iteration loop.
 # ===========================================================================
 
-
 # NOTE: the Sinkhorn body below is written fully inline (no @triton.jit
 # helper). In this fork the frontend lowers every @triton.jit callee to a
 # separate tt.func + tt.call (code_generator.call_JitFunction), so a helper is
@@ -154,19 +153,25 @@ def _rms_scale_kernel_tle(
 
 
 @triton.jit
-def _heads_sinkhorn_kernel_tle(mixes_ptr,  # (T, 24) fp32
-                               alpha_ptr,  # (3,)   fp32
-                               base_ptr,  # (24,)  fp32
-                               pre_ptr,  # (T, 4)        fp32  OUT
-                               post_ptr,  # (T, 4)        fp32  OUT
-                               comb_ptr,  # (T, 4, 4)     fp32  OUT
-                               logits_ptr,  # (T, 4, 4)     fp32  OUT (pre-clamp logits, for bwd)
-                               HC_EPS: tl.constexpr, CLAMP_MIN: tl.constexpr, CLAMP_MAX: tl.constexpr,
-                               APPLY_CLAMP: tl.constexpr, ITERS: tl.constexpr, SAVE_INTERMEDIATES: tl.constexpr,
-                               NUM_TOKENS: tl.constexpr,  # tokens per program (pipeline depth)
-                               USE_STATIC_RANGE: tl.constexpr = False, APPLY_EPS: tl.constexpr = True,
-                               NORM_ORDER: tl.constexpr = 0,
-                               ):
+def _heads_sinkhorn_kernel_tle(
+    mixes_ptr,  # (T, 24) fp32
+    alpha_ptr,  # (3,)   fp32
+    base_ptr,  # (24,)  fp32
+    pre_ptr,  # (T, 4)        fp32  OUT
+    post_ptr,  # (T, 4)        fp32  OUT
+    comb_ptr,  # (T, 4, 4)     fp32  OUT
+    logits_ptr,  # (T, 4, 4)     fp32  OUT (pre-clamp logits, for bwd)
+    HC_EPS: tl.constexpr,
+    CLAMP_MIN: tl.constexpr,
+    CLAMP_MAX: tl.constexpr,
+    APPLY_CLAMP: tl.constexpr,
+    ITERS: tl.constexpr,
+    SAVE_INTERMEDIATES: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,  # tokens per program (pipeline depth)
+    USE_STATIC_RANGE: tl.constexpr = False,
+    APPLY_EPS: tl.constexpr = True,
+    NORM_ORDER: tl.constexpr = 0,
+):
     """Pipeline version: each program processes NUM_TOKENS tokens sequentially.
 
     Uses tle.dsa.pipeline(num_stages=2) to overlap MTE2 DMA (loading next

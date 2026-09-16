@@ -61,25 +61,23 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _MHC_DIR = os.path.abspath(os.path.join(_HERE, "..", "mhc"))
 sys.path.insert(0, _MHC_DIR)  # mhc_pre_clamp_sinkhorn.py
 
-
 # The Ascend backend ships the maintained do_bench_npu; load it by explicit
 # path (the module name `testing` is generic and easily shadowed on sys.path).
 _ASCEND_TESTING = os.path.abspath(
-    os.path.join(_HERE, "..", "..", "..", "..", "third_party", "ascend",
-                 "backend", "testing.py"))
+    os.path.join(_HERE, "..", "..", "..", "..", "third_party", "ascend", "backend", "testing.py"))
 
 
 def _load_do_bench_npu():
     """Load ``do_bench_npu`` from third_party/ascend/backend/testing.py."""
     if not os.path.exists(_ASCEND_TESTING):
         raise ImportError(f"cannot find {_ASCEND_TESTING}")
-    spec = importlib.util.spec_from_file_location("_mhc_bench_testing",
-                                                  _ASCEND_TESTING)
+    spec = importlib.util.spec_from_file_location("_mhc_bench_testing", _ASCEND_TESTING)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load testing.py from {_ASCEND_TESTING}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.do_bench_npu
+
 
 # Marker printed by a child process so the driver can find its JSON result.
 _MARK = "@@MHC_PRE_LV_RESULT@@"
@@ -185,13 +183,15 @@ def _bytes_io(B, S, N, D, dtype):
     hc_mix = N * (N + 2)
     hc_d = N * D
     T = B * S
-    read = (T * N * D * elem      # x
-            + hc_mix * hc_d * 4   # phi (fp32)
-            + 3 * 4               # alpha
-            + hc_mix * 4)         # base
-    write = (T * D * elem         # y
-             + T * N * 4          # post_out
-             + T * N * N * 4)     # comb_frag
+    read = (
+        T * N * D * elem  # x
+        + hc_mix * hc_d * 4  # phi (fp32)
+        + 3 * 4  # alpha
+        + hc_mix * 4)  # base
+    write = (
+        T * D * elem  # y
+        + T * N * 4  # post_out
+        + T * N * N * 4)  # comb_frag
     return read + write
 
 
@@ -267,16 +267,13 @@ def _run_child(args) -> int:
 
         bw = _bytes_io(B, S, N, D, dtype) / (t["ms"] * 1e-3) / 1e9
         log(f"[LV {args.variant}] {label}: {t['ms']:.4f} ms  {bw:.2f} GB/s")
-        results.append(dict(label=label, B=B, S=S, N=N, D=D,
-                            ms=t["ms"], min=t["min"], max=t["max"], mean=t["mean"],
-                            bw_gbs=bw, check=check, detail=detail))
+        results.append(
+            dict(label=label, B=B, S=S, N=N, D=D, ms=t["ms"], min=t["min"], max=t["max"], mean=t["mean"], bw_gbs=bw,
+                 check=check, detail=detail))
 
-    payload = dict(variant=args.variant, device=device, mode=args.mode, dtype=args.dtype,
-                   iter_times=args.iter_times, clamp_min=args.clamp_min,
-                   clamp_max=args.clamp_max, need_backward=args.need_backward,
-                   sinkhorn_loop=args.sinkhorn_loop, eps=args.eps,
-                   norm_order=args.norm_order,
-                   results=results)
+    payload = dict(variant=args.variant, device=device, mode=args.mode, dtype=args.dtype, iter_times=args.iter_times,
+                   clamp_min=args.clamp_min, clamp_max=args.clamp_max, need_backward=args.need_backward,
+                   sinkhorn_loop=args.sinkhorn_loop, eps=args.eps, norm_order=args.norm_order, results=results)
     print(_MARK + json.dumps(payload), flush=True)
     return 0
 
@@ -300,22 +297,42 @@ def _run_driver(args) -> int:
     payloads = {}
     for variant in ("on", "off"):
         cmd = [
-            sys.executable, os.path.abspath(__file__),
-            "--variant", variant,
-            "--mode", args.mode,
-            "--dtype", args.dtype,
-            "--warmup", str(args.warmup),
-            "--rep", str(args.rep),
-            "--B", str(args.B), "--S", str(args.S),
-            "--N", str(args.N), "--D", str(args.D),
-            "--iter-times", str(args.iter_times),
-            "--norm-eps", str(args.norm_eps),
-            "--hc-eps", str(args.hc_eps),
-            "--clamp-min", str(args.clamp_min),
-            "--clamp-max", str(args.clamp_max),
-            "--sinkhorn-loop", args.sinkhorn_loop,
-            "--eps", args.eps,
-            "--norm-order", args.norm_order,
+            sys.executable,
+            os.path.abspath(__file__),
+            "--variant",
+            variant,
+            "--mode",
+            args.mode,
+            "--dtype",
+            args.dtype,
+            "--warmup",
+            str(args.warmup),
+            "--rep",
+            str(args.rep),
+            "--B",
+            str(args.B),
+            "--S",
+            str(args.S),
+            "--N",
+            str(args.N),
+            "--D",
+            str(args.D),
+            "--iter-times",
+            str(args.iter_times),
+            "--norm-eps",
+            str(args.norm_eps),
+            "--hc-eps",
+            str(args.hc_eps),
+            "--clamp-min",
+            str(args.clamp_min),
+            "--clamp-max",
+            str(args.clamp_max),
+            "--sinkhorn-loop",
+            args.sinkhorn_loop,
+            "--eps",
+            args.eps,
+            "--norm-order",
+            args.norm_order,
         ]
         if args.sweep:
             cmd.append("--sweep")
@@ -403,8 +420,7 @@ def _parse_args():
     p = argparse.ArgumentParser(
         description="Benchmark mhc_pre_clamp_sinkhorn with/without the triton-lane-vectorize pass")
     # internal: select a single variant (child mode); normally unset
-    p.add_argument("--variant", choices=["on", "off"], default=None,
-                   help=argparse.SUPPRESS)
+    p.add_argument("--variant", choices=["on", "off"], default=None, help=argparse.SUPPRESS)
     p.add_argument("--B", type=int, default=_DEFAULT_SHAPE[0], help="batch size")
     p.add_argument("--S", type=int, default=_DEFAULT_SHAPE[1], help="sequence length")
     p.add_argument("--N", type=int, default=_DEFAULT_SHAPE[2], help="head multiplier (must be 4)")
@@ -415,16 +431,14 @@ def _parse_args():
     p.add_argument("--iter-times", type=int, default=20, help="sinkhorn iteration count")
     p.add_argument("--sinkhorn-loop", choices=["static_range", "range"], default="static_range",
                    help="unrolled tl.static_range vs looped tl.range Sinkhorn body")
-    p.add_argument("--eps", choices=["on", "off"], default="on",
-                   help="emit/omit the Sinkhorn HC_EPS adds")
+    p.add_argument("--eps", choices=["on", "off"], default="on", help="emit/omit the Sinkhorn HC_EPS adds")
     p.add_argument("--norm-order", choices=["row_first", "col_first"], default="row_first",
                    help="row-first (0) vs col-first (1) initial norm and iteration order")
     p.add_argument("--norm-eps", type=float, default=1e-6, help="RMSNorm epsilon")
     p.add_argument("--hc-eps", type=float, default=1e-6, help="sinkhorn epsilon")
     p.add_argument("--clamp-min", type=float, default=0.0, help="logits clamp min (0 = disabled)")
     p.add_argument("--clamp-max", type=float, default=0.0, help="logits clamp max (0 = disabled)")
-    p.add_argument("--need-backward", action="store_true",
-                   help="request the extra saved intermediates")
+    p.add_argument("--need-backward", action="store_true", help="request the extra saved intermediates")
     p.add_argument("--warmup", type=int, default=10, help="warmup iterations")
     p.add_argument("--rep", type=int, default=50, help="measurement iterations (active runs for kernel mode)")
     p.add_argument("--check", action="store_true", help="verify output against mhc_pre_clamp_sinkhorn_ref")
