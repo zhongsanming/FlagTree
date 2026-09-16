@@ -1,11 +1,12 @@
-# flagtree-owned TTIR passes. Kept out of lib/Dialect/Triton/Transforms so
-# upstream rebases do not conflict. The pass still uses the upstream tablegen
-# declarations (include/triton/Dialect/Triton/Transforms/Passes.td).
+# FlagTree-owned TTIR passes. Kept out of lib/Dialect/Triton/Transforms so
+# upstream rebases do not conflict. The passes are declared in
+# include/flagtree/Transforms/Passes.td (tablegen target
+# FlagTreeTransformsIncGen); see include/flagtree/Transforms/Passes.h.
 add_triton_library(FlagTreeTransforms
   LaneVectorize.cpp
 
   DEPENDS
-  TritonTransformsIncGen
+  FlagTreeTransformsIncGen
 
   LINK_LIBS PUBLIC
   MLIRPass

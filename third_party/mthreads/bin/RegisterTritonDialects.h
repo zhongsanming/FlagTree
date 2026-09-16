@@ -3,6 +3,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
+#include "flagtree/Transforms/Passes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
@@ -31,6 +32,7 @@ BackendRegisterFunc load_backend_register_func(const char *backend_name,
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerTritonPasses();
+  mlir::triton::registerFlagTreePasses();
 
   mlir::triton::gpu::registerTritonGPUPasses();
   mlir::triton::registerConvertTritonToTritonGPUPass();

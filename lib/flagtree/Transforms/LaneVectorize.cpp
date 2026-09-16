@@ -88,7 +88,8 @@
 // 4. WHERE IT RUNS
 // ===========================================================================
 //
-// Registered as `triton-lane-vectorize` (see Passes.td) and enabled in the
+// Registered as `triton-lane-vectorize` (declared in
+// include/flagtree/Transforms/Passes.td) and enabled in the
 // TTIR pipeline of every backend. It runs AFTER `add_inliner` (so per-lane
 // `@triton.jit` helpers are already flattened into the cone) and BEFORE `cse`
 // / `loop-unroll`, operating on TTIR (`scf`, `tt.reduce`, `arith`, `tensor`).
@@ -145,7 +146,7 @@
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "flagtree/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -159,7 +160,7 @@
 namespace mlir::triton {
 
 #define GEN_PASS_DEF_TRITONLANEVECTORIZE
-#include "triton/Dialect/Triton/Transforms/Passes.h.inc"
+#include "flagtree/Transforms/Passes.h.inc"
 
 namespace {
 
