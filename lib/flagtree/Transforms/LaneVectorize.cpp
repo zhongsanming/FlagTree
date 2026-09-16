@@ -132,6 +132,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "flagtree/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -146,7 +147,6 @@
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "flagtree/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -329,7 +329,8 @@ static Value packContiguousSlices(OpBuilder &builder, Location loc,
 
 // Packs `lanes` (all of the same ranked tensor type) into one tensor with a new
 // leading dimension of size lanes.size().
-static Value packLanes(OpBuilder &builder, Location loc, ArrayRef<Value> lanes) {
+static Value packLanes(OpBuilder &builder, Location loc,
+                       ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
   if (Value coalesced = packContiguousSlices(builder, loc, lanes))
     return coalesced;
@@ -735,9 +736,9 @@ static Value buildReduceFromKind(OpBuilder &builder, Location loc, Value src,
 
 struct Packer {
   // -- configuration --
-  scf::ForOp forOp;               // loop mode: the loop; block mode: null
-  Operation *scope = nullptr;     // values defined outside it are lane-invariant
-  Block *laneBody = nullptr;      // loop body (loop mode); null in block mode
+  scf::ForOp forOp;           // loop mode: the loop; block mode: null
+  Operation *scope = nullptr; // values defined outside it are lane-invariant
+  Block *laneBody = nullptr;  // loop body (loop mode); null in block mode
   Operation *coneStart = nullptr; // block mode: values before this are shared
   bool blockMode = false;
   OpBuilder &builder;
@@ -750,9 +751,9 @@ struct Packer {
   DenseSet<Value> laneVarying;                 // every lane-varying value
   DenseMap<Value, Value> argRemap;             // old loop args -> new loop args
   SmallVector<unsigned> laneIndices;           // iter-arg indices of the lanes
-  SmallVector<Value> packedRefs;   // lane-varying refs in lift order
-  SmallVector<Value> sharedRefs;   // cross-lane reduce results (shared)
-  SmallPtrSet<Operation *, 32> liftedOps;      // original ops replaced
+  SmallVector<Value> packedRefs;          // lane-varying refs in lift order
+  SmallVector<Value> sharedRefs;          // cross-lane reduce results (shared)
+  SmallPtrSet<Operation *, 32> liftedOps; // original ops replaced
 
   Packer(scf::ForOp forOp, OpBuilder &builder, unsigned n)
       : forOp(forOp), scope(forOp.getOperation()), laneBody(forOp.getBody()),
@@ -1647,8 +1648,7 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
         return failure();
       // An effectful leaf is a hard boundary: packing it would concat memory
       // results (memory vectorization), which is left to other passes.
-      if (Operation *def = ref.getDefiningOp();
-          def && !isMemoryEffectFree(def))
+      if (Operation *def = ref.getDefiningOp(); def && !isMemoryEffectFree(def))
         return failure();
       cone.leafGroups.push_back(group);
       continue;
@@ -1956,7 +1956,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
 //
 // `packedOps` (the skip set) accumulates ops emitted by this pass and boundary
 // concats it consumed, so no rewrite ever considers its own output.
-struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePass> {
+struct LaneVectorizePass
+    : public impl::TritonLaneVectorizeBase<LaneVectorizePass> {
   using TritonLaneVectorizeBase::TritonLaneVectorizeBase;
 
   void runOnOperation() override {
@@ -2030,9 +2031,8 @@ struct LaneVectorizePass : public impl::TritonLaneVectorizeBase<LaneVectorizePas
       // Bound the fixpoint; a block with many families still gets several of
       // them packed without risking an unbounded rewrite loop.
       unsigned rewrites = 0;
-      while (rewrites < 64 &&
-             rewriteBlock(block, parent, packedOps, candidates, boundary,
-                          liveOps, before)) {
+      while (rewrites < 64 && rewriteBlock(block, parent, packedOps, candidates,
+                                           boundary, liveOps, before)) {
         ++rewrites;
         refreshLive();
         // The concat boundary is consumed by its rewrite; drop it so the cached

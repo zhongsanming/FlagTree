@@ -137,26 +137,26 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::proton::gpu::registerAddSchedBarriersPass();
 #endif
 
-  registry.insert<
-      mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
-      mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
-      mlir::triton::gpu::TritonGPUDialect,
-      mlir::triton::instrument::TritonInstrumentDialect,
-      mlir::math::MathDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect,
-      mlir::tensor::TensorDialect, mlir::gpu::GPUDialect,
-      mlir::LLVM::LLVMDialect, mlir::NVVM::NVVMDialect,
-      mlir::triton::nvgpu::NVGPUDialect, mlir::triton::nvws::NVWSDialect,
-      mlir::triton::amdgpu::TritonAMDGPUDialect,
+  registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
+                  mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+                  mlir::triton::gpu::TritonGPUDialect,
+                  mlir::triton::instrument::TritonInstrumentDialect,
+                  mlir::math::MathDialect, mlir::arith::ArithDialect,
+                  mlir::scf::SCFDialect, mlir::tensor::TensorDialect,
+                  mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
+                  mlir::NVVM::NVVMDialect, mlir::triton::nvgpu::NVGPUDialect,
+                  mlir::triton::nvws::NVWSDialect,
+                  mlir::triton::amdgpu::TritonAMDGPUDialect,
 #ifndef __FLAGPRISM__
-      mlir::triton::proton::ProtonDialect,
-      mlir::triton::proton::gpu::ProtonGPUDialect,
+                  mlir::triton::proton::ProtonDialect,
+                  mlir::triton::proton::gpu::ProtonGPUDialect,
 #endif
-      mlir::ROCDL::ROCDLDialect,
+                  mlir::ROCDL::ROCDLDialect,
 #ifdef __TLE__
-      mlir::triton::gluon::GluonDialect,
-      mlir::triton::tle::TleDialect // flagtree tle raw
+                  mlir::triton::gluon::GluonDialect,
+                  mlir::triton::tle::TleDialect // flagtree tle raw
 #else
-      mlir::triton::gluon::GluonDialect
+                  mlir::triton::gluon::GluonDialect
 #endif
-      >();
+                  >();
 }
