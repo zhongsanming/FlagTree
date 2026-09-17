@@ -60,8 +60,6 @@
 //     liftable tensor ops, seeded either by a `tensor.concat` that is itself a
 //     packing boundary (produced by a previous loop-mode pack) or by shallow
 //     structural signatures refined by operand congruence. No loop needed.
-//     This mode is OPT-IN and disabled by default: set
-//     TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 to enable it.
 //
 // Both modes drive the SAME Packer, which owns the lifted value mapping and
 // the resolve() classifier. The difference is only how the lane groups are
@@ -96,9 +94,7 @@
 // `@triton.jit` helpers are already flattened into the cone) and BEFORE `cse`
 // / `loop-unroll`, operating on TTIR (`scf`, `tt.reduce`, `arith`, `tensor`).
 // The Ascend backend gates it behind TRITON_DISABLE_LANE_VECTORIZE (see
-// third_party/ascend/backend/utils.py) for A/B benchmarking. Within the pass,
-// block mode is separately gated behind TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE
-// (default off); see blockModeEnabled().
+// third_party/ascend/backend/utils.py) for A/B benchmarking.
 //
 // ===========================================================================
 // 5. HARD BOUNDARIES (deliberately conservative)
@@ -136,7 +132,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "flagtree/Common/EnvVars.h"
 #include "flagtree/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -173,23 +168,6 @@ namespace {
 // is set in the environment. This is intentionally independent of LLVM_DEBUG.
 static bool debugEnabled() {
   static const bool enabled = ::getenv("LANE_VECTORIZE_DEBUG") != nullptr;
-  return enabled;
-}
-
-// Block mode (SLP over straight-line code; see rewriteBlock) is opt-in and
-// disabled by default: set TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 to turn it
-// on. Loop mode always runs, and the two modes are independent, so leaving
-// block mode off still lets loop-carried lane groups be packed.
-static bool blockModeEnabled() {
-  static const bool enabled = [] {
-    const char *value =
-        ::getenv(flagtree::kEnableLaneVectorizeBlockMode.c_str());
-    if (!value)
-      return false;
-    StringRef str(value);
-    return str == "1" || str.equals_insensitive("true") ||
-           str.equals_insensitive("on");
-  }();
   return enabled;
 }
 
@@ -1989,11 +1967,6 @@ struct LaneVectorizePass
         if (debugEnabled())
           llvm::errs() << "[lane-vectorize] packed loop\n";
     });
-
-    // Block mode is opt-in; see blockModeEnabled(). Loop mode above always
-    // runs.
-    if (!blockModeEnabled())
-      return;
 
     // Straight-line packing runs on every block (the lane-parallel prologue is
     // often inside an outer loop body), except the loop bodies already produced
