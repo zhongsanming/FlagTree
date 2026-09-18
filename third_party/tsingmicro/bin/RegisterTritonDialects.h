@@ -14,6 +14,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/TritonGPUConversion.h"
 
+#include "flagtree/Transforms/Passes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -77,6 +78,7 @@ void registerTestTritonAMDGPURangeAnalysis();
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerTritonPasses();
+  mlir::triton::registerFlagTreePasses();
   mlir::triton::gpu::registerTritonGPUPasses();
   mlir::registerLinalgPasses();
   mlir::registerTritonNvidiaGPUPasses();

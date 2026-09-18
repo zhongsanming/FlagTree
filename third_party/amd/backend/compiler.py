@@ -1,6 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd
 from triton import knobs
+from triton.flagtree_env import is_lane_vectorize_disabled
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
@@ -193,6 +194,8 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
+        if not is_lane_vectorize_disabled():
+            passes.ttir.add_lane_vectorize(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)

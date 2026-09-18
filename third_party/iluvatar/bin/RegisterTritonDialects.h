@@ -16,6 +16,7 @@
 #include "TritonAMDGPUTransforms/TritonGPUConversion.h"
 #endif
 
+#include "flagtree/Transforms/Passes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #ifdef __NVIDIA__
@@ -57,6 +58,7 @@ DEFINE_LOAD_FUNC(registerConvertTritonGPUToLLVMPass)
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerTritonPasses();
+  mlir::triton::registerFlagTreePasses();
   mlir::triton::gpu::registerTritonGPUPasses();
 #ifdef __NVIDIA__
   mlir::registerTritonNvidiaGPUPasses();
