@@ -18,9 +18,16 @@ namespace mlir::triton::flagtree {
 inline const std::string kDisableLaneVectorize =
     "TRITON_DISABLE_LANE_VECTORIZE";
 
+// Opt-in: enable block mode (SLP over straight-line code) in the
+// triton-lane-vectorize pass. Loop mode is always on; block mode is disabled
+// by default. See lib/flagtree/Transforms/LaneVectorize.cpp.
+inline const std::string kEnableLaneVectorizeBlockMode =
+    "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE";
+
 inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     // clang-format off
     kDisableLaneVectorize,
+    kEnableLaneVectorizeBlockMode,
     // clang-format on
 };
 
