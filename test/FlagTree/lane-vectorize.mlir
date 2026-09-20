@@ -1,4 +1,12 @@
+<<<<<<< Updated upstream
 // RUN: env TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 triton-opt --triton-lane-vectorize %s | FileCheck %s
+=======
+// RUN: env TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1 TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1 triton-opt --triton-lane-vectorize %s | FileCheck %s
+//
+// This file checks the historical (unguarded) behavior of the pass: both
+// correctness guards are relaxed via the env vars above. See
+// lane-vectorize-guards.mlir for the default, guarded behavior.
+>>>>>>> Stashed changes
 
 module {
   tt.func @row_col_row(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %eps: f32, %lb: index, %ub: index, %step: index) -> (tensor<4xf32>, tensor<4xf32>) {

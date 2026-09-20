@@ -25,3 +25,22 @@ def is_lane_vectorize_disabled() -> bool:
     ``TRITON_DISABLE_LANE_VECTORIZE=1`` to skip it.
     """
     return _flagtree_bool("TRITON_DISABLE_LANE_VECTORIZE", False)
+
+
+def is_lane_vectorize_concat_allowed() -> bool:
+    """Whether the pass may emit the generic ``tensor.concat`` packing path.
+
+    Off by default: the concat materializes its operands (an allocation the
+    bundled Ascend BiSheng/HIVM pipeline cannot lower). Only the coalesced
+    ``tensor.extract_slice`` path packs unless this is enabled.
+    """
+    return _flagtree_bool("TRITON_LANE_VECTORIZE_ALLOW_CONCAT", False)
+
+
+def are_lane_vectorize_address_cones_allowed() -> bool:
+    """Whether block mode may pack integer/index cones that feed addresses.
+
+    Off by default: packing address arithmetic and unpacking it again is wrong
+    for strided/non-contiguous accesses.
+    """
+    return _flagtree_bool("TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES", False)

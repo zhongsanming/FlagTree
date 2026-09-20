@@ -122,6 +122,18 @@
 //   * `tt.reshape allow_reorder` is rejected: element reordering could move
 //     data across lanes.
 //
+//   * (GUARD, default on) The generic `tensor.concat` packing fallback is
+//     disabled. A concat that is not a contiguous `tensor.extract_slice` view
+//     MATERIALIZES its operands, i.e. it needs an allocation, which the bundled
+//     Ascend BiSheng/HIVM pipeline cannot lower ("Unknown core type: llvm.func
+//     @malloc"). Only the coalesced path packs by default;
+//     TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1 restores the fallback.
+//
+//   * (GUARD, default on) Block mode rejects integer/index cones that feed
+//     memory addresses: packing the address math and unpacking it again is
+//     wrong for strided/non-contiguous accesses. Restore with
+//     TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1.
+//
 //   * Block mode never creates a lane group larger than kMaxLanes (32) and the
 //     per-block fixpoint is capped (64 rewrites), so a pathological block
 //     cannot blow up compile time.
@@ -176,6 +188,7 @@ static bool debugEnabled() {
   return enabled;
 }
 
+<<<<<<< Updated upstream
 // Block mode (SLP over straight-line code; see rewriteBlock) is opt-in and
 // disabled by default: set TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 to turn it
 // on. Loop mode always runs, and the two modes are independent, so leaving
@@ -190,6 +203,40 @@ static bool blockModeEnabled() {
     return str == "1" || str.equals_insensitive("true") ||
            str.equals_insensitive("on");
   }();
+=======
+// Reads a FlagTree boolean env var. Unset or any non-truthy value is false.
+static bool flagtreeEnvFlag(const char *name) {
+  const char *value = ::getenv(name);
+  if (!value)
+    return false;
+  llvm::StringRef str(value);
+  return str == "1" || str.equals_insensitive("true") ||
+         str.equals_insensitive("on") || str.equals_insensitive("yes");
+}
+
+// The two guards below default to the SAFE behavior; the matching env vars opt
+// back into the aggressive transform. They are listed in
+// flagtree/Common/EnvVars.h so flipping one invalidates the JIT cache.
+
+// Allow the generic tensor.concat fallback in packLanes(). The fallback copies
+// its operands into a fresh tensor, i.e. it needs an allocation, which the
+// bundled Ascend BiSheng/HIVM pipeline cannot lower ("Unknown core type:
+// llvm.func @malloc"). Only the coalesced extract_slice path is on by default.
+static bool concatFallbackAllowed() {
+  static const bool enabled =
+      flagtreeEnvFlag(flagtree::kAllowLaneVectorizeConcat.c_str());
+  return enabled;
+}
+
+// Allow packing integer/index cones that feed memory addresses. Packing the
+// address math and unpacking it again in front of the (unlifted) memory op is
+// only valid for statically contiguous accesses; for strided/non-contiguous
+// ones it produces wrong or out-of-bounds addresses (the column-major matmul
+// failures).
+static bool addressConesAllowed() {
+  static const bool enabled =
+      flagtreeEnvFlag(flagtree::kAllowLaneVectorizeAddressCones.c_str());
+>>>>>>> Stashed changes
   return enabled;
 }
 
@@ -207,7 +254,12 @@ static void dumpLaneGroup(StringRef label, ArrayRef<Value> lanes,
   if (!debugEnabled())
     return;
   llvm::errs() << "[lane-vectorize] " << label << ": " << lanes.size()
-               << " lanes -> " << packed.getType() << "\n";
+               << " lanes -> ";
+  if (packed)
+    llvm::errs() << packed.getType();
+  else
+    llvm::errs() << "(unpackable)";
+  llvm::errs() << "\n";
   for (auto [i, lane] : llvm::enumerate(lanes)) {
     llvm::errs() << "  | lane" << i << ": ";
     if (Operation *def = lane.getDefiningOp())
@@ -216,6 +268,8 @@ static void dumpLaneGroup(StringRef label, ArrayRef<Value> lanes,
       llvm::errs() << lane << " : " << lane.getType();
     llvm::errs() << "\n";
   }
+  if (!packed)
+    return;
   llvm::errs() << "  v\n  ";
   if (Operation *def = packed.getDefiningOp())
     llvm::errs() << *def;
@@ -268,11 +322,23 @@ static Value buildShapeConst(OpBuilder &builder, Location loc,
                                            builder.getI64TensorAttr(shape));
 }
 
+// Geometry of a contiguous run of tensor.extract_slice leaves: one source,
+// sliced at evenly spaced offsets in dim 0 with identical sizes/strides.
+struct ContiguousSlices {
+  Value source;
+  SmallVector<int64_t> base;
+  SmallVector<int64_t> sizes;
+  SmallVector<int64_t> strides;
+  int64_t laneExtent = 0;
+};
+
 // If the lanes are a contiguous run of tensor.extract_slice of one source
-// (e.g. src[8], src[12], src[16], src[20]), pack them with a single wider
-// slice + reshape instead of a concat. Returns null when it does not apply.
-static Value packContiguousSlices(OpBuilder &builder, Location loc,
-                                  ArrayRef<Value> lanes) {
+// (e.g. src[8], src[12], src[16], src[20]), return the shared geometry so the
+// caller can pack them with a single wider slice + reshape instead of a concat.
+// Returns nullopt when the pattern does not apply. Pure: emits no IR, so it can
+// also be used as a pre-check before committing to a rewrite.
+static std::optional<ContiguousSlices>
+matchContiguousSlices(ArrayRef<Value> lanes) {
   auto toStatic =
       [](ArrayRef<OpFoldResult> ofrs) -> std::optional<SmallVector<int64_t>> {
     SmallVector<int64_t> out;
@@ -287,58 +353,65 @@ static Value packContiguousSlices(OpBuilder &builder, Location loc,
 
   auto first = lanes.front().getDefiningOp<tensor::ExtractSliceOp>();
   if (!first)
-    return Value();
+    return std::nullopt;
   auto firstView = cast<OffsetSizeAndStrideOpInterface>(first.getOperation());
   Value source = first.getSource();
   auto sizes = toStatic(firstView.getMixedSizes());
   auto strides = toStatic(firstView.getMixedStrides());
   auto base = toStatic(firstView.getMixedOffsets());
   if (!sizes || !strides || !base || sizes->empty() || (*strides)[0] != 1)
-    return Value();
+    return std::nullopt;
   int64_t laneExtent = (*sizes)[0];
   if (laneExtent <= 0)
-    return Value();
+    return std::nullopt;
 
   // Every lane must be the same slice shape/strides, offset only in dim 0 by
   // exactly one lane extent each step, and identical in all other dims.
   for (auto [i, lane] : llvm::enumerate(lanes.drop_front())) {
     auto slice = lane.getDefiningOp<tensor::ExtractSliceOp>();
     if (!slice || slice.getSource() != source)
-      return Value();
+      return std::nullopt;
     auto view = cast<OffsetSizeAndStrideOpInterface>(slice.getOperation());
     auto s = toStatic(view.getMixedSizes());
     auto st = toStatic(view.getMixedStrides());
     auto off = toStatic(view.getMixedOffsets());
     if (!s || !st || !off || *s != *sizes || *st != *strides)
-      return Value();
+      return std::nullopt;
     if ((*off)[0] != (*base)[0] + (int64_t)(i + 1) * laneExtent)
-      return Value();
+      return std::nullopt;
     for (unsigned d = 1; d < off->size(); ++d)
       if ((*off)[d] != (*base)[d])
-        return Value();
+        return std::nullopt;
   }
 
+  return ContiguousSlices{source, *base, *sizes, *strides, laneExtent};
+}
+
+// Emits the single wide slice + reshape that realizes a matched contiguous run.
+static Value packContiguousSlices(OpBuilder &builder, Location loc,
+                                  ArrayRef<Value> lanes,
+                                  const ContiguousSlices &info) {
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
   int64_t n = (int64_t)lanes.size();
 
   SmallVector<OpFoldResult> newOffsets;
-  for (int64_t o : *base)
+  for (int64_t o : info.base)
     newOffsets.push_back(builder.getIndexAttr(o));
   SmallVector<OpFoldResult> newSizes;
-  newSizes.push_back(builder.getIndexAttr(n * laneExtent));
-  for (unsigned d = 1; d < sizes->size(); ++d)
-    newSizes.push_back(builder.getIndexAttr((*sizes)[d]));
+  newSizes.push_back(builder.getIndexAttr(n * info.laneExtent));
+  for (unsigned d = 1; d < info.sizes.size(); ++d)
+    newSizes.push_back(builder.getIndexAttr(info.sizes[d]));
   SmallVector<OpFoldResult> newStrides;
-  for (int64_t s : *strides)
+  for (int64_t s : info.strides)
     newStrides.push_back(builder.getIndexAttr(s));
 
   SmallVector<int64_t> wideShape;
-  wideShape.push_back(n * laneExtent);
+  wideShape.push_back(n * info.laneExtent);
   wideShape.append(laneTy.getShape().begin() + 1, laneTy.getShape().end());
   auto wideTy = RankedTensorType::get(wideShape, laneTy.getElementType(),
                                       laneTy.getEncoding());
   Value wide = builder.create<tensor::ExtractSliceOp>(
-      loc, wideTy, source, newOffsets, newSizes, newStrides);
+      loc, wideTy, info.source, newOffsets, newSizes, newStrides);
 
   SmallVector<int64_t> packedShape;
   packedShape.push_back(n);
@@ -351,11 +424,20 @@ static Value packContiguousSlices(OpBuilder &builder, Location loc,
 
 // Packs `lanes` (all of the same ranked tensor type) into one tensor with a new
 // leading dimension of size lanes.size().
+//
+// GUARD: only the coalesced path above is enabled by default. The generic
+// tensor.concat fallback below copies its operands into a fresh tensor, i.e. it
+// requires an allocation, which the bundled Ascend BiSheng/HIVM pipeline cannot
+// lower ("Unknown core type: llvm.func @malloc"). It is therefore opt-in via
+// TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1. A null return means "cannot pack this
+// group"; callers MUST skip the group instead of packing it.
 static Value packLanes(OpBuilder &builder, Location loc,
                        ArrayRef<Value> lanes) {
   assert(lanes.size() >= 2 && "expected at least two lanes");
-  if (Value coalesced = packContiguousSlices(builder, loc, lanes))
-    return coalesced;
+  if (std::optional<ContiguousSlices> info = matchContiguousSlices(lanes))
+    return packContiguousSlices(builder, loc, lanes, *info);
+  if (!concatFallbackAllowed())
+    return Value();
   auto laneTy = cast<RankedTensorType>(lanes.front().getType());
 
   SmallVector<int64_t> singletonLaneShape;
@@ -520,6 +602,51 @@ static bool isLiftableOp(Operation *op) {
     return combiner && isAssociativeCombine(combiner);
   }
   return isPackableElementwise(op) && op->getNumRegions() == 0;
+}
+
+// True when `v` is an integer/index value that (transitively, through pure
+// integer/shape ops) reaches a memory operation as an address: a tt.addptr
+// offset, a tt.load/tt.store pointer, an atomic address, or a gather index.
+// Such values are addressing, not data: packing them means the packed address
+// tensor has to be unpacked again in front of the (unlifted) memory op, and for
+// non-contiguous/strided accesses the coalesced packing is invalid. Used by the
+// block-mode address-cone guard (see addressConesAllowed()).
+static bool isAddressProducer(Value v) {
+  SmallVector<Value> worklist{v};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (!seen.insert(cur).second)
+      continue;
+    for (OpOperand &use : cur.getUses()) {
+      Operation *user = use.getOwner();
+      // tt.addptr / tt.advance take a pointer and an integer offset: the
+      // integer operand is the address computation.
+      if (isa<triton::AddPtrOp, triton::AdvanceOp>(user) &&
+          use.getOperandNumber() >= 1)
+        return true;
+      // tt.int_to_ptr materializes a pointer from an integer offset.
+      if (isa<triton::IntToPtrOp>(user))
+        return true;
+      // tt.gather's second operand is the index tensor (an address); its first
+      // operand is data and must not count.
+      if (isa<triton::GatherOp>(user)) {
+        if (use.getOperandNumber() == 1)
+          return true;
+        continue;
+      }
+      // Follow pure integer/index math to the memory op. A value consumed as
+      // data (e.g. the value operand of a store) is not an address.
+      if (user->getNumResults() != 1 || !isMemoryEffectFree(user))
+        continue;
+      Type t = user->getResult(0).getType();
+      if (auto shaped = dyn_cast<ShapedType>(t))
+        t = shaped.getElementType();
+      if (isa<IntegerType, IndexType>(t))
+        worklist.push_back(user->getResult(0));
+    }
+  }
+  return false;
 }
 
 // Collects the leaves of an associative tree rooted at `v` (recursing through
@@ -1355,6 +1482,10 @@ rewriteLaneVectorizeLoop(scf::ForOp forOp,
   for (unsigned idx : laneIndices)
     initLanes.push_back(initArgs[idx]);
   Value packedInit = packLanes(builder, loc, initLanes);
+  // packLanes may refuse (e.g. the concat fallback is disabled and the init
+  // lanes are not a contiguous slice run); leave the loop untouched.
+  if (!packedInit)
+    return failure();
   dumpLaneGroup("loop init", initLanes, packedInit);
 
   SmallVector<unsigned> otherIndices;
@@ -1672,6 +1803,15 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       // results (memory vectorization), which is left to other passes.
       if (Operation *def = ref.getDefiningOp(); def && !isMemoryEffectFree(def))
         return failure();
+      // GUARD: skip integer/index cones that feed memory addresses. Packing the
+      // address math and unpacking it again in front of the (unlifted) memory
+      // op is wrong for strided/non-contiguous accesses (wrong or out-of-bounds
+      // addresses). Relax with
+      // TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1.
+      if (!addressConesAllowed() &&
+          llvm::any_of(group,
+                       [](Value v) { return isAddressProducer(v); }))
+        return failure();
       cone.leafGroups.push_back(group);
       continue;
     }
@@ -1794,6 +1934,19 @@ static bool rewriteBlock(Block *block, Operation *scope,
     if (!processStart)
       continue;
 
+    // GUARD: with the generic-concat fallback disabled, every leaf group must
+    // be packable by the coalesced (no-data-movement) path. Check BEFORE
+    // emitting anything so a candidate is either fully packed or left
+    // untouched.
+    if (!concatFallbackAllowed()) {
+      bool allCoalescible = llvm::all_of(
+          cone->leafGroups, [&](const SmallVector<Value> &g) {
+            return matchContiguousSlices(g).has_value();
+          });
+      if (!allCoalescible)
+        continue;
+    }
+
     // Emit the packed ops after the last leaf defined in this block so every
     // leaf dominates them, even when leaves are interleaved with cone ops.
     Operation *emissionPoint = processStart;
@@ -1826,7 +1979,11 @@ static bool rewriteBlock(Block *block, Operation *scope,
     DenseSet<Value> leafRefs;
     for (SmallVector<Value> &g : cone->leafGroups) {
       Value packedLeaf = packLanes(builder, loc, g);
+      // The coalesced pre-check above guarantees this for the default policy.
+      assert(packedLeaf && "leaf escaped the coalesced pre-check");
       dumpLaneGroup("leaf", g, packedLeaf);
+      if (!packedLeaf)
+        continue;
       // Seed every lane of the leaf, not just the reference: otherwise the
       // sibling lanes (defined before the cone start) are misclassified as
       // lane-invariant and their whole chain is skipped.

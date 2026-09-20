@@ -67,6 +67,12 @@ def TritonLaneVectorize : Pass<"triton-lane-vectorize", "mlir::ModuleOp"> {
     Effectful ops (loads/stores/copies/barriers), pointer/buffer/memref/token
     types, arith.select and tt.reshape with allow_reorder are deliberately NOT
     packed; see the file header for the rationale.
+
+    Two additional correctness guards are on by default and can be relaxed with
+    env vars (see flagtree/Common/EnvVars.h): the generic tensor.concat packing
+    fallback is disabled because it needs an allocation the bundled Ascend
+    BiSheng/HIVM pipeline cannot lower, and block mode rejects address-producing
+    integer cones.
   }];
 
   let dependentDialects = ["mlir::scf::SCFDialect",
