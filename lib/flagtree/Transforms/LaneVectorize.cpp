@@ -1809,8 +1809,7 @@ static FailureOr<Cone> discoverCone(ArrayRef<Value> seed) {
       // addresses). Relax with
       // TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1.
       if (!addressConesAllowed() &&
-          llvm::any_of(group,
-                       [](Value v) { return isAddressProducer(v); }))
+          llvm::any_of(group, [](Value v) { return isAddressProducer(v); }))
         return failure();
       cone.leafGroups.push_back(group);
       continue;
@@ -1939,8 +1938,8 @@ static bool rewriteBlock(Block *block, Operation *scope,
     // emitting anything so a candidate is either fully packed or left
     // untouched.
     if (!concatFallbackAllowed()) {
-      bool allCoalescible = llvm::all_of(
-          cone->leafGroups, [&](const SmallVector<Value> &g) {
+      bool allCoalescible =
+          llvm::all_of(cone->leafGroups, [&](const SmallVector<Value> &g) {
             return matchContiguousSlices(g).has_value();
           });
       if (!allCoalescible)
