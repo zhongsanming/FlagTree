@@ -44,3 +44,13 @@ def are_lane_vectorize_address_cones_allowed() -> bool:
     for strided/non-contiguous accesses.
     """
     return _flagtree_bool("TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES", False)
+
+
+def is_mlir_print_op_generic() -> bool:
+    """Whether dumped stage IR is serialized in the generic op form.
+
+    Equivalent to MLIR's ``--mlir-print-op-generic``. Off by default; when set,
+    ``python/triton/runtime/cache.py`` prints modules/ops with
+    ``get_asm(print_generic_op_form=True)``, giving canonical/diffable IR dumps.
+    """
+    return _flagtree_bool("TRITON_MLIR_PRINT_OP_GENERIC", False)

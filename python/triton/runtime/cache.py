@@ -11,6 +11,40 @@ import sysconfig
 from triton import __version__, knobs
 
 
+_TRUTHY = ("1", "true", "on", "yes")
+
+
+def _print_op_generic() -> bool:
+    """Whether dumped IR should use the generic op form.
+
+    Equivalent to MLIR's ``--mlir-print-op-generic``. When
+    ``TRITON_MLIR_PRINT_OP_GENERIC`` is truthy, every serialized module/op is
+    printed with ``get_asm(print_generic_op_form=True)`` instead of ``str()``,
+    so dumped stage files are canonical and independent of custom assembly
+    syntax. Off by default so the cache format is unchanged unless requested.
+    """
+    return os.environ.get("TRITON_MLIR_PRINT_OP_GENERIC", "").strip().lower() in _TRUTHY
+
+
+def _serialize_ir(data):
+    """Serialize ``data`` for a cache/dump write.
+
+    Byte strings are returned untouched elsewhere; here ``data`` is a
+    non-bytes module/op/string. MLIR modules and operations are printed in the
+    generic op form when requested, everything else falls back to ``str()``.
+    """
+    if _print_op_generic():
+        op = getattr(data, "operation", None)
+        if op is None and hasattr(data, "get_asm"):
+            op = data
+        if op is not None:
+            try:
+                return op.get_asm(print_generic_op_form=True)
+            except Exception:  # noqa: BLE001 - fall back to the default printer
+                pass
+    return str(data)
+
+
 class CacheManager(ABC):
 
     def __init__(self, key, override=False, dump=False):
@@ -100,7 +134,7 @@ class FileCacheManager(CacheManager):
             raise RuntimeError("Could not create or locate cache dir")
         binary = isinstance(data, bytes)
         if not binary:
-            data = str(data)
+            data = _serialize_ir(data)
         assert self.lock_path is not None
         filepath = self._make_path(filename)
         # Random ID to avoid any collisions

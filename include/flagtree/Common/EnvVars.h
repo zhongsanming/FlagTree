@@ -38,12 +38,20 @@ inline const std::string kAllowLaneVectorizeConcat =
 inline const std::string kAllowLaneVectorizeAddressCones =
     "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES";
 
+// Print dumped stage IR (including .ttir) in the generic op form, equivalent to
+// MLIR's --mlir-print-op-generic. Off by default so the cache format is
+// unchanged; when set, python/triton/runtime/cache.py serializes modules/ops
+// with get_asm(print_generic_op_form=True). Useful for canonical, diffable IR
+// dumps (see tools/run_ab_interleaved.py).
+inline const std::string kPrintOpGeneric = "TRITON_MLIR_PRINT_OP_GENERIC";
+
 inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     // clang-format off
     kDisableLaneVectorize,
     kEnableLaneVectorizeBlockMode,
     kAllowLaneVectorizeConcat,
     kAllowLaneVectorizeAddressCones,
+    kPrintOpGeneric,
     // clang-format on
 };
 
