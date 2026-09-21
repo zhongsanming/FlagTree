@@ -1,4 +1,4 @@
-// RUN: triton-opt --triton-lane-vectorize %s | FileCheck %s
+// RUN: env TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 triton-opt --triton-lane-vectorize %s | FileCheck %s
 //
 // Default (guarded) behavior of triton-lane-vectorize. Unlike
 // lane-vectorize.mlir, which relaxes both guards, this file checks that

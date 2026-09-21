@@ -188,7 +188,6 @@ static bool debugEnabled() {
   return enabled;
 }
 
-<<<<<<< Updated upstream
 // Block mode (SLP over straight-line code; see rewriteBlock) is opt-in and
 // disabled by default: set TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1 to turn it
 // on. Loop mode always runs, and the two modes are independent, so leaving
@@ -203,7 +202,9 @@ static bool blockModeEnabled() {
     return str == "1" || str.equals_insensitive("true") ||
            str.equals_insensitive("on");
   }();
-=======
+  return enabled;
+}
+
 // Reads a FlagTree boolean env var. Unset or any non-truthy value is false.
 static bool flagtreeEnvFlag(const char *name) {
   const char *value = ::getenv(name);
@@ -236,7 +237,6 @@ static bool concatFallbackAllowed() {
 static bool addressConesAllowed() {
   static const bool enabled =
       flagtreeEnvFlag(flagtree::kAllowLaneVectorizeAddressCones.c_str());
->>>>>>> Stashed changes
   return enabled;
 }
 
