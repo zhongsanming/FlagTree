@@ -20,9 +20,10 @@ def _print_op_generic() -> bool:
 
     Equivalent to MLIR's ``--mlir-print-op-generic``. When
     ``TRITON_MLIR_PRINT_OP_GENERIC`` is truthy, every serialized module/op is
-    printed with ``get_asm(print_generic_op_form=True)`` instead of ``str()``,
-    so dumped stage files are canonical and independent of custom assembly
-    syntax. Off by default so the cache format is unchanged unless requested.
+    printed with ``get_asm(print_generic_op_form=True, print_debug_info=False)``
+    instead of ``str()``, so dumped stage files are canonical, location-free and
+    independent of custom assembly syntax. Off by default so the cache format is
+    unchanged unless requested.
     """
     return os.environ.get("TRITON_MLIR_PRINT_OP_GENERIC", "").strip().lower() in _TRUTHY
 
@@ -32,7 +33,8 @@ def _serialize_ir(data):
 
     Byte strings are returned untouched elsewhere; here ``data`` is a
     non-bytes module/op/string. MLIR modules and operations are printed in the
-    generic op form when requested, everything else falls back to ``str()``.
+    generic op form (without locations) when requested, everything else falls
+    back to ``str()``.
     """
     if _print_op_generic():
         op = getattr(data, "operation", None)
@@ -40,7 +42,8 @@ def _serialize_ir(data):
             op = data
         if op is not None:
             try:
-                return op.get_asm(print_generic_op_form=True)
+                return op.get_asm(print_generic_op_form=True,
+                                  print_debug_info=False)
             except Exception as exc:  # noqa: BLE001 - fall back to the default printer
                 print(
                     "[triton] TRITON_MLIR_PRINT_OP_GENERIC is set but "

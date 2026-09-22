@@ -51,6 +51,7 @@ def is_mlir_print_op_generic() -> bool:
 
     Equivalent to MLIR's ``--mlir-print-op-generic``. Off by default; when set,
     ``python/triton/runtime/cache.py`` prints modules/ops with
-    ``get_asm(print_generic_op_form=True)``, giving canonical/diffable IR dumps.
+    ``get_asm(print_generic_op_form=True, print_debug_info=False)``, giving
+    canonical, location-free/diffable IR dumps.
     """
     return _flagtree_bool("TRITON_MLIR_PRINT_OP_GENERIC", False)
