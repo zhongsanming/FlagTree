@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -40,8 +41,14 @@ def _serialize_ir(data):
         if op is not None:
             try:
                 return op.get_asm(print_generic_op_form=True)
-            except Exception:  # noqa: BLE001 - fall back to the default printer
-                pass
+            except Exception as exc:  # noqa: BLE001 - fall back to the default printer
+                print(
+                    "[triton] TRITON_MLIR_PRINT_OP_GENERIC is set but "
+                    f"get_asm(print_generic_op_form=True) failed ({exc!r}); "
+                    "falling back to the custom printer. This usually means the "
+                    "installed libtriton (_C) does not match the Python sources.",
+                    file=sys.stderr,
+                )
     return str(data)
 
 
