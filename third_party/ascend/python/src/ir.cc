@@ -42,6 +42,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "flagtree/Common/EnvVars.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
@@ -2083,7 +2084,13 @@ void init_triton_env_vars(py::module &m) {
   m.def("get_cache_invalidating_env_vars",
         []() -> std::map<std::string, std::string> {
           std::map<std::string, std::string> ret;
-          for (const auto &envVar : CACHE_INVALIDATING_ENV_VARS) {
+          // Upstream variables plus the FlagTree-owned ones
+          // (include/flagtree/Common/EnvVars.h), so toggling a FlagTree feature
+          // still invalidates the JIT cache.
+          std::set<std::string> envVars = CACHE_INVALIDATING_ENV_VARS;
+          envVars.insert(flagtree::CACHE_INVALIDATING_ENV_VARS.begin(),
+                         flagtree::CACHE_INVALIDATING_ENV_VARS.end());
+          for (const auto &envVar : envVars) {
             auto strVal = triton::tools::getStrEnv(envVar);
             if (strVal.empty())
               continue;
