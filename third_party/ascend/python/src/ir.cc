@@ -581,6 +581,18 @@ void init_triton_ir(py::module &&m) {
           },
           ret::reference)
       .def("dump", [](OpState &self) { self->dump(); })
+      // MLIR's --mlir-print-op-generic equivalent: used by the cache writer to
+      // dump stage IR in canonical form (see triton.runtime.cache)._serialize_ir.
+      .def("get_asm",
+           [](OpState &self, bool print_generic_op_form) -> std::string {
+             std::string str;
+             llvm::raw_string_ostream os(str);
+             auto printingFlags = getOpPrintingFlags();
+             printingFlags.printGenericOpForm(print_generic_op_form);
+             self->print(os, printingFlags);
+             return str;
+           },
+           py::arg("print_generic_op_form") = false)
       .def("__str__",
            [](OpState &self) -> std::string {
              std::string str;
