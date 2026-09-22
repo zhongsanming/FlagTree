@@ -1,6 +1,8 @@
 #ifndef TRITON_TOOLS_SYS_GETENV_HPP
 #define TRITON_TOOLS_SYS_GETENV_HPP
 
+#include "flagtree/Common/EnvVars.h"
+
 #include <algorithm>
 #include <assert.h>
 #include <cstdlib>
@@ -61,9 +63,13 @@ inline void assertIsRecognized(const std::string &env) {
                          CACHE_INVALIDATING_ENV_VARS.end();
   bool is_neutral =
       CACHE_NEUTRAL_ENV_VARS.find(env.c_str()) != CACHE_NEUTRAL_ENV_VARS.end();
+  // FlagTree-owned variables are cache-invalidating too, but live in their own
+  // set (see flagtree/Common/EnvVars.h).
+  bool is_flagtree = flagtree::CACHE_INVALIDATING_ENV_VARS.find(env) !=
+                     flagtree::CACHE_INVALIDATING_ENV_VARS.end();
   std::string errmsg = env + "is not recognized. "
                              "Please add it to triton/tools/sys/getenv.hpp";
-  assert((is_invalidating || is_neutral) && errmsg.c_str());
+  assert((is_invalidating || is_neutral || is_flagtree) && errmsg.c_str());
 }
 
 static std::mutex getenv_mutex;
