@@ -2,9 +2,10 @@
 
 Kept out of ``triton.knobs`` (upstream) so upstream rebases of that file do not
 conflict. The C++ side declares the same names in
-``include/flagtree/Common/EnvVars.h``, which ``get_cache_invalidating_env_vars``
-merges into the upstream cache-invalidating list, so flipping any of these
-still invalidates the JIT cache.
+``include/flagtree/Common/EnvVars.h``; only the variables listed in its
+``CACHE_INVALIDATING_ENV_VARS`` set are merged into the upstream cache key.
+The triton-lane-vectorize toggles below are intentionally excluded, so a caller
+that flips one must use a distinct ``TRITON_CACHE_DIR``.
 """
 
 import os

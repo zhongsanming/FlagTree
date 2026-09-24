@@ -9,9 +9,9 @@ namespace mlir::triton::flagtree {
 // Environment variables owned by FlagTree rather than by upstream Triton.
 //
 // They are declared here instead of in include/triton/Tools/Sys/GetEnv.hpp so
-// that upstream rebases of that file do not conflict. python/src/ir.cc merges
-// this set into the upstream cache-invalidating set, so changing any of them
-// still invalidates the JIT cache, exactly as for an upstream variable.
+// that upstream rebases of that file do not conflict. The backends merge this
+// set into the upstream cache-invalidating set, so changing a variable listed
+// here invalidates the JIT cache, exactly as for an upstream variable.
 //
 // Keep the Python-side readers in sync (grep for the variable name); the
 // backends read these directly with os.getenv.
@@ -46,14 +46,16 @@ inline const std::string kAllowLaneVectorizeAddressCones =
 // canonical, diffable IR dumps (see tools/run_ab_interleaved.py).
 inline const std::string kPrintOpGeneric = "TRITON_MLIR_PRINT_OP_GENERIC";
 
+// Only variables that participate in the JIT cache key are listed here.
+//
+// The triton-lane-vectorize toggles (kDisableLaneVectorize,
+// kEnableLaneVectorizeBlockMode, kAllowLaneVectorizeConcat,
+// kAllowLaneVectorizeAddressCones) are deliberately NOT listed: they change
+// codegen but are kept out of the cache key, so flipping one does not force a
+// recompile. A caller that flips them must use a distinct TRITON_CACHE_DIR
+// (tools/run_ab_interleaved.py does), otherwise a stale kernel is reused.
 inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
-    // clang-format off
-    kDisableLaneVectorize,
-    kEnableLaneVectorizeBlockMode,
-    kAllowLaneVectorizeConcat,
-    kAllowLaneVectorizeAddressCones,
     kPrintOpGeneric,
-    // clang-format on
 };
 
 } // namespace mlir::triton::flagtree
