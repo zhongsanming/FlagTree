@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -9,6 +10,49 @@ import functools
 import sysconfig
 
 from triton import __version__, knobs
+
+
+_TRUTHY = ("1", "true", "on", "yes")
+
+
+def _print_op_generic() -> bool:
+    """Whether dumped IR should use the generic op form.
+
+    Equivalent to MLIR's ``--mlir-print-op-generic``. When
+    ``TRITON_MLIR_PRINT_OP_GENERIC`` is truthy, every serialized module/op is
+    printed with ``get_asm(print_generic_op_form=True, print_debug_info=False)``
+    instead of ``str()``, so dumped stage files are canonical, location-free and
+    independent of custom assembly syntax. Off by default so the cache format is
+    unchanged unless requested.
+    """
+    return os.environ.get("TRITON_MLIR_PRINT_OP_GENERIC", "").strip().lower() in _TRUTHY
+
+
+def _serialize_ir(data):
+    """Serialize ``data`` for a cache/dump write.
+
+    Byte strings are returned untouched elsewhere; here ``data`` is a
+    non-bytes module/op/string. MLIR modules and operations are printed in the
+    generic op form (without locations) when requested, everything else falls
+    back to ``str()``.
+    """
+    if _print_op_generic():
+        op = getattr(data, "operation", None)
+        if op is None and hasattr(data, "get_asm"):
+            op = data
+        if op is not None:
+            try:
+                return op.get_asm(print_generic_op_form=True,
+                                  print_debug_info=False)
+            except Exception as exc:  # noqa: BLE001 - fall back to the default printer
+                print(
+                    "[triton] TRITON_MLIR_PRINT_OP_GENERIC is set but "
+                    f"get_asm(print_generic_op_form=True) failed ({exc!r}); "
+                    "falling back to the custom printer. This usually means the "
+                    "installed libtriton (_C) does not match the Python sources.",
+                    file=sys.stderr,
+                )
+    return str(data)
 
 
 class CacheManager(ABC):
@@ -100,7 +144,7 @@ class FileCacheManager(CacheManager):
             raise RuntimeError("Could not create or locate cache dir")
         binary = isinstance(data, bytes)
         if not binary:
-            data = str(data)
+            data = _serialize_ir(data)
         assert self.lock_path is not None
         filepath = self._make_path(filename)
         # Random ID to avoid any collisions

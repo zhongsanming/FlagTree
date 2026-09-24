@@ -1,0 +1,63 @@
+#ifndef FLAGTREE_COMMON_ENVVARS_H
+#define FLAGTREE_COMMON_ENVVARS_H
+
+#include <set>
+#include <string>
+
+namespace mlir::triton::flagtree {
+
+// Environment variables owned by FlagTree rather than by upstream Triton.
+//
+// They are declared here instead of in include/triton/Tools/Sys/GetEnv.hpp so
+// that upstream rebases of that file do not conflict. The backends merge this
+// set into the upstream cache-invalidating set, so changing a variable listed
+// here invalidates the JIT cache, exactly as for an upstream variable.
+//
+// Keep the Python-side readers in sync (grep for the variable name); the
+// backends read these directly with os.getenv.
+inline const std::string kDisableLaneVectorize =
+    "TRITON_DISABLE_LANE_VECTORIZE";
+
+// Opt-in: enable block mode (SLP over straight-line code) in the
+// triton-lane-vectorize pass. Loop mode is always on; block mode is disabled
+// by default. See lib/flagtree/Transforms/LaneVectorize.cpp.
+inline const std::string kEnableLaneVectorizeBlockMode =
+    "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE";
+
+// Opt-in relaxations for the correctness guards in triton-lane-vectorize. Both
+// default OFF (the guarded/safe behavior); set to 1/true/on to restore the
+// aggressive transform. See lib/flagtree/Transforms/LaneVectorize.cpp.
+//
+//   ALLOW_CONCAT         permit the generic tensor.concat packing fallback,
+//                        which materializes its operands (an allocation the
+//                        bundled Ascend BiSheng/HIVM pipeline cannot lower).
+//   ALLOW_ADDRESS_CONES  permit packing integer/index cones that feed memory
+//                        addresses (unsafe for strided/non-contiguous access).
+inline const std::string kAllowLaneVectorizeConcat =
+    "TRITON_LANE_VECTORIZE_ALLOW_CONCAT";
+inline const std::string kAllowLaneVectorizeAddressCones =
+    "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES";
+
+// Print dumped stage IR (including .ttir) in the generic op form, equivalent to
+// MLIR's --mlir-print-op-generic, with locations (line info) stripped. Off by
+// default so the cache format is unchanged; when set,
+// python/triton/runtime/cache.py serializes modules/ops with
+// get_asm(print_generic_op_form=True, print_debug_info=False). Useful for
+// canonical, diffable IR dumps (see tools/run_ab_interleaved.py).
+inline const std::string kPrintOpGeneric = "TRITON_MLIR_PRINT_OP_GENERIC";
+
+// Only variables that participate in the JIT cache key are listed here.
+//
+// The triton-lane-vectorize toggles (kDisableLaneVectorize,
+// kEnableLaneVectorizeBlockMode, kAllowLaneVectorizeConcat,
+// kAllowLaneVectorizeAddressCones) are deliberately NOT listed: they change
+// codegen but are kept out of the cache key, so flipping one does not force a
+// recompile. A caller that flips them must use a distinct TRITON_CACHE_DIR
+// (tools/run_ab_interleaved.py does), otherwise a stale kernel is reused.
+inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
+    kPrintOpGeneric,
+};
+
+} // namespace mlir::triton::flagtree
+
+#endif

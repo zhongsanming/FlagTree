@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "flagtree/Common/EnvVars.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -377,6 +378,23 @@ void init_triton_ir(py::module &&m) {
           },
           ret::reference)
       .def("dump", [](OpState &self) { self->dump(); })
+      // MLIR's --mlir-print-op-generic equivalent: used by the cache writer to
+      // dump stage IR in canonical form (see triton.runtime.cache)._serialize_ir.
+      // print_debug_info=False strips locations (line info) from the dump.
+      .def("get_asm",
+           [](OpState &self, bool print_generic_op_form,
+              bool print_debug_info) -> std::string {
+             std::string str;
+             llvm::raw_string_ostream os(str);
+             auto printingFlags = OpPrintingFlags();
+             if (print_debug_info)
+               printingFlags.enableDebugInfo();
+             printingFlags.printGenericOpForm(print_generic_op_form);
+             self->print(os, printingFlags);
+             return str;
+           },
+           py::arg("print_generic_op_form") = false,
+           py::arg("print_debug_info") = false)
       .def("__str__",
            [](OpState &self) -> std::string {
              std::string str;
@@ -1633,7 +1651,13 @@ void init_triton_env_vars(py::module &m) {
   m.def("get_cache_invalidating_env_vars",
         []() -> std::map<std::string, std::string> {
           std::map<std::string, std::string> ret;
-          for (const auto &envVar : CACHE_INVALIDATING_ENV_VARS) {
+          // Upstream variables plus the FlagTree-owned ones
+          // (include/flagtree/Common/EnvVars.h), so toggling a FlagTree feature
+          // still invalidates the JIT cache.
+          std::set<std::string> envVars = CACHE_INVALIDATING_ENV_VARS;
+          envVars.insert(flagtree::CACHE_INVALIDATING_ENV_VARS.begin(),
+                         flagtree::CACHE_INVALIDATING_ENV_VARS.end());
+          for (const auto &envVar : envVars) {
             auto strVal = triton::tools::getStrEnv(envVar);
             if (strVal.empty())
               continue;
