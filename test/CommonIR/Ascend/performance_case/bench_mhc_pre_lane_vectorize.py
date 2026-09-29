@@ -1,12 +1,17 @@
-"""Benchmark mhc_pre_clamp_sinkhorn with and without the triton-lane-vectorize pass.
+"""Benchmark the mhc TLE kernels with and without the triton-lane-vectorize pass.
 
 The ``triton-lane-vectorize`` TTIR pass (see
 ``lib/flagtree/Transforms/LaneVectorize.cpp``) packs lane-parallel
 tensors into a leading dimension. This script measures its performance impact
-on the ``mhc_pre_clamp_sinkhorn`` TLE kernel by running it twice:
+on the mhc kernels by running each one twice:
 
     LV on   the pass is in the Ascend TTIR pipeline (default)
     LV off  ``TRITON_DISABLE_LANE_VECTORIZE=1`` skips it
+
+Supported kernels (``--kernel``):
+    mhc_pre_clamp_sinkhorn  (default) the Sinkhorn normalization pre-kernel
+    mhc_post                the fused post-kernel
+    all                     run every kernel above in one invocation
 
 Triton's JIT caches compiled kernels per process, so the toggle only takes
 effect on the first compile. To avoid stale in-process caches, the two
@@ -21,13 +26,20 @@ kernel  kernel-only via ``do_bench_npu`` from testing.py (mspti -> profiler).
 Metrics
 -------
 - Latency (ms)
-- Bandwidth (GB/s): read x + phi + alpha + base, write y + post_out + comb_frag.
+- Bandwidth (GB/s): read the inputs, write the outputs (per kernel; see
+  ``_bytes_io_for``).
 - Speedup: latency(LV off) / latency(LV on).  > 1 means the pass helps.
 
 Usage
 -----
-    # compare LV on vs off for the default shape
+    # compare LV on vs off for the default kernel and shape
     python bench_mhc_pre_lane_vectorize.py
+
+    # run every supported kernel
+    python bench_mhc_pre_lane_vectorize.py --kernel all
+
+    # benchmark mhc_post instead
+    python bench_mhc_pre_lane_vectorize.py --kernel mhc_post --B 2 --S 1024 --D 3584
 
     # specific shape / sinkhorn settings / timing mode
     python bench_mhc_pre_lane_vectorize.py --B 2 --S 1024 --D 3584 \
@@ -225,22 +237,79 @@ def _check_outputs(torch, out, ref):
     return y_ok and post_ok and comb_ok, dict(y=y_ok, post_out=post_ok, comb_frag=comb_ok)
 
 
+# ---------------------------------------------------------------------------
+# Kernel registry: per-kernel inputs, callable kwargs, bytes/IO and checks
+# ---------------------------------------------------------------------------
+
+_KERNELS = ("mhc_pre_clamp_sinkhorn", "mhc_post")
+
+
+def _make_inputs_for(args, torch, B, S, N, D, dtype, device):
+    """Build the positional inputs of the selected kernel."""
+    if args.kernel == "mhc_post":
+        x = torch.randn(B, S, N, D, dtype=dtype, device=device)
+        h_res = torch.randn(B, S, N, N, dtype=torch.float32, device=device)
+        h_out = torch.randn(B, S, D, dtype=dtype, device=device)
+        h_post = torch.randn(B, S, N, dtype=torch.float32, device=device)
+        return (x, h_res, h_out, h_post)
+    return _make_inputs(torch, B, S, N, D, dtype, device)
+
+
+def _kernel_kwargs_for(args):
+    if args.kernel == "mhc_post":
+        return dict(use_pipeline=(args.post_pipeline == "on"), use_concat_reduce=args.post_concat_reduce)
+    return _kernel_kwargs(args)
+
+
+def _ref_kwargs_for(args):
+    if args.kernel == "mhc_post":
+        return {}
+    return _ref_kwargs(args)
+
+
+def _bytes_io_for(args, B, S, N, D, dtype):
+    """Bytes read + written by the selected kernel (see the module docstring)."""
+    if args.kernel == "mhc_post":
+        elem = dtype.itemsize
+        T = B * S
+        read = (T * N * D * elem  # x
+                + T * N * N * 4  # h_res (fp32)
+                + T * D * elem  # h_out
+                + T * N * 4)  # h_post (fp32)
+        write = T * N * D * elem  # out
+        return read + write
+    return _bytes_io(B, S, N, D, dtype)
+
+
+def _check_outputs_for(args, torch, out, ref):
+    if args.kernel == "mhc_post":
+        ok = bool(torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2))
+        return ok, dict(out=ok)
+    return _check_outputs(torch, out, ref)
+
+
 def _run_child(args) -> int:
     _apply_variant_env(args.variant)
 
     import torch  # noqa: E402  (import after env is set)
-    from mhc_pre_clamp_sinkhorn import mhc_pre_clamp_sinkhorn, mhc_pre_clamp_sinkhorn_ref  # noqa: E402
+    if args.kernel == "mhc_post":
+        from mhc_post import mhc_post as kernel_fn, mhc_post_ref as ref_fn  # noqa: E402
+    else:
+        from mhc_pre_clamp_sinkhorn import (  # noqa: E402
+            mhc_pre_clamp_sinkhorn as kernel_fn,
+            mhc_pre_clamp_sinkhorn_ref as ref_fn,
+        )
     do_bench_npu = _load_do_bench_npu()  # noqa: E402
 
     device = _device(torch)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
-    kwargs = _kernel_kwargs(args)
-    ref_kwargs = _ref_kwargs(args)
+    kwargs = _kernel_kwargs_for(args)
+    ref_kwargs = _ref_kwargs_for(args)
 
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
 
-    log(f"[LV {args.variant}] device={device} dtype={args.dtype} mode={args.mode} "
+    log(f"[LV {args.variant}] kernel={args.kernel} device={device} dtype={args.dtype} mode={args.mode} "
         f"iter_times={args.iter_times} clamp=({args.clamp_min},{args.clamp_max}) "
         f"need_backward={args.need_backward}")
 
@@ -248,16 +317,17 @@ def _run_child(args) -> int:
     for (B, S, N, D) in _resolve_shapes(args):
         label = f"B{B}_S{S}_N{N}_D{D}"
         torch.manual_seed(0)
-        x, phi, alpha, base = _make_inputs(torch, B, S, N, D, dtype, device)
+        inputs = _make_inputs_for(args, torch, B, S, N, D, dtype, device)
 
-        fn = lambda: mhc_pre_clamp_sinkhorn(x, phi, alpha, base, **kwargs)
+        def fn(inputs=inputs):
+            return kernel_fn(*inputs, **kwargs)
 
         check = None
         detail = None
         if args.check:
-            ref = mhc_pre_clamp_sinkhorn_ref(x, phi, alpha, base, **ref_kwargs)
+            ref = ref_fn(*inputs, **ref_kwargs)
             out = fn()
-            check, detail = _check_outputs(torch, out, ref)
+            check, detail = _check_outputs_for(args, torch, out, ref)
             log(f"[LV {args.variant}] {label}: check={'PASS' if check else 'FAIL'} {detail}")
 
         if args.mode == "kernel":
@@ -265,15 +335,17 @@ def _run_child(args) -> int:
         else:
             t = _bench_wall(fn, device, torch, args.warmup, args.rep)
 
-        bw = _bytes_io(B, S, N, D, dtype) / (t["ms"] * 1e-3) / 1e9
-        log(f"[LV {args.variant}] {label}: {t['ms']:.4f} ms  {bw:.2f} GB/s")
+        bandwidth = _bytes_io_for(args, B, S, N, D, dtype) / (t["ms"] * 1e-3) / 1e9
+        log(f"[LV {args.variant}] {args.kernel} {label}: {t['ms']:.4f} ms  {bandwidth:.2f} GB/s")
         results.append(
-            dict(label=label, B=B, S=S, N=N, D=D, ms=t["ms"], min=t["min"], max=t["max"], mean=t["mean"], bw_gbs=bw,
-                 check=check, detail=detail))
+            dict(label=label, B=B, S=S, N=N, D=D, ms=t["ms"], min=t["min"], max=t["max"], mean=t["mean"],
+                 bandwidth_gbs=bandwidth, check=check, detail=detail))
 
-    payload = dict(variant=args.variant, device=device, mode=args.mode, dtype=args.dtype, iter_times=args.iter_times,
-                   clamp_min=args.clamp_min, clamp_max=args.clamp_max, need_backward=args.need_backward,
-                   sinkhorn_loop=args.sinkhorn_loop, eps=args.eps, norm_order=args.norm_order, results=results)
+    payload = dict(variant=args.variant, kernel=args.kernel, device=device, mode=args.mode, dtype=args.dtype,
+                   iter_times=args.iter_times, clamp_min=args.clamp_min, clamp_max=args.clamp_max,
+                   need_backward=args.need_backward, sinkhorn_loop=args.sinkhorn_loop, eps=args.eps,
+                   norm_order=args.norm_order, post_pipeline=args.post_pipeline,
+                   post_concat_reduce=args.post_concat_reduce, results=results)
     print(_MARK + json.dumps(payload), flush=True)
     return 0
 
@@ -294,11 +366,22 @@ def _parse_marker(stdout: str):
 
 
 def _run_driver(args) -> int:
+    kernels = list(_KERNELS) if args.kernel == "all" else [args.kernel]
+    ok = True
+    for kernel in kernels:
+        if not _run_driver_one(args, kernel):
+            ok = False
+    return 0 if ok else 1
+
+
+def _run_driver_one(args, kernel) -> bool:
     payloads = {}
     for variant in ("on", "off"):
         cmd = [
             sys.executable,
             os.path.abspath(__file__),
+            "--kernel",
+            kernel,
             "--variant",
             variant,
             "--mode",
@@ -333,6 +416,8 @@ def _run_driver(args) -> int:
             args.eps,
             "--norm-order",
             args.norm_order,
+            "--post-pipeline",
+            args.post_pipeline,
         ]
         if args.sweep:
             cmd.append("--sweep")
@@ -340,19 +425,22 @@ def _run_driver(args) -> int:
             cmd.append("--check")
         if args.need_backward:
             cmd.append("--need-backward")
+        if args.post_concat_reduce:
+            cmd.append("--post-concat-reduce")
 
-        print(f"\n=== running variant: LV {variant} (pass {'enabled' if variant == 'on' else 'disabled'}) ===")
+        print(f"\n=== kernel {kernel}: running variant LV {variant} "
+              f"(pass {'enabled' if variant == 'on' else 'disabled'}) ===")
         proc = subprocess.run(cmd, text=True, capture_output=True)
         if proc.stderr:
             sys.stderr.write(proc.stderr)
         parsed = _parse_marker(proc.stdout)
         if parsed is None:
             print(proc.stdout)
-            print(f"ERROR: variant LV {variant} produced no result (exit {proc.returncode})")
-            return 1
+            print(f"ERROR: kernel {kernel} variant LV {variant} produced no result (exit {proc.returncode})")
+            return False
         payloads[variant] = parsed
 
-    return 0 if _print_comparison(payloads, args) else 1
+    return _print_comparison(payloads, args)
 
 
 def _index_by_label(payload):
@@ -363,18 +451,23 @@ def _print_comparison(payloads, args):
     on = _index_by_label(payloads["on"])
     off = _index_by_label(payloads["off"])
     mode = payloads["on"]["mode"]
+    kernel = payloads["on"]["kernel"]
     tag = "avg" if mode == "kernel" else "median"
 
     print()
-    print(f"Device : {payloads['on']['device']}   timing={mode}   dtype={args.dtype}   "
-          f"iter_times={args.iter_times}   clamp=({args.clamp_min},{args.clamp_max})   "
-          f"need_backward={args.need_backward}")
-    print(f"Sinkhorn : loop={args.sinkhorn_loop}   eps={args.eps}   norm_order={args.norm_order}")
+    print(f"Kernel : {kernel}")
+    print(f"Device : {payloads['on']['device']}   timing={mode}   dtype={args.dtype}")
+    if kernel == "mhc_post":
+        print(f"Options : use_pipeline={args.post_pipeline}   use_concat_reduce={args.post_concat_reduce}")
+    else:
+        print(f"Options : iter_times={args.iter_times}   clamp=({args.clamp_min},{args.clamp_max})   "
+              f"need_backward={args.need_backward}")
+        print(f"Sinkhorn : loop={args.sinkhorn_loop}   eps={args.eps}   norm_order={args.norm_order}")
     print(f"Warmup : {args.warmup}   Rep/Active: {args.rep}")
     print()
 
     hdr = (f"{'config':>22} | {'LV on(ms)':>10} {'LV off(ms)':>11} "
-           f"{'speedup':>8} | {'BW on':>8} {'BW off':>8} | {'check':>5}")
+           f"{'speedup':>8} | {'bandwidth on':>12} {'bandwidth off':>13} | {'check':>5}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -388,7 +481,7 @@ def _print_comparison(payloads, args):
         check = "" if r_on["check"] is None else ("ok" if r_on["check"] else "FAIL")
         direction = "up" if sp > 1 else "dn"
         print(f"{label:>22} | {r_on['ms']:>10.4f} {r_off['ms']:>11.4f} "
-              f"{sp:>7.2f}{direction} | {r_on['bw_gbs']:>7.1f} {r_off['bw_gbs']:>8.1f} | {check:>5}")
+              f"{sp:>7.2f}{direction} | {r_on['bandwidth_gbs']:>12.1f} {r_off['bandwidth_gbs']:>13.1f} | {check:>5}")
 
     if speedups:
         avg = sum(speedups) / len(speedups)
@@ -418,9 +511,11 @@ def _print_comparison(payloads, args):
 
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Benchmark mhc_pre_clamp_sinkhorn with/without the triton-lane-vectorize pass")
+        description="Benchmark the mhc kernels with/without the triton-lane-vectorize pass")
     # internal: select a single variant (child mode); normally unset
     p.add_argument("--variant", choices=["on", "off"], default=None, help=argparse.SUPPRESS)
+    p.add_argument("--kernel", choices=[*_KERNELS, "all"], default=_KERNELS[0],
+                   help="mhc kernel to benchmark; 'all' runs every supported kernel")
     p.add_argument("--B", type=int, default=_DEFAULT_SHAPE[0], help="batch size")
     p.add_argument("--S", type=int, default=_DEFAULT_SHAPE[1], help="sequence length")
     p.add_argument("--N", type=int, default=_DEFAULT_SHAPE[2], help="head multiplier (must be 4)")
@@ -441,7 +536,11 @@ def _parse_args():
     p.add_argument("--need-backward", action="store_true", help="request the extra saved intermediates")
     p.add_argument("--warmup", type=int, default=10, help="warmup iterations")
     p.add_argument("--rep", type=int, default=50, help="measurement iterations (active runs for kernel mode)")
-    p.add_argument("--check", action="store_true", help="verify output against mhc_pre_clamp_sinkhorn_ref")
+    p.add_argument("--check", action="store_true", help="verify output against the kernel reference")
+    p.add_argument("--post-pipeline", choices=["on", "off"], default="on",
+                   help="mhc_post: use the software-pipelined kernel (default) or the 2D-grid one")
+    p.add_argument("--post-concat-reduce", action="store_true",
+                   help="mhc_post: use the concat+reduce variant (takes precedence over --post-pipeline)")
     p.add_argument("--sweep", action="store_true", help="benchmark a set of shapes instead of one")
     return p.parse_args()
 
