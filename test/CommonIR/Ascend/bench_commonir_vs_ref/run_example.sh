@@ -22,10 +22,15 @@ case "${1:-smoke}" in
   full)
     "$PY" commonir_bench.py selfcheck
     OUT="out/full-$STAMP"
+    # default --artifacts failures: only failing cases keep their .pt
     "$PY" commonir_bench.py run --outdir "$OUT" --cases default \
           --dump-ir --iters 20 --rounds 5 --warmup 5
-    tar Jcf "$OUT.tar.xz" "$OUT"
-    echo "packed: $OUT.tar.xz  ($(du -h "$OUT.tar.xz" | cut -f1))"
+    tar Jcf "$OUT.tar.xz" --exclude="$OUT/artifacts" "$OUT"
+    echo "packed: $OUT.tar.xz  ($(du -h "$OUT.tar.xz" | cut -f1))  [artifacts excluded]"
+    if compgen -G "$OUT/artifacts/*.pt" > /dev/null; then
+      tar Jcf "$OUT.artifacts.tar.xz" "$OUT/artifacts"
+      echo "failures-only artifacts: $OUT.artifacts.tar.xz ($(du -h "$OUT.artifacts.tar.xz" | cut -f1))"
+    fi
     ;;
   perf)
     "$PY" commonir_bench.py run --outdir "out/perf-$STAMP" --cases default \

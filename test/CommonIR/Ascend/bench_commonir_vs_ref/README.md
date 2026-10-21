@@ -115,6 +115,16 @@ comma-separated list mixing set names and case ids
 Tolerances are taken from the counterpart repo's own tests, so "accuracy: ok"
 means "as tight as that op is normally validated".
 
+For every tensor the report records `max_abs_err`, `mean_abs_err`,
+`max_rel_err`, `p50/p90/p99_abs_err`, `rms_ref`, cosine similarity and NaN
+counts — so a "MISMATCH" that is really fp32-accumulation-order noise is easy to
+tell apart from a real break. On a mismatch, `digest/<op>__<case>.json`
+additionally lists the `--digest-n` (default 16) worst elements as
+`{flat_index, new, ref, abs_err}` — row-major flat index into the compared
+tensor — which is usually enough to localise the bug without any `.pt` file.
+Statistics are streamed in chunks, so a 268M-element `out` does not materialise
+a 1 GB float32 copy.
+
 Two interface divergences are handled explicitly rather than papered over:
 
 1. **`causal_conv1d_fn` output width.** The CommonIR op *compacts away*
@@ -206,20 +216,61 @@ why it is not enabled together with `--dump-ir` by default.
   summary.md                      # the human-readable report
   raw/<op>__<case>__<impl>.json   # worker result incl. timing samples
   logs/<op>__<case>__<impl>.log   # worker stdout+stderr (tracebacks, MLIR dumps)
-  artifacts/<op>__<case>__<impl>.pt   # CPU tensors, for the offline compare
+  digest/<op>__<case>.json        # worst-element locations, failures only (~KB)
+  artifacts/<op>__<case>__<impl>.pt   # CPU tensors -- see section 8
   ir/...                          # stage IR (only with --dump-ir)
   ir_manifest.json, ir_bundle/    # only if IR was dumped
 ```
 
-Disk: artifacts are the big item (bf16 `out` of an 8192-token
-`sparse_attn_sharedkv` prefill is ~0.5 GB per impl; a `compressor` prefill's
-fp32 `state_cache` is ~70 MB). `quick` stays well under 1 GB; `full` can reach a
-few GB. Use `--no-save-artifacts` for a perf-only run (the compare stage is then
-skipped), or run `produce` and `compare` separately.
+---
+
+## 8. What are the `.pt` files in `artifacts/`? Do I need them?
+
+Each `.pt` is a `torch.save`d dict of **that implementation's output tensors on
+CPU** (exactly what the `collect_*()` functions pull out: the op's return value
+plus the in-place-updated caches, reduced to the touched rows). Sizes are
+1:1 with the real outputs, e.g. an 8192-token `sparse_attn_sharedkv` prefill
+`out` is 512 MB per impl, a `compressor` prefill's fp32 `state_cache` ~70 MB.
+
+They exist **only** to feed the CPU-side `compare` stage. Since `run` already
+executes `compare` **on the NPU box**, the verdict is in `accuracy.json`, and
+the `.pt` files add nothing to it.
+
+| you want… | need the `.pt`? |
+|---|---|
+| accuracy verdict + error stats | **no** — in `accuracy.json` / `results.csv` / `summary.md` |
+| timing + speedup | **no** — in `results.csv` |
+| IR diff | **no** — in `ir/`, `ir_bundle/` |
+| to see *where* a mismatch is | **no** — in `digest/` (worst-N indices + values) |
+| to re-run `compare` on another machine (no NPU) | yes |
+| to change tolerances / write your own analysis (error histograms, per-token attribution, bisection) | yes |
+
+Hence the default is `--artifacts failures`: after `compare` the `.pt` of every
+**passing** case is deleted, and only failing ones are kept (plus a `digest/`
+file for each). Options:
+
+```bash
+--artifacts failures   # default: keep only non-ok cases
+--artifacts drop       # keep none; accuracy is still computed
+--artifacts all        # keep everything (old behaviour; needed for offline re-compare)
+--no-save-artifacts    # perf-only: no artifacts AND no accuracy stage
+```
+
+`summary.md` ends with an **Output size** table (MB per subfolder, total) plus a
+ready-to-paste `tar` that excludes `artifacts/`.
+
+For a full `default` case set (including the 8192-token sparse prefills)
+`artifacts/` is a few GB while everything else is a few MB, so in practice:
+
+```bash
+python commonir_bench.py run --outdir out/full --cases default --dump-ir
+# -> out/full.tar.xz        (MB, everything except artifacts)
+# -> out/full.artifacts.tar.xz  (only if something actually failed)
+```
 
 ---
 
-## 8. Failure handling
+## 9. Failure handling
 
 Each worker is a subprocess with `--timeout` (default 3600 s):
 
@@ -232,7 +283,7 @@ if several consecutive runs crash, re-run with `--ops <single op>` to isolate.
 
 ---
 
-## 9. `selfcheck`
+## 10. `selfcheck`
 
 `python commonir_bench.py selfcheck` builds synthetic artifact pairs and
 verifies that the comparator reports `ok` for identical data, `MISMATCH` for
@@ -240,3 +291,52 @@ perturbed data, accepts a permuted `lightning_indexer` index row, and handles
 the `causal_conv1d_fn` pad-column compaction. It needs `torch` only. Run it
 before trusting any result — it catches harness bugs (and I could not run the
 NPU paths while writing this).
+
+---
+
+## 11. Counterpart / toolchain problems this harness works around
+
+Recorded from the first full run (`full-20261020-174740`), so the numbers are
+not misread as rewrite regressions:
+
+1. **`mha_fwd` hardcodes `"cuda"`** — `flaggems_vllm/ops/flash_api.py`
+   (`dispatch()`, also present in `flag_gems/ops/flash_api.py`) calls
+   `torch_device_fn.get_device_properties("cuda")`, which on Ascend raises
+   `ValueError: Expected a npu device, but got: cuda`. That makes the `gqa`
+   counterpart unusable out of the box. `_patch_flash_api_cuda_literal()`
+   retries without the bogus device and supplies a `multi_processor_count`
+   stand-in (torch_npu names it differently). The patch is recorded in
+   `raw/*.json` under `meta.notes`. **Worth reporting upstream.**
+
+2. **`lightning_indexer` counterpart: bytecode/MLIR skew** — on the
+   `top-k` path (`*_prefill_sort_*`, `*_decode_stage1*`) the installed
+   `tle/language/dsa/ascend/custom_ops/custom_ops.bc` emits
+   `hivm.hir.custom` with `operandSegmentSizes = [0, 0]` but 7 operands, and
+   BiShengHIR rejects it (`in bytecode version 6 produced by MLIR22.0.0git`).
+   This is a flaggems_vllm↔flagtree version mismatch, not a kernel bug.
+   Only the `direct_indices` path compiles, so the counterpart can currently
+   only be validated on degenerate windows (`active <= sparse_count`).
+
+3. **UB budget** — the Ascend UB is 1 572 864 bits = 192 KiB. The rewrite's
+   `gqa` and `sparse_attn_sharedkv` compressed branches exceed it; see §9 for
+   how to read the failure out of `ir/` (a specialisation with `ttir` +
+   `ttadapter` but **no `npubin`** failed to compile). `gqa.run` and
+   `kv_rmsnorm_rope_cache.run` pass
+   `multibuffer=True, limit_auto_multi_buffer_of_local_buffer='no-limit'`,
+   which lets the compiler multi-buffer without a cap — the first knob to try
+   when a tile is "just" over the limit.
+
+## 12. Reading the IR without the artifacts
+
+`ir/<op>/<impl>/<src-hash>/<kernel>.<ext>` — stage order is
+`ttir → ttadapter (CommonIR→Linalg) → mlirbc → bcmlir → npubin`, so:
+
+* `ttir` vs `ttadapter` = what the CommonIR/TLE primitives lowered into.
+* **missing `npubin`** = that specialisation did not build.
+* `ir_bundle/<op>__<impl>.{ttir,ttadapter}.mlir` concatenates every kernel of
+  one `(op, impl)`, which is what to `diff` when comparing the rewrite against
+  the counterpart.
+* For the Linalg tile shapes, grep the `bcmlir`/`ttadapter` for
+  `memref<...>` (UB buffers) — that is where an overflow is visible
+  (e.g. `gqa` D=128 emits 17 × `memref<128x128xbf16>` = 557 KiB of UB
+  buffers against a 192 KiB budget).

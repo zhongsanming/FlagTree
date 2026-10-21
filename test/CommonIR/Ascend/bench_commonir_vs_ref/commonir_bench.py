@@ -919,26 +919,79 @@ def _call_ref_compressor(kw, meta):
     return fn(**kw)
 
 
-def _call_ref_gqa(kw, meta):
-    """AbsDrop-in for gqa.run() built on the FlashAttention forward stack.
+def _patch_flash_api_cuda_literal():
+    """Work around an upstream bug in the counterpart.
 
-    ``flash_attention_forward`` with ``is_causal=True`` uses
-    ``col_rb = row + seqlen_k - seqlen_q`` i.e. exactly the bottom-right
-    aligned mask gqa.run() implements, and ``hid // nheads_ngroups_ratio``
-    i.e. exactly its ``hq // (N_q // N_kv)`` head mapping.
+    ``flaggems_vllm/ops/flash_api.py::mha_fwd.dispatch()`` calls
+    ``torch_device_fn.get_device_properties("cuda")`` -- a leftover from the
+    CUDA original (``flag_gems/ops/flash_api.py`` has the same literal).  On
+    Ascend that raises ``ValueError: Expected a npu device, but got: cuda`` and
+    makes the whole counterpart unusable.  We retry without the bogus device
+    and guarantee a ``multi_processor_count`` attribute (torch_npu exposes the
+    core count under other names).
+
+    Only used for the ``ref`` impl; the patch is process-local.
     """
-    import torch
+    try:
+        import flaggems_vllm.runtime as runtime
+    except Exception:
+        return None
+    fn = getattr(runtime, "torch_device_fn", None)
+    orig = getattr(fn, "get_device_properties", None)
+    if orig is None or getattr(orig, "_commonir_bench_patched", False):
+        return None
 
+    class _Props:
+        """Proxy that forwards everything and always offers multi_processor_count."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.multi_processor_count = int(
+                getattr(inner, "multi_processor_count", 0)
+                or getattr(inner, "vector_core_num", 0)
+                or getattr(inner, "ai_core_num", 0)
+                or 24
+            )
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def patched(device=None, *a, **k):
+        try:
+            props = orig(device, *a, **k)
+        except Exception:
+            # the counterpart passed a literal "cuda"; ask for the default
+            props = orig(*a, **k)
+        return _Props(props)
+
+    patched._commonir_bench_patched = True
+    fn.get_device_properties = patched
+    return "flash_api.dispatch(): get_device_properties('cuda') -> default device"
+
+
+def _call_ref_gqa(kw, meta):
+    """Drop-in for gqa.run() built on the FlashAttention forward stack.
+
+    ``mha_fwd`` unpacks ``q.size()`` as ``(batch, seqlen_q, nheads, headdim)``,
+    i.e. it takes BSND directly -- which is exactly ``gqa.run()``'s layout, so
+    no transposes are needed.
+
+    Semantics line up exactly: with ``is_causal=True`` the kernel uses
+    ``col_rb = row + seqlen_k - seqlen_q`` (bottom-right aligned, identical to
+    gqa's ``j <= i + (S_kv - S)``) and ``hid // h_hk_ratio`` (identical to
+    gqa's ``hq // (N_q // N_kv)``); ``scale=None`` means ``1/sqrt(D)``.
+    """
     fn = _require("flaggems_vllm.ops.attention", "flash_attention_forward")
+    note = _patch_flash_api_cuda_literal()
     q = kw["query"]
     k = kw["key"]
     v = kw["value"]
     seq_q, seq_kv, head_dim = q.shape[1], k.shape[1], q.shape[3]
     scale = kw["scaleValue"] if kw["scaleValue"] > 0 else float(head_dim) ** -0.5
     out = fn(
-        q.transpose(1, 2).contiguous(),
-        k.transpose(1, 2).contiguous(),
-        v.transpose(1, 2).contiguous(),
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
         None,
         None,
         seq_q,
@@ -948,7 +1001,9 @@ def _call_ref_gqa(kw, meta):
         False,
         scale=scale,
     )[0]
-    return out.transpose(1, 2)
+    if note:
+        meta.setdefault("notes", []).append(note)
+    return out
 
 
 def _call_ref_kv_rmsnorm_rope_cache(kw, meta):
@@ -1051,6 +1106,8 @@ def collect_gqa(kw, meta, result):
 
 
 def collect_kv_rmsnorm_rope_cache(kw, meta, result):
+    import torch
+
     kc = kw["k_cache"]
     cc = kw["ckv_cache"]
     rope = meta["rope"]
@@ -1105,41 +1162,150 @@ TOLERANCE = {
 }
 
 
-def _tensor_stats(a, b):
-    """Diff statistics for two same-shape CPU tensors."""
+def _tensor_stats(a, b, chunk=1 << 22):
+    """Diff statistics for two same-shape CPU tensors.
+
+    Streamed in chunks so that a 256M-element bf16 tensor never materialises a
+    full float32 copy (that is ~1 GB per side).
+    """
     import torch
 
-    af = a.float()
-    bf = b.float()
-    diff = (af - bf).abs()
-    denom = bf.abs().clamp_min(1e-12)
-    flat_a = af.reshape(-1)
-    flat_b = bf.reshape(-1)
-    finite = torch.isfinite(flat_a) & torch.isfinite(flat_b)
-    if int(finite.sum()) > 1:
-        va = flat_a[finite] - flat_a[finite].mean()
-        vb = flat_b[finite] - flat_b[finite].mean()
-        cos = float(
-            (va * vb).sum()
-            / (va.norm() * vb.norm()).clamp_min(1e-12)
+    fa = a.reshape(-1)
+    fb = b.reshape(-1)
+    n = int(fa.numel())
+    if n == 0:
+        return dict(
+            shape=list(a.shape),
+            dtype=str(a.dtype),
+            numel=0,
+            max_abs_err=0.0,
+            mean_abs_err=0.0,
+            max_rel_err=0.0,
+            rms_ref=0.0,
+            cosine=float("nan"),
+            nan_new=0,
+            nan_ref=0,
         )
-    else:
-        cos = float("nan")
+
+    mx = 0.0
+    sabs = 0.0
+    mre = 0.0
+    sa = sb = saa = sbb = sab = 0.0
+    nan_new = nan_ref = 0
+    for i in range(0, n, chunk):
+        xa = fa[i : i + chunk].float()
+        xb = fb[i : i + chunk].float()
+        nan_new += int(torch.isnan(xa).sum())
+        nan_ref += int(torch.isnan(xb).sum())
+        d = (xa - xb).abs()
+        d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+        mx = max(mx, float(d.max()))
+        sabs += float(d.sum(dtype=torch.float64))
+        mre = max(mre, float((d / xb.abs().clamp_min(1e-12)).max()))
+        # accumulate in fp64 without materialising a float64 copy of the chunk
+        sa += float(xa.sum(dtype=torch.float64))
+        sb += float(xb.sum(dtype=torch.float64))
+        saa += float((xa * xa).sum(dtype=torch.float64))
+        sbb += float((xb * xb).sum(dtype=torch.float64))
+        sab += float((xa * xb).sum(dtype=torch.float64))
+
+    # percentiles of |err| via a second (histogram) pass -- exact sorting of a
+    # 256M-element vector is not worth it for a report field
+    pct = dict(p50=None, p90=None, p99=None)
+    if mx > 0:
+        bins = 512
+        hist = torch.zeros(bins, dtype=torch.float64)
+        for i in range(0, n, chunk):
+            d = (fa[i : i + chunk].float() - fb[i : i + chunk].float()).abs()
+            d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+            idx = (d.double() * (bins / mx)).to(torch.long).clamp_(0, bins - 1)
+            hist += torch.bincount(idx, minlength=bins).double()
+        cum = torch.cumsum(hist, 0) / n
+        # value at the bin centre of each percentile
+        for key, q in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+            b_idx = int(torch.searchsorted(cum, torch.tensor(q, dtype=torch.float64)))
+            pct[key] = round((min(b_idx, bins - 1) + 0.5) * mx / bins, 6)
+
+    var_a = n * saa - sa * sa
+    var_b = n * sbb - sb * sb
+    cov = n * sab - sa * sb
+    cos = (cov / math.sqrt(var_a * var_b)) if var_a > 0 and var_b > 0 else float("nan")
+
     return dict(
         shape=list(a.shape),
         dtype=str(a.dtype),
-        numel=int(a.numel()),
-        max_abs_err=float(diff.max()) if diff.numel() else 0.0,
-        mean_abs_err=float(diff.mean()) if diff.numel() else 0.0,
-        max_rel_err=float((diff / denom).max()) if diff.numel() else 0.0,
-        rms_ref=float(bf.pow(2).mean().sqrt()) if bf.numel() else 0.0,
+        numel=n,
+        max_abs_err=mx,
+        mean_abs_err=sabs / n,
+        max_rel_err=mre,
+        p50_abs_err=pct["p50"],
+        p90_abs_err=pct["p90"],
+        p99_abs_err=pct["p99"],
+        rms_ref=math.sqrt(sbb / n),
         cosine=cos,
-        nan_new=int(torch.isnan(af).sum()),
-        nan_ref=int(torch.isnan(bf).sum()),
+        nan_new=nan_new,
+        nan_ref=nan_ref,
     )
 
 
-def _cmp_tensor_block(name, a, b, rtol, atol):
+def _worst_elements(a, b, n_worst, budget=1 << 23):
+    """Locations of the n_worst largest |err| elements (approximate if huge).
+
+    This is what replaces the raw tensor for debugging: a few hundred bytes of
+    coordinates + values per tensor instead of hundreds of megabytes.
+    """
+    import torch
+
+    fa = a.reshape(-1)
+    fb = b.reshape(-1)
+    total = int(fa.numel())
+    if total == 0:
+        return [], False
+    step = max(1, total // budget)
+    out, approx = [], step > 1
+    if approx:
+        # coarse pass: worst coarse block, then refine inside it
+        block = 8112 * step
+        blocks = (total + block - 1) // block
+        best, best_err = 0, -1.0
+        for blk in range(blocks):
+            lo, hi = blk * block, min((blk + 1) * block, total)
+            d = (
+                (fa[lo:hi].float() - fb[lo:hi].float())
+                .abs()
+                .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            )
+            m = float(d.max())
+            if m > best_err:
+                best_err, best = m, lo
+        lo = best
+        hi = min(best + block, total)
+    else:
+        lo, hi = 0, total
+
+    d = (
+        (fa[lo:hi].float() - fb[lo:hi].float())
+        .abs()
+        .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+    )
+    k = min(n_worst, d.numel())
+    if k <= 0:
+        return [], approx
+    vals, idx = torch.topk(d, k)
+    for v, i in zip(vals.tolist(), idx.tolist()):
+        flat = lo + i
+        out.append(
+            dict(
+                flat_index=int(flat),
+                abs_err=round(float(v), 8),
+                new=float(fa[flat]),
+                ref=float(fb[flat]),
+            )
+        )
+    return out, approx
+
+
+def _cmp_tensor_block(name, a, b, rtol, atol, digest_n=16):
     import torch
 
     a = a.detach().cpu()
@@ -1155,6 +1321,10 @@ def _cmp_tensor_block(name, a, b, rtol, atol):
         torch.allclose(a.float(), b.float(), rtol=rtol, atol=atol, equal_nan=True)
     )
     st.update(tensor=name, ok=ok, rtol=rtol, atol=atol)
+    if not ok and digest_n:
+        worst, approx = _worst_elements(a, b, digest_n)
+        st["worst"] = worst
+        st["worst_is_approximate"] = approx
     return st
 
 
@@ -1173,10 +1343,14 @@ def _cmp_index_multiset(a, b):
     flat_a = a.reshape(a.shape[0], -1)
     flat_b = b.reshape(b.shape[0], -1)
     rows = flat_a.shape[0]
-    bad, pad_mismatch, bad_example = 0, 0, None
+    bad, pad_mismatch, bad_example, trivial = 0, 0, None, 0
     for r in range(rows):
         ra = sorted(int(v) for v in flat_a[r].tolist() if v != -1)
         rb = sorted(int(v) for v in flat_b[r].tolist() if v != -1)
+        # a row that is exactly 0,1,2,... is the degenerate "visible window
+        # <= sparse_count" branch, where neither impl does any selection
+        if rb == list(range(len(rb))):
+            trivial += 1
         if ra != rb:
             bad += 1
             if bad_example is None:
@@ -1188,14 +1362,17 @@ def _cmp_index_multiset(a, b):
     return dict(
         tensor="indices",
         ok=bad == 0 and pad_mismatch == 0,
+        numel=int(a.numel()),
         rows=int(rows),
         mismatched_rows=bad,
         padcount_mismatched_rows=pad_mismatch,
         first_mismatch=bad_example,
+        trivial_rows=trivial,
+        all_rows_trivial=trivial == rows,
     )
 
 
-def compare_case(op, outdir, case_id):
+def compare_case(op, outdir, case_id, digest_n=16):
     import torch
 
     a_path = _art_path(outdir, op, case_id, NEW_IMPL)
@@ -1236,9 +1413,9 @@ def compare_case(op, outdir, case_id):
                     cols.append(out_ref[:, pos : pos + n])
                 pos += n
             ref_cat = torch.cat(cols, dim=1) if cols else out_ref[:, :0]
-        checks.append(_cmp_tensor_block("out", out_new, ref_cat, rtol, atol))
+        checks.append(_cmp_tensor_block("out", out_new, ref_cat, rtol, atol, digest_n))
         checks.append(
-            _cmp_tensor_block("conv_states", new["conv_states"], ref["conv_states"], rtol, atol)
+            _cmp_tensor_block("conv_states", new["conv_states"], ref["conv_states"], rtol, atol, digest_n)
         )
 
     elif op == "compressor":
@@ -1247,23 +1424,28 @@ def compare_case(op, outdir, case_id):
         b = ref["out"].reshape(-1, ref["out"].shape[-1])
         if new["rank3"]:
             checks.append(
-                _cmp_tensor_block("out", a[: sum(rows)], b[: sum(rows)], rtol, atol)
+                _cmp_tensor_block("out", a[: sum(rows)], b[: sum(rows)], rtol, atol, digest_n)
             )
         else:
             total = sum(rows)
-            checks.append(_cmp_tensor_block("out", a[:total], b[:total], rtol, atol))
+            checks.append(_cmp_tensor_block("out", a[:total], b[:total], rtol, atol, digest_n))
         checks.append(
             _cmp_tensor_block(
-                "state_cache", new["state_cache"], ref["state_cache"], rtol, atol
+                "state_cache",
+                new["state_cache"],
+                ref["state_cache"],
+                rtol,
+                atol,
+                digest_n,
             )
         )
 
     elif op == "kv_rmsnorm_rope_cache":
         for key in ("k_rope", "c_kv", "k_cache", "ckv_cache"):
-            checks.append(_cmp_tensor_block(key, new[key], ref[key], rtol, atol))
+            checks.append(_cmp_tensor_block(key, new[key], ref[key], rtol, atol, digest_n))
 
     elif op == "sparse_attn_sharedkv":
-        checks.append(_cmp_tensor_block("out", new["out"], ref["out"], rtol, atol))
+        checks.append(_cmp_tensor_block("out", new["out"], ref["out"], rtol, atol, digest_n))
         checks.append(
             dict(
                 tensor="lse",
@@ -1274,7 +1456,7 @@ def compare_case(op, outdir, case_id):
         )
 
     else:  # gqa and any plain tensor op
-        checks.append(_cmp_tensor_block("out", new["out"], ref["out"], rtol, atol))
+        checks.append(_cmp_tensor_block("out", new["out"], ref["out"], rtol, atol, digest_n))
 
     ok = all(bool(c.get("ok")) for c in checks)
     return dict(op=op, case=case_id, status="ok" if ok else "MISMATCH", checks=checks)
@@ -1582,6 +1764,10 @@ def produce(outdir, ops, cases, args):
                         rc=rc,
                         wall_s=round(dt, 2),
                         median_ms=lat,
+                        min_ms=bench.get("min_ms"),
+                        artifact_mb=raw.get("artifact_mb"),
+                        peak_alloc_mb=bench.get("peak_alloc_mb"),
+                        notes=raw.get("meta", {}).get("notes"),
                         log=os.path.relpath(log_path, outdir),
                     )
                 )
@@ -1589,14 +1775,15 @@ def produce(outdir, ops, cases, args):
     return results
 
 
-def compare(outdir, ops, cases):
+def compare(outdir, ops, cases, digest_n=16):
     _log("=" * 78)
     _log("COMPARE  (cpu only)")
     _log("=" * 78)
     out = []
+    digest_dir = os.path.join(outdir, "digest")
     for op in ops:
         for case_id in cases[op]:
-            res = compare_case(op, outdir, case_id)
+            res = compare_case(op, outdir, case_id, digest_n=digest_n)
             out.append(res)
             if res["status"] == "skipped":
                 _log(f"  {op}/{case_id}: SKIP ({res.get('reason')})")
@@ -1611,10 +1798,77 @@ def compare(outdir, ops, cases):
                 elif "max_abs_err" in c:
                     parts.append(f"{c['tensor']}:{'ok' if c['ok'] else 'DIFF'}@{c['max_abs_err']:.3g}")
                 else:
-                    parts.append(f"{c['tensor']}:{'ok' if c['ok'] else 'DIFF'}")
+                    extra = ""
+                    if c.get("all_rows_trivial"):
+                        extra = f" (degenerate: all {c['rows']} rows are arange)"
+                    parts.append(f"{c['tensor']}:{'ok' if c['ok'] else 'DIFF'}{extra}")
             _log(f"  {op}/{case_id}: {res['status']:<9} " + "  ".join(parts))
+            # a few-hundred-byte replacement for the raw tensors on failures
+            if res["status"] != "ok":
+                os.makedirs(digest_dir, exist_ok=True)
+                _json_dump(
+                    os.path.join(digest_dir, f"{op}__{case_id}.json"),
+                    dict(
+                        op=op,
+                        case=case_id,
+                        status=res["status"],
+                        rtol=TOLERANCE.get(op, (None, None))[0],
+                        atol=TOLERANCE.get(op, (None, None))[1],
+                        # note: flat_index is a row-major index into the
+                        # compared tensor, whose shape is in `checks[].shape`
+                        checks=[
+                            c for c in res["checks"] if not c.get("ok")
+                        ],
+                    ),
+                )
     _json_dump(os.path.join(outdir, "accuracy.json"), out)
     return out
+
+
+def _dir_mb(path):
+    total = 0
+    for dirpath, _d, filenames in os.walk(path):
+        for fn in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                pass
+    return total / 2**20
+
+
+def apply_artifacts_policy(outdir, ops, cases, policy, accuracy):
+    """Shrink the output folder so that only what you need gets downloaded.
+
+    ``all``      keep every .pt (allows a full offline re-compare)
+    ``failures`` keep only the cases that did not come back ``ok``
+    ``drop``     keep none (accuracy is already in accuracy.json)
+    """
+    adir = os.path.join(outdir, "artifacts")
+    if not os.path.isdir(adir) or policy == "all":
+        return
+    status = {(r["op"], r["case"]): r.get("status") for r in accuracy or []}
+    removed = kept = 0
+    freed = 0.0
+    for op in ops:
+        for case_id in cases[op]:
+            keep = policy == "failures" and status.get((op, case_id)) != "ok"
+            for impl in IMPLS:
+                path = _art_path(outdir, op, case_id, impl)
+                if not os.path.isfile(path):
+                    continue
+                if keep:
+                    kept += 1
+                    continue
+                try:
+                    freed += os.path.getsize(path) / 2**20
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+    _log(
+        f"  artifacts policy={policy}: kept {kept}, removed {removed} "
+        f"({freed:.0f} MB freed)"
+    )
 
 
 # =========================================================================== #
@@ -1810,6 +2064,57 @@ def selfcheck(outdir=None):
     failures += [] if ok else ["causal_conv1d_fn: pad-slot compaction not handled"]
     print(f"  {'PASS' if ok else 'FAIL'}  {'causal_conv1d_fn':<24} pad compaction -> {ok}")
 
+    # collectors: a NameError/typo in a collect_*() silently kills the whole op
+    # for every case (this actually happened), so exercise each one here.
+    fake = {
+        "causal_conv1d_fn": (
+            dict(conv_states=torch.randn(4, 8, 3)),
+            dict(slots=[0, 1], live=[True, False], seqlens=[3, 2]),
+            torch.randn(8, 6),
+            ("out", "conv_states"),
+        ),
+        "compressor": (
+            dict(state_cache=torch.randn(2, 4, 8)),
+            dict(valid_rows=[3], rank3=False),
+            torch.randn(5, 8),
+            ("out", "state_cache"),
+        ),
+        "gqa": (dict(), dict(), torch.randn(1, 4, 2, 8), ("out",)),
+        "kv_rmsnorm_rope_cache": (
+            dict(
+                k_cache=torch.zeros(4, 2, 1, 8),
+                ckv_cache=torch.zeros(4, 2, 1, 16),
+                index=torch.arange(6),
+            ),
+            dict(rope=8, rms=16),
+            (None, None, torch.randn(6, 8), torch.randn(6, 16)),
+            ("k_rope", "c_kv", "k_cache", "ckv_cache"),
+        ),
+        "lightning_indexer": (
+            dict(),
+            dict(),
+            (torch.zeros((2, 1, 4), dtype=torch.int32), torch.empty(0)),
+            ("indices",),
+        ),
+        "sparse_attn_sharedkv": (
+            dict(),
+            dict(),
+            (torch.randn(2, 4, 8), torch.empty(0)),
+            ("out", "lse"),
+        ),
+    }
+    for op, (kw, meta, result, keys) in fake.items():
+        try:
+            got = COLLECTORS[op](kw, meta, result)
+            missing = [k for k in keys if k not in got]
+            ok = not missing
+            detail = f"keys ok" if ok else f"missing {missing}"
+        except Exception as exc:
+            ok = False
+            detail = f"{type(exc).__name__}: {exc}"
+        failures += [] if ok else [f"{op}: collector broken ({detail})"]
+        print(f"  {'PASS' if ok else 'FAIL'}  {op:<24} collector -> {detail}")
+
     print()
     if failures:
         for f in failures:
@@ -1855,17 +2160,22 @@ def report(outdir):
             [c.get("max_abs_err", 0.0) for c in checks if "max_abs_err" in c],
             default=None,
         )
+        # how many elements actually got compared -- guards against a
+        # "passing" case whose comparison was vacuous (0-element slice)
+        compared = sum(int(c.get("numel", 0)) for c in checks if "numel" in c)
         rows.append(
             dict(
                 op=op,
                 case=case_id,
                 accuracy=verdict,
+                compared_elems=compared,
                 max_abs_err=max_err,
                 new_status=new.get("status", "n/a"),
                 ref_status=ref.get("status", "n/a"),
                 new_ms=n_ms,
                 ref_ms=r_ms,
                 speedup=speedup,
+                new_peak_alloc_mb=new.get("peak_alloc_mb"),
                 new_artifact_mb=new.get("artifact_mb"),
                 ref_artifact_mb=ref.get("artifact_mb"),
             )
@@ -1890,25 +2200,32 @@ def report(outdir):
     # ---- markdown -------------------------------------------------------
     md = []
     md.append("# CommonIR (TLE/DSA) rewrite vs non-CommonIR counterpart\n")
-    md.append(f"- device: `{os.environ.get('COMMONIR_BENCH_DEVICE', '?')}`")
+    _run_meta = _json_load(os.path.join(outdir, "meta.json"), {}) or {}
+    md.append(
+        "- device: `{}`".format(
+            _run_meta.get("device")
+            or os.environ.get("COMMONIR_BENCH_DEVICE", "?")
+        )
+    )
     md.append(f"- output: `{os.path.abspath(outdir)}`")
     md.append(f"- generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     md.append("")
     md.append("## Accuracy + latency\n")
     md.append(
-        "| op | case | accuracy | max_abs_err | new (ms) | ref (ms) | ref/new |"
+        "| op | case | accuracy | compared | max_abs_err | new (ms) | ref (ms) | ref/new |"
     )
-    md.append("|---|---|---|---|---|---|---|")
+    md.append("|---|---|---|---|---|---|---|---|")
 
     def fmt(v, spec="{:.3f}"):
         return spec.format(v) if isinstance(v, (int, float)) else "-"
 
     for row in rows:
         md.append(
-            "| {op} | {case} | {acc} | {err} | {n} | {r} | {sp} |".format(
+            "| {op} | {case} | {acc} | {cmp} | {err} | {n} | {r} | {sp} |".format(
                 op=row["op"],
                 case=row["case"],
                 acc=row["accuracy"],
+                cmp=fmt(row.get("compared_elems"), "{:.3g}") if row.get("compared_elems") else "0 !",
                 err=fmt(row["max_abs_err"], "{:.3g}"),
                 n=fmt(row["new_ms"]),
                 r=fmt(row["ref_ms"]),
@@ -1950,6 +2267,53 @@ def report(outdir):
         md.append(f"{len(ir)} files under `ir/<op>/<impl>/`.")
         md.append("`ir_bundle/<op>__<impl>.{ttir,ttadapter}.mlir` holds the concatenated text IR.")
         md.append("`ir_manifest.json` has the full listing.")
+
+    # ---- what does this folder actually cost to move? --------------------
+    sizes = {
+        name: _dir_mb(os.path.join(outdir, name))
+        for name in ("artifacts", "ir", "logs", "raw", "digest")
+    }
+    top = sum(
+        os.path.getsize(os.path.join(outdir, f)) / 2**20
+        for f in (
+            "accuracy.json",
+            "results.json",
+            "results.csv",
+            "produce.json",
+            "meta.json",
+            "ir_manifest.json",
+            "summary.md",
+        )
+        if os.path.isfile(os.path.join(outdir, f))
+    )
+    md.append("\n## Output size (MB)\n")
+    md.append("| subfolder | MB | needed for |")
+    md.append("|---|---|---|")
+    md.append(f"| top-level .json/.csv/.md | {top:.2f} | the result table |")
+    md.append(
+        f"| `artifacts/` | {sizes['artifacts']:.2f} | only re-running `compare` offline |"
+    )
+    md.append(f"| `ir/` | {sizes['ir']:.2f} | the IR analysis |")
+    md.append(f"| `digest/` | {sizes['digest']:.2f} | worst-element locations of failures |")
+    md.append(f"| `raw/` | {sizes['raw']:.2f} | timing samples + worker env |")
+    md.append(f"| `logs/` | {sizes['logs']:.2f} | tracebacks / pass IR |")
+    total_mb = sum(sizes.values()) + top
+    md.append(f"\n**total {total_mb:.2f} MB**")
+    if sizes["artifacts"] >= 50:
+        md.append(
+            f"\n`artifacts/` is {sizes['artifacts']:.0f} MB of the {total_mb:.0f} MB. "
+            "It is only needed to re-run `compare` on another machine; accuracy "
+            "has already been computed here. Re-run with `--artifacts drop` (or "
+            "`--artifacts failures`, the default) to keep the folder small."
+        )
+    md.append("\nDownload without the raw tensors:\n")
+    md.append("```bash")
+    md.append(
+        f"tar Jcf run.tar.xz -C {os.path.dirname(os.path.abspath(outdir))} \\"
+    )
+    md.append(f"    --exclude='{os.path.basename(outdir)}/artifacts' \\")
+    md.append(f"    {os.path.basename(outdir)}")
+    md.append("```")
 
     with open(os.path.join(outdir, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
@@ -2021,10 +2385,29 @@ def _add_artifact_arg(p):
         dest="save_artifacts",
         action="store_true",
         default=True,
-        help="save per-impl CPU artifacts (needed for the CPU-only compare stage)",
+        help="save per-impl CPU artifacts (needed by the CPU-only compare stage)",
     )
     p.add_argument(
-        "--no-save-artifacts", dest="save_artifacts", action="store_false"
+        "--no-save-artifacts",
+        dest="save_artifacts",
+        action="store_false",
+        help="perf-only run: no artifacts AND no accuracy stage",
+    )
+    p.add_argument(
+        "--artifacts",
+        dest="artifacts_policy",
+        choices=("all", "failures", "drop"),
+        default="failures",
+        help="what to keep after compare: 'all' = every .pt (offline re-compare), "
+        "'failures' (default) = only the cases that did not pass, "
+        "'drop' = none (accuracy is already in accuracy.json)",
+    )
+    p.add_argument(
+        "--digest-n",
+        type=int,
+        default=16,
+        help="on a mismatch, record the N worst element coordinates+values "
+        "(default 16; 0 disables)",
     )
 
 
@@ -2054,6 +2437,12 @@ def main(argv=None):
 
     p_cmp = sub.add_parser("compare", help="CPU-only accuracy comparison")
     _add_common(p_cmp)
+    p_cmp.add_argument(
+        "--digest-n",
+        type=int,
+        default=16,
+        help="on a mismatch, record the N worst element coordinates+values",
+    )
 
     p_rep = sub.add_parser("report", help="aggregate raw results")
     _add_common(p_rep)
@@ -2111,10 +2500,16 @@ def main(argv=None):
             produce(args.outdir, ops, cases, args)
         else:
             _log("--reuse: skipping produce stage")
+        accuracy = None
         if args.save_artifacts:
-            compare(args.outdir, ops, cases)
+            accuracy = compare(
+                args.outdir, ops, cases, digest_n=args.digest_n
+            )
+            apply_artifacts_policy(
+                args.outdir, ops, cases, args.artifacts_policy, accuracy
+            )
         else:
-            _log("--no-save-artifacts: skipping compare stage")
+            _log("--no-save-artifacts: skipping compare stage (perf-only run)")
         report(args.outdir)
         return 0
 
@@ -2131,7 +2526,7 @@ def main(argv=None):
             cases = {
                 op: list(produced.get(op, cases[op])) for op in ops
             }
-        compare(args.outdir, ops, cases)
+        compare(args.outdir, ops, cases, digest_n=args.digest_n)
         return 0
 
     if args.cmd == "report":
