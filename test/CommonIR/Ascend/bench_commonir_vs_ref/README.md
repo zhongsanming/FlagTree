@@ -369,3 +369,20 @@ First run: 1.91 GB of `.pt` (95 % of it `compressor`'s fp32 `state_cache`,
 cases that did not compare — plus a 12 MB tarball. Artifacts are now also
 dropped when only one of the two impls produced one (a lone `.pt` is useless
 to `compare`).
+
+### Correction (run `fix2`): where the num_stages patch went wrong
+
+`_patch_flash_num_stages` first looked for `obj.heuristics`, but this Triton
+stores the dict as **`Heuristics.values`** (`python/triton/runtime/autotuner.py`),
+so the patch silently did nothing — and because the note was only appended
+after a *successful* call, the run showed no trace of it. Both are fixed:
+the patcher accepts `.values` and `.heuristics`, dedupes the capped configs
+(the tuned list enumerates stages 2/3/4, which collapse), and notes are now
+collected in a process-global `_RUN_NOTES` that is written even when the call
+raises. The `gqa` ref is also launched with `disable_splitkv=True`: the
+split-kv path needs `get_device_properties(...).multi_processor_count`, which
+torch_npu does not expose, and its kernel's `num_stages` comes only from the
+`lambda args: 3` heuristic.
+
+**Check `## Workarounds applied` in `summary.md` before interpreting any
+`gqa` row** — its absence means no patch was applied.

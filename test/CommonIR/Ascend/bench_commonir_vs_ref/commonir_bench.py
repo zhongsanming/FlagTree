@@ -150,6 +150,15 @@ def _log_path(outdir, op, case_id, impl):
 # --------------------------------------------------------------------------- #
 
 
+_RUN_NOTES = []
+
+
+def _note(msg):
+    """Process-wide note list; survives an exception so patches are auditable."""
+    if msg not in _RUN_NOTES:
+        _RUN_NOTES.append(msg)
+
+
 def _load_kernel_module(op, kernel_dir):
     """Import ``<kernel_dir>/<op>.py`` under a private module name (cached)."""
     key = (op, os.path.abspath(kernel_dir))
@@ -988,6 +997,7 @@ def _patch_flash_num_stages(limit=2):
         if isinstance(cfgs, list) and cfgs and hasattr(cfgs[0], "num_stages"):
             new = []
             changed = False
+            seen = set()
             for c in cfgs:
                 ns = getattr(c, "num_stages", None)
                 if isinstance(ns, int) and ns > limit:
@@ -996,17 +1006,32 @@ def _patch_flash_num_stages(limit=2):
                         changed = True
                     except Exception:
                         pass
+                # capping can collapse several entries (the tuned list
+                # enumerates stages 2/3/4); drop exact duplicates
+                key = repr(c)
+                if key in seen:
+                    continue
+                seen.add(key)
                 new.append(c)
             if changed:
                 try:
                     obj.configs = new
-                    touched.append(f"{label}: {len(new)} autotune cfg -> num_stages={limit}")
+                    touched.append(
+                        f"{label}: {len(new)} autotune cfg (num_stages<={limit})"
+                    )
                 except Exception:
                     pass
-        heur = getattr(obj, "heuristics", None)
-        if isinstance(heur, dict) and "num_stages" in heur:
+        heur = None
+        # triton.runtime.autotuner.Heuristics stores the dict as `.values`;
+        # some forks call it `.heuristics`.  Handle both.
+        for attr_name in ("values", "heuristics"):
+            cand = getattr(obj, attr_name, None)
+            if isinstance(cand, dict) and "num_stages" in cand:
+                heur = cand
+                break
+        if heur is not None:
             heur["num_stages"] = (lambda args, _l=limit: _l)
-            touched.append(f"{label}: num_stages heuristic -> {limit}")
+            touched.append(f"{label}.num_stages -> {limit}")
         for inner in ("fn", "jit_function", "func"):
             _visit(getattr(obj, inner, None), f"{label}.{inner}", depth + 1)
 
@@ -1043,10 +1068,13 @@ def _call_ref_gqa(kw, meta):
     gqa's ``hq // (N_q // N_kv)``); ``scale=None`` means ``1/sqrt(D)``.
     """
     fn = _require("flaggems_vllm.ops.attention", "flash_attention_forward")
-    notes = []
-    if q_patch := _patch_flash_api_cuda_literal():
-        notes.append(q_patch)
-    notes.extend(_patch_flash_num_stages(2))
+    _note(_patch_flash_api_cuda_literal() or "flash_api cuda literal: nothing to patch")
+    for msg in _patch_flash_num_stages(2):
+        _note(msg)
+    # The split-kv dispatcher needs `get_device_properties(...).multi_processor_count`
+    # (torch_npu does not expose it) and its kernel's num_stages heuristic is 3.
+    # Force the plain forward kernel instead.
+    _note("gqa ref launched with disable_splitkv=True (splitkv is CUDA-only)")
     q = kw["query"]
     k = kw["key"]
     v = kw["value"]
@@ -1064,9 +1092,8 @@ def _call_ref_gqa(kw, meta):
         bool(kw["is_causal"]),
         False,
         scale=scale,
+        disable_splitkv=True,
     )[0]
-    if notes:
-        meta.setdefault("notes", []).extend(notes)
     return out
 
 
@@ -1710,6 +1737,10 @@ def worker_main(args):
         out["traceback"] = traceback.format_exc()
         _log(out["traceback"])
 
+    # workarounds must be visible even when the call failed -- otherwise a
+    # silently-unapplied patch looks exactly like a broken counterpart
+    if _RUN_NOTES:
+        out["notes"] = list(_RUN_NOTES)
     _json_dump(_raw_path(args.outdir, op, case_id, impl), out)
     return 0 if out["status"] == "ok" else 1
 
@@ -1863,7 +1894,8 @@ def produce(outdir, ops, cases, args):
                         min_ms=bench.get("min_ms"),
                         artifact_mb=raw.get("artifact_mb"),
                         peak_alloc_mb=bench.get("peak_alloc_mb"),
-                        notes=raw.get("meta", {}).get("notes"),
+                        notes=raw.get("notes")
+                        or raw.get("meta", {}).get("notes"),
                         log=os.path.relpath(log_path, outdir),
                     )
                 )
