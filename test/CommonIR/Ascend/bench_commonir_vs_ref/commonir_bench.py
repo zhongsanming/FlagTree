@@ -969,6 +969,67 @@ def _patch_flash_api_cuda_literal():
     return "flash_api.dispatch(): get_device_properties('cuda') -> default device"
 
 
+def _patch_flash_num_stages(limit=2):
+    """Ascend Triton rejects ``tl.range(..., num_stages=N)`` with ``N > 2``.
+
+    The counterpart's flash-attention kernels take ``num_stages`` from their
+    tuned autotune configs (and, for the splitkv kernel, from a 3-valued
+    heuristic), so on this toolchain they fail with
+    ``AssertionError: Only `range` iterator supports num_stages <= 2``.
+    Cap it.  Recorded in ``meta.notes``: the counterpart's numbers are then
+    measured with the shallower pipeline.
+    """
+    touched = []
+
+    def _visit(obj, label, depth=0):
+        if obj is None or depth > 2:
+            return
+        cfgs = getattr(obj, "configs", None)
+        if isinstance(cfgs, list) and cfgs and hasattr(cfgs[0], "num_stages"):
+            new = []
+            changed = False
+            for c in cfgs:
+                ns = getattr(c, "num_stages", None)
+                if isinstance(ns, int) and ns > limit:
+                    try:
+                        c = c._replace(num_stages=limit)
+                        changed = True
+                    except Exception:
+                        pass
+                new.append(c)
+            if changed:
+                try:
+                    obj.configs = new
+                    touched.append(f"{label}: {len(new)} autotune cfg -> num_stages={limit}")
+                except Exception:
+                    pass
+        heur = getattr(obj, "heuristics", None)
+        if isinstance(heur, dict) and "num_stages" in heur:
+            heur["num_stages"] = (lambda args, _l=limit: _l)
+            touched.append(f"{label}: num_stages heuristic -> {limit}")
+        for inner in ("fn", "jit_function", "func"):
+            _visit(getattr(obj, inner, None), f"{label}.{inner}", depth + 1)
+
+    for modname in ("flaggems_vllm.ops.flash_kernel", "flag_gems.ops.flash_kernel"):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        for attr, obj in list(vars(mod).items()):
+            if attr.startswith("__"):
+                continue
+            try:
+                _visit(obj, f"{modname}.{attr}")
+            except Exception:
+                continue
+    if not touched:
+        return [
+            "flash num_stages patch: no autotune configs/heuristics found, "
+            "patch NOT applied"
+        ]
+    return touched
+
+
 def _call_ref_gqa(kw, meta):
     """Drop-in for gqa.run() built on the FlashAttention forward stack.
 
@@ -982,7 +1043,10 @@ def _call_ref_gqa(kw, meta):
     gqa's ``hq // (N_q // N_kv)``); ``scale=None`` means ``1/sqrt(D)``.
     """
     fn = _require("flaggems_vllm.ops.attention", "flash_attention_forward")
-    note = _patch_flash_api_cuda_literal()
+    notes = []
+    if q_patch := _patch_flash_api_cuda_literal():
+        notes.append(q_patch)
+    notes.extend(_patch_flash_num_stages(2))
     q = kw["query"]
     k = kw["key"]
     v = kw["value"]
@@ -1001,8 +1065,8 @@ def _call_ref_gqa(kw, meta):
         False,
         scale=scale,
     )[0]
-    if note:
-        meta.setdefault("notes", []).append(note)
+    if notes:
+        meta.setdefault("notes", []).extend(notes)
     return out
 
 
@@ -1055,9 +1119,38 @@ REF_SOURCE = {
 }
 
 
-def call_new(op, kw, meta, kernel_dir):
+def call_new(op, kw, meta, kernel_dir, consts=None):
     mod = _load_kernel_module(op, kernel_dir)
+    for name, value in (consts or {}).items():
+        if not hasattr(mod, name):
+            raise AttributeError(
+                f"{op}.py has no module-level constant {name!r} "
+                f"(available: {[a for a in dir(mod) if a.isupper()]})"
+            )
+        setattr(mod, name, value)
     return mod.run(**kw)
+
+
+def _parse_consts(spec):
+    """``_BLOCK_N=64,_BLOCK_M=32`` -> {'_BLOCK_N': 64, '_BLOCK_M': 32}."""
+    out = {}
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"--new-const expects NAME=VALUE, got {item!r}")
+        name, raw = item.split("=", 1)
+        raw = raw.strip()
+        for conv in (int, float):
+            try:
+                out[name.strip()] = conv(raw)
+                break
+            except ValueError:
+                continue
+        else:
+            out[name.strip()] = raw
+    return out
 
 
 # =========================================================================== #
@@ -1539,9 +1632,10 @@ def worker_main(args):
         else:
             kw, meta = BUILDERS[op](case_id, device)
 
+        consts = _parse_consts(getattr(args, "new_const", None))
         if impl == NEW_IMPL:
             def invoke():
-                return call_new(op, kw, meta, args.kernel_dir)
+                return call_new(op, kw, meta, args.kernel_dir, consts)
         else:
             def invoke():
                 return REF_CALLERS[op](kw, meta)
@@ -1726,6 +1820,8 @@ def produce(outdir, ops, cases, args):
                     "--sparse-metadata",
                     args.sparse_metadata,
                 ]
+                if getattr(args, "new_const", None):
+                    cmd += ["--new-const", args.new_const]
                 if args.no_bench:
                     cmd.append("--no-bench")
                 if not args.save_artifacts:
@@ -1851,7 +1947,15 @@ def apply_artifacts_policy(outdir, ops, cases, policy, accuracy):
     freed = 0.0
     for op in ops:
         for case_id in cases[op]:
-            keep = policy == "failures" and status.get((op, case_id)) != "ok"
+            # A lone artifact is useless for `compare` -- it needs both sides.
+            both = all(
+                os.path.isfile(_art_path(outdir, op, case_id, i)) for i in IMPLS
+            )
+            keep = (
+                policy == "failures"
+                and both
+                and status.get((op, case_id)) != "ok"
+            )
             for impl in IMPLS:
                 path = _art_path(outdir, op, case_id, impl)
                 if not os.path.isfile(path):
@@ -2258,6 +2362,24 @@ def report(outdir):
             g = math.exp(sum(math.log(v) for v in vals) / len(vals))
             md.append(f"| {op} | {g:.2f}x | {len(vals)} |")
 
+    # ---- workarounds applied to the counterpart, or kernel overrides --------
+    seen = {}
+    for r in produce:
+        for n in r.get("notes") or []:
+            seen.setdefault((r["impl"], n), f"{r['op']}/{r['case']}")
+    applied = (_json_load(os.path.join(outdir, "meta.json"), {}) or {}).get(
+        "new_const"
+    )
+    if seen or applied:
+        md.append("\n## Workarounds applied during this run\n")
+        for (impl, note), sample in sorted(seen.items()):
+            md.append(f"- `{impl}`: {note} (first seen in `{sample}`)")
+        if applied:
+            md.append(
+                "- `new`: module constants overridden, **these are not the "
+                f"committed kernel's numbers**: `{applied}`"
+            )
+
     md.append("\n## Counterparts\n")
     for op in ops:
         md.append(f"- **{op}**: `{REF_SOURCE[op]}`")
@@ -2377,6 +2499,14 @@ def _add_produce_args(p):
         default="auto",
         help="sparse_attn_sharedkv reference metadata source",
     )
+    p.add_argument(
+        "--new-const",
+        default=None,
+        metavar="NAME=VALUE[,NAME=VALUE]",
+        help="experiment only: override module-level constants of the CommonIR "
+        "kernel before calling (e.g. '_BLOCK_N=64' for gqa to test whether a "
+        "UB overflow is just a too-large tile). Recorded in meta.notes.",
+    )
 
 
 def _add_artifact_arg(p):
@@ -2490,6 +2620,7 @@ def main(argv=None):
             dump_ir=args.dump_ir,
             dump_pass_ir=args.dump_pass_ir,
             measure_mode=args.measure_mode,
+            new_const=getattr(args, "new_const", None),
             env={
                 "python": sys.version.split()[0],
                 "platform": platform.platform(),

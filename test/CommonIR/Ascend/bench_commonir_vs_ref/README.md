@@ -340,3 +340,32 @@ not misread as rewrite regressions:
   `memref<...>` (UB buffers) — that is where an overflow is visible
   (e.g. `gqa` D=128 emits 17 × `memref<128x128xbf16>` = 557 KiB of UB
   buffers against a 192 KiB budget).
+
+4. **`num_stages > 2` in the counterpart's flash kernel** — once (1) is worked
+   around, `gqa`'s counterpart fails at *codegen*:
+   `AssertionError('Only `range` iterator supports num_stages <= 2')` on
+   `for col_start in tl.range(..., num_stages=num_stages)` in
+   `flash_kernel.py`. `flash_fwd_kernel` takes `num_stages` from its tuned
+   autotune configs (`runtime.get_tuned_config("attention")`) and
+   `flash_fwd_splitkv_kernel` from a `lambda args: 3` heuristic.
+   `_patch_flash_num_stages(2)` caps both; the run log records it under
+   `meta.notes` (and hence in the summary's "Workarounds applied" section),
+   because the counterpart is then measured with a shallower pipeline.
+   *If that section is missing on your next run, the patch did not find the
+   config objects and you are looking at the unpatched failure.*
+
+5. **Experimenting with tile sizes without editing the kernel** —
+   `--new-const _BLOCK_N=64` sets module-level constants on the **CommonIR**
+   kernel before the call. This is a diagnostic, not a measurement of the
+   committed code: it is for answering "is that UB overflow just a too-large
+   tile?" (e.g. `gqa` `_BLOCK_M/_BLOCK_N`, `sparse_attn_sharedkv`
+   `_CMP_CHUNK/_N_CHUNK/_HEAD_BLOCK`). The override is echoed in `meta.json`
+   and in the summary so such rows can never be mistaken for the real kernel.
+
+### Artifact size after `--artifacts failures`
+
+First run: 1.91 GB of `.pt` (95 % of it `compressor`'s fp32 `state_cache`,
+546 MB for a **24-token** decode case). Second run: **34 MB**, and only for the
+cases that did not compare — plus a 12 MB tarball. Artifacts are now also
+dropped when only one of the two impls produced one (a lone `.pt` is useless
+to `compare`).
