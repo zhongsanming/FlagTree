@@ -24,8 +24,8 @@ case "${1:-smoke}" in
     OUT="out/full-$STAMP"
     "$PY" commonir_bench.py run --outdir "$OUT" --cases default \
           --dump-ir --iters 20 --rounds 5 --warmup 5
-    tar czf "$OUT.tgz" "$OUT"
-    echo "packed: $OUT.tgz  ($(du -h "$OUT.tgz" | cut -f1))"
+    tar Jcf "$OUT.tar.xz" "$OUT"
+    echo "packed: $OUT.tar.xz  ($(du -h "$OUT.tar.xz" | cut -f1))"
     ;;
   perf)
     "$PY" commonir_bench.py run --outdir "out/perf-$STAMP" --cases default \
