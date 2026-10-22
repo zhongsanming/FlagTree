@@ -585,3 +585,58 @@ directly testable (`0` forces the masked single-tile head).
 cleanest test of whether the remaining 1.3x on `prefill0_b2_rank3` is the
 per-tile grid (1 N-tile => no A-tile re-read, 4x fewer programs) or the fused
 data-dependent scatter.
+
+### Round 6: root causes confirmed, two fixes applied
+
+**`causal_conv1d_fn` — the head path is NOT the cause; global traffic is.**
+
+`_HEAD_DSA_AVG_LIMIT=0` (masked single-tile head) is *worse*: 2.450 vs 1.926 ms
+total at 1024 tokens, so the per-column DSA head pays for itself. With
+`_BLOCK_T=64` the device split is:
+
+| tokens | new device | ref device | ratio | new traffic | ref traffic | new GB/s | ref GB/s |
+|---|---|---|---|---|---|---|---|
+| 249 | 0.771 | 0.629 | 1.23x | 10.2 MB | 4.1 MB | 13 | 6.5 |
+| 1024 | 1.671 | 0.643 | 2.60x | 41.9 MB | 16.8 MB | 25 | 26 |
+| 4096 | 2.491 | 0.722 | 3.45x | 167.8 MB | 67.1 MB | 67 | 93 |
+
+Reads `x` `WIDTH` times, so it moves **2.5x the bytes** at comparable achieved
+bandwidth — that is the whole regression. (The ref's device time is nearly flat
+because its `BLOCK_M=128` token loop is a serial dependent chain, so it does not
+scale either; the rewrite loses on traffic but would keep scaling.)
+
+*Fix applied:* `_BODY_HALO = 1` cuts every tap of a chunk from a **single loaded
+strip**, halving `x` traffic (2·BLOCK_T tokens loaded per BLOCK_T outputs —
+`tl.arange` forces a power of two, so 2x is the reachable factor without a
+masked store path). It is a separate statically-known loop followed by the
+unchanged per-tap loop for the chunks whose strip would cross the part
+boundary, because a runtime branch around the accumulator is the pattern this
+backend miscompiles. **Default stays 0 (unchanged behaviour)**; verified locally
+for bounds, coverage and *bit-identical* accumulation order, but not yet on the
+NPU — enable with `--new-const _BODY_HALO=1`.
+
+**`compressor` — `BN` is the lever, `BK` is not; the default is now shape-gated.**
+
+`BM=64/BN=512/BK=128` (L0C exactly 128 KiB) is the best on the worst case
+(3.473 ms) but only ~5 % ahead of `BM=128/BN=256/BK=256` (3.633) and it regresses
+`prefill_small`. Adopted instead, mirroring the counterpart's own
+`block_n = 256 if wide_projection else 128`:
+
+```python
+_PROJ_BN = 256            # upper bound
+_PROJ_BK = 256
+_PROJ_WIDE_MIN_TOKENS = 2048   # below this, BN=128 measured better
+```
+
+All of these are `max_abs_err = 0` against the counterpart (out/sw_comp2,
+out/sw_comp3), i.e. bit-exact. Net: `prefill0_b2_rank3` 5.234 → 3.633 ms
+(0.54x → 0.77x), `prefill1_hd128` 2.045 → 1.670 ms (0.83x → 1.03x),
+`prefill_small` and the decode cases unchanged.
+
+The residual ~1.3x on `prefill0_b2_rank3` is structural and NOT reachable by
+tiling (the counterpart at the same 128/128/512 tiles is still 3.6x faster): the
+rewrite fuses a data-dependent scatter store into the matmul
+(`dst = cache_ptr + row[:, None] * W2 + cols`) where the counterpart writes a
+dense `state_proj` workspace and scatters separately, and it runs 256 one-tile
+programs against the counterpart's 24 persistent ones. Splitting the scatter out
+is the next change, and it needs its own validation round.

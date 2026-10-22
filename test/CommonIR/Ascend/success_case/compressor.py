@@ -49,11 +49,22 @@ _LARGE = 3.4028234663852886e38
 _META_BLOCK = 128
 
 # Projection tiling.  Hoisted out of run() so the benchmark harness can sweep
-# them (``--new-const _PROJ_BK=256``) instead of editing the kernel.  The
-# values are unchanged defaults: BM/BN/BK = 128/128/128.
+# them (``--new-const _PROJ_BK=256``) instead of editing the kernel.
+#
+# Measured on Ascend910B4 (out/sw_comp, out/sw_comp2, out/sw_comp3), all
+# accuracy-verified bit-exact against the counterpart:
+#   128/128/128 (old)  5.234 ms   25% L1   prefill0_b2_rank3
+#   128/256/256        3.633 ms   75% L1
+#    64/512/128         3.473 ms  100% L0C
+# BN is the lever, not BK: matching the counterpart's BK=512 at BN=128 recovers
+# only 11% because that config already fills L1.  L0C (128 KiB) caps the fp32
+# accumulator at BM*BN <= 32768, so BN=512 needs BM=64.  Below ~2k tokens the
+# 128-wide tile still measured better, which mirrors the counterpart's own
+# `block_n = 256 if wide_projection else 128` rule.
 _PROJ_BM_MAX = 128
-_PROJ_BN = 128
-_PROJ_BK = 128
+_PROJ_BN = 256
+_PROJ_BK = 256
+_PROJ_WIDE_MIN_TOKENS = 2048
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +398,7 @@ def run(
     )
 
     # ---- kernel 1: projection + scatter (two constexpr halves) ----
-    bn = _PROJ_BN
+    bn = _PROJ_BN if total_tokens >= _PROJ_WIDE_MIN_TOKENS else min(_PROJ_BN, 128)
     while bn > 16 and proj_dim % bn:
         bn >>= 1
     if proj_dim % bn:
