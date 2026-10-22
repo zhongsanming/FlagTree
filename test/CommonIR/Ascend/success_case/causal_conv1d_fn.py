@@ -52,7 +52,6 @@ def _cc1d_kernel(
     XDT: tl.constexpr, WDT: tl.constexpr, ODT: tl.constexpr,
     HAS_BIAS: tl.constexpr, HAS_CACHE: tl.constexpr,
     HAS_INIT: tl.constexpr, SILU: tl.constexpr, HEAD_DSA: tl.constexpr,
-    BODY_HALO: tl.constexpr,
 ):
     H: tl.constexpr = WIDTH - 1
     pid_s = tl.program_id(0)
@@ -93,11 +92,6 @@ def _cc1d_kernel(
     csd = dcol[:, None] * cs1
 
     xbuf = tle.dsa.alloc([BLOCK_D, BLOCK_T], XDT, tle.dsa.ascend.UB)
-    if BODY_HALO and H > 0:
-        # one strip serves every tap of a chunk: WIDTH shifted BLOCK_T-wide
-        # windows starting at 0..H all fit inside 2*BLOCK_T columns
-        sbuf = tle.dsa.alloc([BLOCK_D, 2 * BLOCK_T], XDT, tle.dsa.ascend.UB)
-        sst = tl.arange(0, 2 * BLOCK_T)
     wbuf = tle.dsa.alloc([WP, BLOCK_D], WDT, tle.dsa.ascend.UB)
     if HAS_BIAS:
         bbuf = tle.dsa.alloc([BLOCK_D], XDT, tle.dsa.ascend.UB)
@@ -203,59 +197,7 @@ def _cc1d_kernel(
             bs = body_lo + (span * part) // nparts
             be = body_lo + (span * (part + 1)) // nparts
             nch = (be - bs + BLOCK_T - 1) // BLOCK_T
-            # Split the chunk loop instead of branching inside it: a runtime
-            # branch around the accumulator is the pattern this backend is
-            # documented to miscompile, so the halo variant is a separate,
-            # statically-known loop over the chunks whose whole strip is in
-            # bounds, followed by the unchanged per-tap loop for the rest.
-            tail_lo = 0
-            if BODY_HALO and H > 0:
-                room = be - bs - (2 * BLOCK_T - H)
-                # NB: Triton's ``//`` truncates toward zero (C semantics),
-                # unlike Python's floor, so a negative ``room`` would yield 1
-                # here and read a strip past the end of the part -- that is a
-                # vector-core fault at runtime, not a compile error.
-                nhalo = tl.where(room >= 0, room // BLOCK_T + 1, 0)
-                nhalo = tl.maximum(tl.minimum(nhalo, nch), 0)
-                for m in range(0, nhalo):
-                    c = bs + m * BLOCK_T
-                    acc = tl.zeros([BLOCK_D, BLOCK_T], tl.float32)
-                    if HAS_BIAS:
-                        acc += bv2[:, None]
-                    # one strip [c-H, c-H+2*BLOCK_T) serves every tap: the
-                    # window for tap j starts at column j and is BLOCK_T wide,
-                    # so j + BLOCK_T - 1 <= H + BLOCK_T - 1 < 2*BLOCK_T
-                    tle.dsa.copy(
-                        x_ptr + xd + (start + c - H + sst)[None, :] * xs1,
-                        sbuf, [BLOCK_D, 2 * BLOCK_T])
-                    strip = tle.dsa.to_tensor(sbuf)
-                    for j in range(0, WIDTH):
-                        if BODY_HALO == 2:
-                            # Shift along the token axis in registers.  A
-                            # strided extract_slice out of a UB tile (offset in
-                            # the *last* dim) faults the MTE engine, so shift
-                            # with a gather instead; every existing use of
-                            # extract_slice in these kernels takes a contiguous
-                            # row.
-                            gi = tl.broadcast_to(
-                                kt[None, :] + j, (BLOCK_D, BLOCK_T))
-                            xv = tl.gather(strip, gi, axis=1).to(tl.float32)
-                        else:
-                            xv = tle.dsa.extract_slice(
-                                strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1]
-                            ).to(tl.float32)
-                        wj = tl.reshape(
-                            tle.dsa.extract_slice(
-                                wt2, [j, 0], [1, BLOCK_D], [BLOCK_D, 1]),
-                            [BLOCK_D])
-                        acc += xv * wj[:, None]
-                    res = _silu(acc) if SILU else acc
-                    rbuf = tle.dsa.to_buffer(res.to(ODT), tle.dsa.ascend.UB)
-                    with tle.dsa.hint(inter_no_alias=True):
-                        tle.dsa.copy(rbuf, o_ptr + dcol[:, None] * L
-                                     + (off + c + kt)[None, :], [BLOCK_D, BLOCK_T])
-                tail_lo = nhalo
-            for m in range(tail_lo, nch):
+            for m in range(0, nch):
                 c = tl.maximum(tl.minimum(bs + m * BLOCK_T, be - BLOCK_T), bs)
                 acc = tl.zeros([BLOCK_D, BLOCK_T], tl.float32)
                 if HAS_BIAS:
@@ -312,20 +254,6 @@ _BLOCK_T = 32
 # than this; set it to 0 to force the masked single-tile head, or to a huge
 # value to force the column head.  Used to attribute the head path's cost.
 _HEAD_DSA_AVG_LIMIT = 256.0
-# The body loop currently issues one global load per tap, i.e. it reads x
-# WIDTH times.  Measured on Ascend910B4 (out/sw_cc1d2), the body is purely
-# memory bound: 4096 tokens at dim 4096 moves 168 MB for the rewrite against
-# 67 MB for the counterpart at comparable achieved bandwidth (67 vs 93 GB/s),
-# which is the whole 3.45x device gap.  With _BODY_HALO=1 the taps of a chunk
-# are cut from a single loaded strip, halving x traffic (2*BLOCK_T tokens are
-# loaded per BLOCK_T outputs; the strip must stay power-of-two because
-# tl.arange has no other size).  UB: the strip is [BLOCK_D, 2*BLOCK_T] in the
-# input dtype plus one [BLOCK_D, BLOCK_T] fp32 window and the accumulator, so
-# use it with BLOCK_T=32 (BLOCK_T=64 overflows UB once the tail loop's xbuf is
-# also resident).
-# 1 = extract_slice window (faults the MTE engine: strided UB slice),
-# 2 = tl.gather shift (register permute, the safe form)
-_BODY_HALO = 0
 
 
 def _pick_block_d(dim):
@@ -418,7 +346,6 @@ def run(
         HAS_INIT=has_initial_state is not None,
         SILU=activation is not None,
         HEAD_DSA=head_dsa,
-        BODY_HALO=bool(_BODY_HALO),
         num_warps=1,
     )
     return out

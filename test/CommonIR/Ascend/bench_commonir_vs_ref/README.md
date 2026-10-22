@@ -723,3 +723,28 @@ the counterpart's half of that gap is a serial-latency floor that does not
 scale, or (b) restructure the body around an explicit UB-resident sliding window
 (mirroring what the counterpart does per token, but 32 tokens at a time) — a
 much larger change than a tiling constant.
+
+### Round 9 (final): `_BODY_HALO` is not salvageable, reverted
+
+Both shift formulations fault **identically** — `_BODY_HALO=1` (strided
+`extract_slice` from UB) and `_BODY_HALO=2` (`tl.gather` register permute) — with
+the same `aivec error / mte error info: 0x11060000bd` on all three cases. Since
+the two variants share only the strip load and the two-loop structure, the fault
+is not the shift and not the `nhalo` arithmetic. Rather than guess again, the
+whole halo path has been **removed**: `causal_conv1d_fn.py` is now identical to
+the originally committed kernel except for the three behaviour-preserving knob
+hoists (`_MAX_BLOCK_D=128`, `_BLOCK_T=32`, `_HEAD_DSA_AVG_LIMIT=256.0`, all
+unchanged in value and verified against `1dae1466b`).
+
+What is still worth knowing (all measured, all reproducible):
+
+* the body reads `x` `WIDTH` times → 2.5x the counterpart's bytes at comparable
+  achieved bandwidth (67 vs 93 GB/s). That is the entire regression. Any fix has
+  to reduce that traffic; nothing else moved the number by more than 8%
+  (`_BLOCK_T=64` best, `_HEAD_DSA_AVG_LIMIT=0` is *worse*).
+* `_BLOCK_T=64` is a real but small win (≈8%, accuracy `ok`, `max_abs_err=0`) and
+  is available via `--new-const _BLOCK_T=64`. It was not made the default because
+  the two runs disagree by ±5% and it loses ~2% on the 4096-token case.
+* the counterpart's device time does not scale (0.616 ms at 249 tokens, 0.722 at
+  4096) because its `BLOCK_M=128` token loop is a serial dependent chain, while
+  the rewrite scales (0.843 → 2.491). The rewrite loses on bytes, not on shape.
