@@ -493,3 +493,48 @@ The two-launch split in `compressor` cannot be reached by a constant: it needs
 `_proj_scatter_kernel` to take a `[2*proj_dim, hidden]` concatenated weight and
 emit both halves in one launch (what `_project_concat_kernel` does). If the BK/BN
 sweep does not close the 4x gap, that is the next change.
+
+### Round 4 measurements (`out/graph`, `out/sw_comp`, `out/sw_cc1d`)
+
+**Method bug found and fixed (twice):** most *counterparts* cannot be graph
+captured (`RuntimeError: copy_between_host_and_device`) because they sync the
+host inside the call, so `out/graph` mixed device-only `new` numbers against
+host-inclusive `ref` numbers — e.g. `kv_rmsnorm_rope_cache/decode_bf16 344x` is
+an artefact (0.066 device vs 22.7 host+device). Fixes: `sweep` now drops the
+whole case to `loop` if the ref cannot be captured, `report` shows `mode!`
+instead of a ratio when the two sides' modes differ, and `--measure-mode
+host-split` attributes host vs device when *neither* side is capturable.
+
+**`--measure-mode host-split`** times `run()` normally, then times it again with
+every `JITFunction.run` stubbed out. The second number is the host cost
+*including* the D2H sync (`causal_conv1d_fn` does `.cpu().tolist()` on
+`query_start_loc` — which is also why it cannot be graph-captured). Use it for
+exactly those ops:
+
+```bash
+python commonir_bench.py run --outdir out/hspl --ops causal_conv1d_fn \
+  --cases b10_d4096_s1024_pad_fp16,b4_d4096_s249 --measure-mode host-split
+```
+
+**Results so far**
+
+* `compressor` — `BN=256` is worth 27 % on the worst case (`prefill0_b2_rank3`
+  5.20 → 3.79 ms), `BN=256+BK=256` 31 % (→ 3.61 ms), `BK=512` adds nothing above
+  `BK=256` and `BK=512+BN=256` does not compile. The counterpart's own resource
+  plan (`logs/*ref@base.log`) says it runs `block_k=512` with `l1_bytes=524288`,
+  i.e. **100 % of L1**; the rewrite's 128/128/128 uses 131 KiB (25 %). 31 % is
+  real but the remaining ~3x is structural: 2 launches re-reading `x` and a
+  per-tile (not persistent) grid.
+* `causal_conv1d_fn` — tiling is **not** the cause: `_BLOCK_T=64` is worth 8 %
+  (2.13 → 1.95 ms) and reaches parity on the smaller case; `_BLOCK_T=128` is
+  worse than 64 and `_MAX_BLOCK_D=64` is worse than 128, so the kernel is not
+  parallelism-starved and not simply DMA-size limited. The likely cause is the
+  body loop's `dsa.copy → to_tensor → acc` chain being fully serial (no
+  double buffering) — `success_case/matmul_double_buffer.py` is the in-tree
+  template for that fix.
+* `gqa` — the `JITFunction.run` `num_stages` clamp made the real counterpart
+  compile at last: `b1_s1024_h8x2_d64_noncausal` **new 0.157 ms vs ref 0.193 ms
+  (1.23x), max_abs_err 1.2e-4** on 524 288 elements — the first gqa comparison.
+* `~62 µs` is the graph-replay floor on this box (`sparse/swa_decode` and
+  `gqa/b1_s128` both land on it), so sub-0.1 ms graph numbers are not
+  comparable; use loop or host-split there.

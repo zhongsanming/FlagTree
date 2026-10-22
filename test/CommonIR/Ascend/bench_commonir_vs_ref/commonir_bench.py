@@ -1703,6 +1703,60 @@ def _measure_loop(fn, device, warmup, iters, rounds):
     )
 
 
+def _jit_classes():
+    out = []
+    for modname in ("triton.runtime", "triton.runtime.jit",
+                    "triton.spec.ascend.runtime.jit",
+                    "triton.backends.ascend.runtime.jit"):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        cls = getattr(mod, "JITFunction", None)
+        if cls is not None and cls not in out:
+            out.append(cls)
+    return out
+
+
+def _measure_host_split(fn, device, warmup=3, iters=20, rounds=5):
+    """Split a call into host bookkeeping vs device work.
+
+    `npu-graph` cannot capture an op that synchronises the host (both
+    implementations of causal_conv1d_fn do `.cpu().tolist()` in run()), so for
+    those the only honest attribution is: time run() normally, then time it
+    again with every Triton launch stubbed out.  The second number is the host
+    cost *including* the D2H sync; device = total - host.
+    """
+    total = _measure_loop(fn, device, warmup, iters, rounds)
+
+    classes = _jit_classes()
+    saved = [(cls, cls.run) for cls in classes]
+
+    def stub_run(self, *a, **k):
+        return None
+
+    for cls, _orig in saved:
+        cls.run = stub_run
+    try:
+        host = _measure_loop(fn, device, warmup, iters, rounds)
+    finally:
+        for cls, orig in saved:
+            cls.run = orig
+
+    return dict(
+        mode="host-split",
+        iters=iters,
+        rounds=rounds,
+        median_ms=total["median_ms"],
+        min_ms=total["min_ms"],
+        mean_ms=total["mean_ms"],
+        host_ms=host["median_ms"],
+        device_ms=max(total["median_ms"] - host["median_ms"], 0.0),
+        total_samples_ms=total["samples_ms"],
+        host_samples_ms=host["samples_ms"],
+    )
+
+
 def _measure_do_bench(fn, device):
     ms = None
     if str(device).startswith("npu"):
@@ -1833,7 +1887,12 @@ def worker_main(args):
             out["bench"] = dict(mode="skipped")
         else:
             with torch.inference_mode():
-                if args.measure_mode == "npu-graph":
+                if args.measure_mode == "host-split":
+                    bench = _measure_host_split(
+                        invoke, device, warmup=args.warmup,
+                        iters=args.iters, rounds=args.rounds,
+                    )
+                elif args.measure_mode == "npu-graph":
                     try:
                         bench = _measure_graph(
                             invoke, device, warmup=args.warmup,
@@ -2047,6 +2106,9 @@ def produce(outdir, ops, cases, args):
                         wall_s=round(dt, 2),
                         median_ms=lat,
                         min_ms=bench.get("min_ms"),
+                        measure_mode=bench.get("mode"),
+                        host_ms=bench.get("host_ms"),
+                        device_ms=bench.get("device_ms"),
                         artifact_mb=raw.get("artifact_mb"),
                         peak_alloc_mb=bench.get("peak_alloc_mb"),
                         notes=raw.get("notes")
@@ -2131,8 +2193,19 @@ def sweep(args, ops, cases):
     for op in ops:
         for case_id in cases[op]:
             ref = _spawn_worker(args, op, case_id, REF_IMPL, "base")
-            ref_ms = (ref.get("bench") or {}).get("median_ms")
-            _log(f"  {op}/{case_id}: ref {ref_ms if ref_ms else ref['status']}")
+            ref_bench = ref.get("bench") or {}
+            ref_ms = ref_bench.get("median_ms")
+            ref_mode = ref_bench.get("mode")
+            _log(f"  {op}/{case_id}: ref {ref_ms if ref_ms else ref['status']}"
+                 f" (mode={ref_mode})")
+            # a ratio is only meaningful if both sides were measured the same
+            # way; if the counterpart cannot be graph-captured, drop everyone
+            # back to loop timing for this case
+            mode = getattr(args, "measure_mode", "loop")
+            if mode == "npu-graph" and ref_mode != "graph":
+                _log("    (ref not capturable -> measuring this case in loop mode)")
+                mode = "loop"
+            args.measure_mode = mode
             for i, variant in enumerate(variants):
                 tag = f"v{i}"
                 const = ",".join(f"{k}={v}" for k, v in variant.items())
@@ -2155,6 +2228,7 @@ def sweep(args, ops, cases):
                     speedup=(ref_ms / n_ms) if (n_ms and ref_ms) else None,
                     new_status=new["status"], ref_status=ref["status"],
                     bench_mode=(new.get("bench") or {}).get("mode"),
+                    ref_mode=ref_mode,
                     graph_capture_failed=(new.get("bench") or {}).get(
                         "graph_capture_failed"),
                     notes=new.get("notes"),
@@ -2165,21 +2239,32 @@ def sweep(args, ops, cases):
                     f"new={n_ms if n_ms else '-'} ms  ref={ref_ms if ref_ms else '-'} ms"
                 )
                 if not args.keep_variant_artifacts:
-                    for impl, t in ((NEW_IMPL, tag), (REF_IMPL, "base")):
-                        try:
-                            os.remove(_art_path(args.outdir, op, case_id, impl, t))
-                        except OSError:
-                            pass
+                    try:
+                        os.remove(
+                            _art_path(args.outdir, op, case_id, NEW_IMPL, tag)
+                        )
+                    except OSError:
+                        pass
+            # ref@base is only needed while comparing this case's variants
+            if not args.keep_variant_artifacts:
+                try:
+                    os.remove(_art_path(args.outdir, op, case_id, REF_IMPL, "base"))
+                except OSError:
+                    pass
     _json_dump(os.path.join(args.outdir, "sweep.json"), rows)
     md = ["# Sweep", "", f"`--sweep {args.sweep}`  measure={args.measure_mode}", ""]
-    md.append("| op | case | variant | const | acc | max_abs_err | new (ms) | ref (ms) | ref/new |")
-    md.append("|---|---|---|---|---|---|---|---|---|")
+    md.append("`new@vN` and `ref@base` are always measured in the same mode; "
+              "a `ref` that cannot be graph-captured drops the whole case to "
+              "`loop` timing.")
+    md.append("| op | case | variant | const | acc | max_abs_err | new (ms) | ref (ms) "
+              "| ref/new | mode |")
+    md.append("|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         f = lambda v, sp="{:.3f}": sp.format(v) if isinstance(v, (int, float)) else "-"
         md.append("| {op} | {case} | {variant} | `{new_const}` | {acc} | {err} | {n} | {r} | {s} |".format(
             op=r["op"], case=r["case"], variant=r["variant"], new_const=r["new_const"],
             acc=r["accuracy"], err=f(r["max_abs_err"], "{:.3g}"), n=f(r["new_ms"]),
-            r=f(r["ref_ms"]), s=f(r["speedup"], "{:.2f}x")))
+            r=f(r["ref_ms"]), s=f(r["speedup"], "{:.2f}x"), m=r.get("bench_mode")))
     # best accuracy-preserving variant per case
     md += ["", "## Best accuracy-preserving variant per case", ""]
     md.append("| op | case | best variant | const | new (ms) | ref (ms) | ref/new |")
@@ -2627,7 +2712,10 @@ def report(outdir):
         ref = timings.get((op, case_id, REF_IMPL), {})
         a = acc.get((op, case_id), {})
         n_ms, r_ms = new.get("median_ms"), ref.get("median_ms")
-        speedup = (r_ms / n_ms) if (n_ms and r_ms) else None
+        n_mode, r_mode = new.get("measure_mode"), ref.get("measure_mode")
+        mode_ok = n_mode == r_mode and n_mode in (
+            "loop", "graph", "do_bench", "host-split")
+        speedup = (r_ms / n_ms) if (n_ms and r_ms and mode_ok) else None
         checks = a.get("checks", [])
         verdict = a.get("status", "n/a")
         max_err = max(
@@ -2649,6 +2737,11 @@ def report(outdir):
                 new_ms=n_ms,
                 ref_ms=r_ms,
                 speedup=speedup,
+                new_mode=n_mode,
+                ref_mode=r_mode,
+                mode_comparable=mode_ok,
+                new_host_ms=new.get("host_ms"),
+                new_device_ms=new.get("device_ms"),
                 new_peak_alloc_mb=new.get("peak_alloc_mb"),
                 new_artifact_mb=new.get("artifact_mb"),
                 ref_artifact_mb=ref.get("artifact_mb"),
@@ -2703,7 +2796,8 @@ def report(outdir):
                 err=fmt(row["max_abs_err"], "{:.3g}"),
                 n=fmt(row["new_ms"]),
                 r=fmt(row["ref_ms"]),
-                sp=fmt(row["speedup"], "{:.2f}x"),
+                sp=(fmt(row["speedup"], "{:.2f}x")
+                    if row.get("mode_comparable") else "mode!"),
             )
         )
 
@@ -2859,7 +2953,11 @@ def _add_produce_args(p):
     )
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument(
-        "--measure-mode", choices=("loop", "do_bench", "npu-graph"), default="loop"
+        "--measure-mode",
+        choices=("loop", "do_bench", "npu-graph", "host-split"),
+        default="loop",
+        help="loop = wall clock (host+device); npu-graph = device only via "
+        "graph replay; host-split = wall clock + launch-stubbed host cost",
     )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=20)
