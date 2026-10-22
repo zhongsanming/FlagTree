@@ -686,3 +686,40 @@ python commonir_bench.py sweep --outdir out/halo2 --ops causal_conv1d_fn \
   --cases b4_d4096_s249,b10_d4096_s1024_pad_fp16,b10_d4096_s4096_pad_fp16 \
   --sweep "_BODY_HALO=1,_BLOCK_T=32" --measure-mode host-split
 ```
+
+### Round 8: `_BODY_HALO` faults the MTE engine — diagnosis and a second form
+
+`_BODY_HALO=1,_BLOCK_T=32` now compiles and then faults on **all three** cases
+at runtime:
+
+```
+aivec error ... mte error info: 0x11060000bd   (identical code on every case)
+```
+
+So it was not the `nhalo` arithmetic (that bug was real and is fixed, but this
+fault is independent). The consistent MTE error points at
+`tle.dsa.extract_slice(strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1])`: a **strided
+column window out of a UB tile**. Every existing use of `extract_slice` in these
+kernels extracts a *contiguous* row (`[j, 0], [1, BLOCK_D]`), and the only other
+strided use in the tree (`extract_slice(x, (0,0), (B,HALF), (1,2))` in the
+counterpart's RoPE kernel) strides a *register* tensor, not UB.
+
+Added `_BODY_HALO=2`, which performs the same shift with
+`tl.gather(strip, kt[None, :] + j, axis=1)` — a register permute, the same
+primitive the compressor kernel already uses for its RoPE partner. Both forms
+can be tested in one sweep because a faulting variant only kills its own worker
+(the harness isolates it; subsequent cases still ran clean in round 7).
+
+```bash
+python commonir_bench.py sweep --outdir out/halo3 --ops causal_conv1d_fn \
+  --cases b4_d4096_s249,b10_d4096_s1024_pad_fp16,b10_d4096_s4096_pad_fp16 \
+  --sweep "_BODY_HALO=1|2,_BLOCK_T=32" --measure-mode host-split
+```
+
+**If `_BODY_HALO=2` also fails**, the conclusion is that this backend has no
+cheap way to shift within a UB-resident tile, and the honest options for
+`causal_conv1d_fn` are (a) accept 0.39–0.5x on large token counts, noting that
+the counterpart's half of that gap is a serial-latency floor that does not
+scale, or (b) restructure the body around an explicit UB-resident sliding window
+(mirroring what the counterpart does per token, but 32 tokens at a time) — a
+much larger change than a tiling constant.

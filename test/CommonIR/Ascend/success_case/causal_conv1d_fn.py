@@ -230,9 +230,20 @@ def _cc1d_kernel(
                         sbuf, [BLOCK_D, 2 * BLOCK_T])
                     strip = tle.dsa.to_tensor(sbuf)
                     for j in range(0, WIDTH):
-                        xv = tle.dsa.extract_slice(
-                            strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1]
-                        ).to(tl.float32)
+                        if BODY_HALO == 2:
+                            # Shift along the token axis in registers.  A
+                            # strided extract_slice out of a UB tile (offset in
+                            # the *last* dim) faults the MTE engine, so shift
+                            # with a gather instead; every existing use of
+                            # extract_slice in these kernels takes a contiguous
+                            # row.
+                            gi = tl.broadcast_to(
+                                kt[None, :] + j, (BLOCK_D, BLOCK_T))
+                            xv = tl.gather(strip, gi, axis=1).to(tl.float32)
+                        else:
+                            xv = tle.dsa.extract_slice(
+                                strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1]
+                            ).to(tl.float32)
                         wj = tl.reshape(
                             tle.dsa.extract_slice(
                                 wt2, [j, 0], [1, BLOCK_D], [BLOCK_D, 1]),
@@ -312,6 +323,8 @@ _HEAD_DSA_AVG_LIMIT = 256.0
 # input dtype plus one [BLOCK_D, BLOCK_T] fp32 window and the accumulator, so
 # use it with BLOCK_T=32 (BLOCK_T=64 overflows UB once the tail loop's xbuf is
 # also resident).
+# 1 = extract_slice window (faults the MTE engine: strided UB slice),
+# 2 = tl.gather shift (register permute, the safe form)
 _BODY_HALO = 0
 
 
