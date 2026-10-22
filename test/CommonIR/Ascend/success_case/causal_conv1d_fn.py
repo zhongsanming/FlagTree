@@ -246,14 +246,20 @@ _TORCH_DTYPE = {
 }
 
 
+# Tiling knobs.  Hoisted to module scope so the benchmark harness can sweep them
+# (``--new-const _BLOCK_T=128``) without editing the kernel.  Defaults unchanged.
+_MAX_BLOCK_D = 128
+_BLOCK_T = 32
+
+
 def _pick_block_d(dim):
-    """Widest dim block that divides dim, up to 128.
+    """Widest dim block that divides dim, up to ``_MAX_BLOCK_D``.
 
     The kernel pays a fixed per-program cost, so for large dim it is better to
     cover twice as many dims per program (half as many programs dispatched) than
     to keep the per-program tile small.
     """
-    bd = 128
+    bd = _MAX_BLOCK_D
     while bd > 16 and (bd > dim or dim % bd):
         bd //= 2
     return bd
@@ -296,7 +302,7 @@ def run(
 
     block_d = _pick_block_d(dim)
     # BLOCK_T also fixes the shortest body that can use the unmasked DSA path.
-    block_t = 32
+    block_t = _BLOCK_T
     hh = width - 1
     th = max(4, triton.next_power_of_2(hh))
     wp = triton.next_power_of_2(width)

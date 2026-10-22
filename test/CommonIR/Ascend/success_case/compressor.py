@@ -48,6 +48,13 @@ except Exception:  # pragma: no cover
 _LARGE = 3.4028234663852886e38
 _META_BLOCK = 128
 
+# Projection tiling.  Hoisted out of run() so the benchmark harness can sweep
+# them (``--new-const _PROJ_BK=256``) instead of editing the kernel.  The
+# values are unchanged defaults: BM/BN/BK = 128/128/128.
+_PROJ_BM_MAX = 128
+_PROJ_BN = 128
+_PROJ_BK = 128
+
 
 # --------------------------------------------------------------------------- #
 # Kernel 0: per-token gather metadata (mirrors _cache_block_id)
@@ -350,7 +357,7 @@ def run(
     # hence the descending fallbacks.
     token_cap = max(total_tokens, 1)
     if token_cap >= 128:
-        bm = 128
+        bm = _PROJ_BM_MAX
         masked = False
         tbase = total_tokens - bm
     elif token_cap >= 64:
@@ -380,12 +387,12 @@ def run(
     )
 
     # ---- kernel 1: projection + scatter (two constexpr halves) ----
-    bn = 128
+    bn = _PROJ_BN
     while bn > 16 and proj_dim % bn:
         bn >>= 1
     if proj_dim % bn:
         raise ValueError("projection width is not tileable")
-    bk = 128
+    bk = _PROJ_BK
     while bk > 16 and hidden % bk:
         bk >>= 1
     if hidden % bk:

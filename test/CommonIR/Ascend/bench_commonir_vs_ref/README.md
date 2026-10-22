@@ -386,3 +386,110 @@ torch_npu does not expose, and its kernel's `num_stages` comes only from the
 
 **Check `## Workarounds applied` in `summary.md` before interpreting any
 `gqa` row** — its absence means no patch was applied.
+
+### Round 3 results: what was actually solved
+
+* **`sparse_attn_sharedkv` compressed branch — SOLVED by `HEAD_BLOCK` 32 → 16.**
+  `--new-const _HEAD_BLOCK=16` makes CFA *and* SCFA compile; accuracy is 1 ULP
+  of bf16 against the counterpart on all three compressed cases. The `[HEAD_BLOCK, *]`
+  tensors (`acc` is `[32,512]` fp32 = 64 KiB) are live for the whole kernel,
+  whereas the `[128,512]` PV tiles are streamed — so halving `HEAD_BLOCK` frees
+  the ~80 KiB that was missing. The `_CMP_CHUNK` probe made it *worse*
+  (208 → 280 KiB for cfa, and scfa was bit-identical before/after), which is
+  what ruled the cmp tiles out.
+* **`gqa` rewrite — compiles at `_BLOCK_M=64,_BLOCK_N=64`**, including both
+  `D=128` cases that overflowed at 128×128.
+* **`gqa` counterpart — still unbuildable.** The `num_stages` patch now
+  demonstrably applies (see `## Workarounds applied`), yet
+  `flash_fwd_kernel` keeps failing at the same `tl.range(..., num_stages=...)`
+  line, i.e. the installed `flaggems_vllm` does not expose the config objects
+  the repo copy does. `_clamp_num_stages_globally()` additionally clamps the
+  `num_stages` kwarg in every `JITFunction.run`, and `_call_ref_gqa` now falls
+  back to a **torch SDPA golden** on a compilation error, so `gqa` accuracy no
+  longer depends on that kernel building.
+
+  Note for the fallback: `is_causal=True` in `F.scaled_dot_product_attention`
+  is **upper-left** aligned; `gqa.py` is bottom-right, so the golden uses
+  `torch.nn.attention.bias.causal_lower_right(S_q, S_kv)`. `selfcheck` verifies
+  the golden against a naive bottom-right loop (including `S_q != S_kv`).
+  Fallback rows are marked in `## Workarounds applied` — **their `ref (ms)` is a
+  vendor SDPA number, not a Triton kernel**, so do not quote it as a speedup.
+
+---
+
+## 13. Performance investigation (why the rewrite is slower, and how to fix it)
+
+### The comparison was never like-for-like
+
+Both implementations include host cost in the wall time, and the counterpart's
+host cost is huge: its time is **flat at ~1.0 ms** for `causal_conv1d_fn` from
+8 to 1024 tokens, and **~1.5 ms** for `compressor` from 24 to 1024 tokens. So
+where the rewrite "wins" 2–3x on small shapes that is host overhead, and where
+it loses by 2x the gap is on-device and real.
+
+`--measure-mode npu-graph` captures the call once and times `graph.replay()`,
+giving **device-only** milliseconds. Use it for every perf claim:
+
+```bash
+python commonir_bench.py run --outdir out/graph --cases default --measure-mode npu-graph
+```
+
+If a worker reports `graph_capture_failed` it means the op synchronises the host
+inside `run()` (e.g. `causal_conv1d_fn` does `.cpu().tolist()` on
+`query_start_loc`) — that is itself a finding, and the worker falls back to loop
+timing.
+
+### Structural differences found by reading the two implementations
+
+**`compressor`** — the counterpart runs *one* persistent projection kernel for
+both halves (`_project_concat_kernel`, weight `cat(wkv_t, wgate_t)`,
+`NUM_PROGRAMS = 24` = one program per core), and derives
+`BLOCK_K = floor_pow2(min(ceil_pow2(H), (L1 - intercept) // slope))` from an
+explicit L1/L0C resource model — so K is 256–512 for `H = 4096`. The rewrite
+launches `_proj_scatter_kernel` **twice** (once per weight matrix, re-reading
+all of `x`) with `BM/BN/BK = 128/128/128` hardcoded. 32 K-steps of a
+128x128x128 dot instead of ~8 of 128x256x512 is the classic Ascend GEMM
+efficiency cliff; measured 13 TFLOP/s for the rewrite against ~52 for the
+counterpart.
+
+**`causal_conv1d_fn`** — the counterpart keeps the `width-1` history in
+registers/UB and slides it, so `x` is read **once** (`N*D`). The rewrite does
+`for j in range(WIDTH)` `tle.dsa.copy` per 32-token chunk, so `x` is read
+**WIDTH times** (`4*N*D`), in 128x32x2 = 8 KiB DMA transfers.
+
+### Tuning without editing kernels
+
+`_BLOCK_T`, `_MAX_BLOCK_D` (causal_conv1d_fn) and `_PROJ_BM_MAX`, `_PROJ_BN`,
+`_PROJ_BK` (compressor) are now module-level constants, so `--new-const` can
+sweep them; `sweep` runs a grid, times each variant, and **rejects any variant
+that changes the accuracy verdict**:
+
+```bash
+# compressor: is BK/BN the 4x?
+python commonir_bench.py sweep --outdir out/sw_comp --ops compressor \
+  --cases prefill0_b2_rank3,prefill1_hd128,prefill_small,decode3 \
+  --sweep "_PROJ_BK=128|256|512,_PROJ_BN=128|256" --measure-mode npu-graph
+
+# causal_conv1d_fn: bigger DMA transfers / more programs
+python commonir_bench.py sweep --outdir out/sw_cc1d --ops causal_conv1d_fn \
+  --cases b10_d4096_s1024_pad_fp16,b4_d4096_s249 \
+  --sweep "_BLOCK_T=32|64|128,_MAX_BLOCK_D=64|128" --measure-mode npu-graph
+
+# sparse: HEAD_BLOCK=32 fails to build, so 16 is the baseline; N_CHUNK is the
+# other (PV-tile width) knob
+python commonir_bench.py sweep --outdir out/sw_sas --ops sparse_attn_sharedkv \
+  --cases cfa_prefill_small,scfa_decode \
+  --sweep "_HEAD_BLOCK=16|32,_N_CHUNK=64|128" --measure-mode npu-graph
+```
+
+Output: `sweep.json`, `sweep.md` (full grid + *best accuracy-preserving variant
+per case*). The `ref@base` run for `compressor` also sets
+`COMPRESSOR_PRINT_RESOURCE_PLAN=1`, so `logs/*ref@base.log` records the
+counterpart's own `BLOCK_K` plan — the number the rewrite needs to match.
+
+### Still-untested structural fix
+
+The two-launch split in `compressor` cannot be reached by a constant: it needs
+`_proj_scatter_kernel` to take a `[2*proj_dim, hidden]` concatenated weight and
+emit both halves in one launch (what `_project_concat_kernel` does). If the BK/BN
+sweep does not close the 4x gap, that is the next change.

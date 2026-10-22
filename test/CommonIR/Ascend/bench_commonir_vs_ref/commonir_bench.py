@@ -133,16 +133,26 @@ def _json_load(path, default=None):
         return default
 
 
-def _art_path(outdir, op, case_id, impl):
-    return os.path.join(outdir, "artifacts", f"{op}__{case_id}__{impl}.pt")
+def _tagged(stem, tag):
+    return f"{stem}@{tag}" if tag else stem
 
 
-def _raw_path(outdir, op, case_id, impl):
-    return os.path.join(outdir, "raw", f"{op}__{case_id}__{impl}.json")
+def _art_path(outdir, op, case_id, impl, tag=""):
+    return os.path.join(
+        outdir, "artifacts", _tagged(f"{op}__{case_id}__{impl}", tag) + ".pt"
+    )
 
 
-def _log_path(outdir, op, case_id, impl):
-    return os.path.join(outdir, "logs", f"{op}__{case_id}__{impl}.log")
+def _raw_path(outdir, op, case_id, impl, tag=""):
+    return os.path.join(
+        outdir, "raw", _tagged(f"{op}__{case_id}__{impl}", tag) + ".json"
+    )
+
+
+def _log_path(outdir, op, case_id, impl, tag=""):
+    return os.path.join(
+        outdir, "logs", _tagged(f"{op}__{case_id}__{impl}", tag) + ".log"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,6 +1065,76 @@ def _patch_flash_num_stages(limit=2):
     return touched
 
 
+def _clamp_num_stages_globally(limit=2):
+    """Clamp ``num_stages`` at the point every Triton kernel consumes it.
+
+    The tuned flash-attention configs enumerate stages 2/3/4 and the splitkv
+    kernel takes 3 from a heuristic; Ascend's ``tl.range`` rejects >2.  Patching
+    the configs/heuristics objects by name proved fragile (the installed package
+    need not match the repo layout), so clamp the kwarg in ``JITFunction.run``
+    as well -- that covers every kernel regardless of how it was decorated.
+    """
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return []
+    candidates = []
+    for modname in (
+        "triton.runtime",
+        "triton.runtime.jit",
+        "triton.spec.ascend.runtime.jit",
+        "triton.backends.ascend.runtime.jit",
+    ):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        cls = getattr(mod, "JITFunction", None)
+        if cls is not None and cls not in candidates:
+            candidates.append(cls)
+    notes = []
+    for cls in candidates:
+        if getattr(cls.run, "_commonir_bench_clamped", False):
+            continue
+        orig = cls.run
+
+        def run(self, *args, _orig=orig, **kwargs):
+            v = kwargs.get("num_stages")
+            if isinstance(v, int) and v > limit:
+                kwargs["num_stages"] = limit
+            return _orig(self, *args, **kwargs)
+
+        run._commonir_bench_clamped = True
+        cls.run = run
+        notes.append(
+            f"{cls.__module__}.{cls.__name__}.run: num_stages clamped to {limit}"
+        )
+    return notes
+
+
+def _gqa_torch_golden(kw):
+    """Torch composite golden for gqa.run(), used when the counterpart will not
+    compile on this toolchain.
+
+    ``is_causal=True`` in ``F.scaled_dot_product_attention`` is **upper-left**
+    aligned, which is wrong for ``S_q != S_kv``; gqa.py (and flash-attn) are
+    bottom-right aligned, i.e. ``CausalBias.causal_lower_right``.
+    """
+    import torch
+    from torch.nn.attention.bias import causal_lower_right
+
+    q = kw["query"].transpose(1, 2)
+    k = kw["key"].transpose(1, 2)
+    v = kw["value"].transpose(1, 2)
+    seq_q, seq_kv, head_dim = q.shape[2], k.shape[2], q.shape[3]
+    scale = kw["scaleValue"] if kw["scaleValue"] > 0 else float(head_dim) ** -0.5
+    mask = causal_lower_right(seq_q, seq_kv) if kw["is_causal"] else None
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=scale, enable_gqa=True
+    )
+    return out.transpose(1, 2)
+
+
 def _call_ref_gqa(kw, meta):
     """Drop-in for gqa.run() built on the FlashAttention forward stack.
 
@@ -1069,7 +1149,7 @@ def _call_ref_gqa(kw, meta):
     """
     fn = _require("flaggems_vllm.ops.attention", "flash_attention_forward")
     _note(_patch_flash_api_cuda_literal() or "flash_api cuda literal: nothing to patch")
-    for msg in _patch_flash_num_stages(2):
+    for msg in _patch_flash_num_stages(2) + _clamp_num_stages_globally(2):
         _note(msg)
     # The split-kv dispatcher needs `get_device_properties(...).multi_processor_count`
     # (torch_npu does not expose it) and its kernel's num_stages heuristic is 3.
@@ -1080,21 +1160,32 @@ def _call_ref_gqa(kw, meta):
     v = kw["value"]
     seq_q, seq_kv, head_dim = q.shape[1], k.shape[1], q.shape[3]
     scale = kw["scaleValue"] if kw["scaleValue"] > 0 else float(head_dim) ** -0.5
-    out = fn(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        None,
-        None,
-        seq_q,
-        seq_kv,
-        0.0,
-        bool(kw["is_causal"]),
-        False,
-        scale=scale,
-        disable_splitkv=True,
-    )[0]
-    return out
+    try:
+        return fn(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            None,
+            None,
+            seq_q,
+            seq_kv,
+            0.0,
+            bool(kw["is_causal"]),
+            False,
+            scale=scale,
+            disable_splitkv=True,
+        )[0]
+    except Exception as exc:
+        if "ompil" not in type(exc).__name__ and "ompil" not in str(exc)[:400]:
+            raise
+        _note(
+            "gqa ref FALLBACK: flash_attention_forward does not compile on this "
+            f"toolchain ({type(exc).__name__}); compared against "
+            "F.scaled_dot_product_attention(causal_lower_right, enable_gqa=True) "
+            "-- a vendor SDPA golden, so the ref timing is NOT a Triton kernel"
+        )
+        meta["ref_is_torch_golden"] = True
+        return _gqa_torch_golden(kw)
 
 
 def _call_ref_kv_rmsnorm_rope_cache(kw, meta):
@@ -1492,11 +1583,11 @@ def _cmp_index_multiset(a, b):
     )
 
 
-def compare_case(op, outdir, case_id, digest_n=16):
+def compare_case(op, outdir, case_id, digest_n=16, new_tag="", ref_tag=""):
     import torch
 
-    a_path = _art_path(outdir, op, case_id, NEW_IMPL)
-    b_path = _art_path(outdir, op, case_id, REF_IMPL)
+    a_path = _art_path(outdir, op, case_id, NEW_IMPL, new_tag)
+    b_path = _art_path(outdir, op, case_id, REF_IMPL, ref_tag)
     if not (os.path.isfile(a_path) and os.path.isfile(b_path)):
         return dict(op=op, case=case_id, status="skipped", reason="missing artifact")
     try:
@@ -1630,6 +1721,52 @@ def _measure_do_bench(fn, device):
     return dict(mode="do_bench", median_ms=float(ms))
 
 
+def _measure_graph(fn, device, warmup=3, iters=20, rounds=5):
+    """Replay-only timing: strips *all* host overhead from the number.
+
+    The counterpart rebuilds its launch metadata on every call (~1.0 ms for
+    causal_conv1d_fn, ~1.5 ms for compressor), which completely hides its kernel
+    time.  Capturing the call once and timing `graph.replay()` leaves pure
+    device time, so the two implementations can be compared like for like.
+    """
+    import torch
+
+    mod = torch.npu if str(device).startswith("npu") else torch.cuda
+    graph_cls = getattr(mod, "NPUGraph", None) or getattr(mod, "CUDAGraph", None)
+    if graph_cls is None or not hasattr(mod, "graph"):
+        raise RuntimeError(f"{device} backend exposes no capture API")
+    side = mod.Stream()
+    side.wait_stream(mod.current_stream())
+    with mod.stream(side):
+        for _ in range(warmup):
+            fn()
+    mod.current_stream().wait_stream(side)
+    mod.synchronize()
+    graph = graph_cls()
+    with mod.graph(graph):
+        fn()
+    mod.synchronize()
+    samples = []
+    for _ in range(rounds):
+        mod.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            graph.replay()
+        mod.synchronize()
+        samples.append((time.perf_counter() - t0) / iters * 1e3)
+    samples.sort()
+    n = len(samples)
+    return dict(
+        mode="graph",
+        iters=iters,
+        rounds=rounds,
+        median_ms=samples[n // 2],
+        min_ms=samples[0],
+        mean_ms=sum(samples) / n,
+        samples_ms=samples,
+    )
+
+
 def worker_main(args):
     import torch
 
@@ -1638,6 +1775,10 @@ def worker_main(args):
     impl = args.impl
     device = args.device
     os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
+    tag = getattr(args, "impl_tag", "") or ""
+    if impl == REF_IMPL and op == "compressor":
+        # let the counterpart print its resource-modelled BLOCK_K into logs/
+        os.environ["COMPRESSOR_PRINT_RESOURCE_PLAN"] = "1"
 
     if device.startswith("npu"):
         # The CommonIR kernels rely on torch_npu having registered the "npu"
@@ -1649,7 +1790,7 @@ def worker_main(args):
         except Exception as exc:  # pragma: no cover - env dependent
             out = dict(op=op, case=case_id, impl=impl, device=device, status="error")
             out["error"] = f"torch_npu unavailable for device '{device}': {exc}"
-            _json_dump(_raw_path(args.outdir, op, case_id, impl), out)
+            _json_dump(_raw_path(args.outdir, op, case_id, impl, tag), out)
             return 1
 
     out = dict(op=op, case=case_id, impl=impl, device=device, status="ok")
@@ -1678,7 +1819,7 @@ def worker_main(args):
                 for k, v in artifacts.items()
             }
         if args.save_artifacts:
-            path = _art_path(args.outdir, op, case_id, impl)
+            path = _art_path(args.outdir, op, case_id, impl, tag)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(cpu_artifacts, path)
             out["artifact"] = path
@@ -1692,7 +1833,21 @@ def worker_main(args):
             out["bench"] = dict(mode="skipped")
         else:
             with torch.inference_mode():
-                if args.measure_mode == "do_bench":
+                if args.measure_mode == "npu-graph":
+                    try:
+                        bench = _measure_graph(
+                            invoke, device, warmup=args.warmup,
+                            iters=args.iters, rounds=args.rounds,
+                        )
+                    except Exception as exc:
+                        _note(f"graph capture failed ({type(exc).__name__}: {exc}); "
+                              f"fell back to loop timing")
+                        bench = _measure_loop(
+                            invoke, device, warmup=args.warmup,
+                            iters=args.iters, rounds=args.rounds,
+                        )
+                        bench["graph_capture_failed"] = str(exc)[:200]
+                elif args.measure_mode == "do_bench":
                     bench = _measure_do_bench(invoke, device)
                 else:
                     bench = _measure_loop(
@@ -1741,7 +1896,7 @@ def worker_main(args):
     # silently-unapplied patch looks exactly like a broken counterpart
     if _RUN_NOTES:
         out["notes"] = list(_RUN_NOTES)
-    _json_dump(_raw_path(args.outdir, op, case_id, impl), out)
+    _json_dump(_raw_path(args.outdir, op, case_id, impl, tag), out)
     return 0 if out["status"] == "ok" else 1
 
 
@@ -1901,6 +2056,152 @@ def produce(outdir, ops, cases, args):
                 )
     _json_dump(os.path.join(outdir, "produce.json"), results)
     return results
+
+
+def _expand_sweep(spec):
+    """'a=1|2,b=3|4' -> [{'a': 1, 'b': 3}, {'a': 1, 'b': 4}, ...]."""
+    knobs = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"--sweep expects NAME=V1|V2, got {item!r}")
+        name, raw = item.split("=", 1)
+        parsed = []
+        for v in raw.split("|"):
+            v = v.strip()
+            for conv in (int, float):
+                try:
+                    parsed.append(conv(v))
+                    break
+                except ValueError:
+                    continue
+            else:
+                parsed.append(v)
+        knobs.append((name.strip(), parsed))
+    variants = [{}]
+    for name, values in knobs:
+        variants = [dict(v, **{name: val}) for v in variants for val in values]
+    return variants
+
+
+def _spawn_worker(args, op, case_id, impl, tag, new_const=None):
+    log_path = _log_path(args.outdir, op, case_id, impl, tag)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    cmd = [
+        sys.executable, _SELF, "worker",
+        "--outdir", args.outdir, "--op", op, "--case", case_id,
+        "--impl", impl, "--impl-tag", tag,
+        "--kernel-dir", args.kernel_dir, "--device", args.device,
+        "--measure-mode", args.measure_mode,
+        "--warmup", str(args.warmup), "--iters", str(args.iters),
+        "--rounds", str(args.rounds),
+        "--sparse-metadata", args.sparse_metadata,
+    ]
+    if new_const:
+        cmd += ["--new-const", new_const]
+    if args.no_bench:
+        cmd.append("--no-bench")
+    if not args.save_artifacts:
+        cmd.append("--no-save-artifacts")
+    try:
+        with open(log_path, "w") as lf:
+            rc = subprocess.run(
+                cmd, env=_worker_env(args, op, impl), stdout=lf,
+                stderr=subprocess.STDOUT, timeout=args.timeout,
+            ).returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    raw = _json_load(_raw_path(args.outdir, op, case_id, impl, tag), {}) or {}
+    if rc == 124:
+        raw["status"] = "timeout"
+    raw.setdefault("status", "crash" if rc else "unknown")
+    return raw
+
+
+def sweep(args, ops, cases):
+    variants = _expand_sweep(args.sweep)
+    _log("=" * 78)
+    _log(f"SWEEP  {len(variants)} variant(s) x cases   measure={args.measure_mode}")
+    for i, v in enumerate(variants):
+        _log(f"  v{i}: {v}")
+    _log("=" * 78)
+    rows = []
+    for op in ops:
+        for case_id in cases[op]:
+            ref = _spawn_worker(args, op, case_id, REF_IMPL, "base")
+            ref_ms = (ref.get("bench") or {}).get("median_ms")
+            _log(f"  {op}/{case_id}: ref {ref_ms if ref_ms else ref['status']}")
+            for i, variant in enumerate(variants):
+                tag = f"v{i}"
+                const = ",".join(f"{k}={v}" for k, v in variant.items())
+                new = _spawn_worker(args, op, case_id, NEW_IMPL, tag, const)
+                n_ms = (new.get("bench") or {}).get("median_ms")
+                acc = compare_case(
+                    op, args.outdir, case_id, digest_n=8,
+                    new_tag=tag, ref_tag="base",
+                )
+                checks = acc.get("checks", [])
+                max_err = max(
+                    [c.get("max_abs_err", 0.0) for c in checks if "max_abs_err" in c],
+                    default=None,
+                )
+                rows.append(dict(
+                    op=op, case=case_id, variant=tag, new_const=const,
+                    accuracy=acc.get("status", "n/a"),
+                    max_abs_err=max_err,
+                    new_ms=n_ms, ref_ms=ref_ms,
+                    speedup=(ref_ms / n_ms) if (n_ms and ref_ms) else None,
+                    new_status=new["status"], ref_status=ref["status"],
+                    bench_mode=(new.get("bench") or {}).get("mode"),
+                    graph_capture_failed=(new.get("bench") or {}).get(
+                        "graph_capture_failed"),
+                    notes=new.get("notes"),
+                ))
+                mark = "ok " if acc.get("status") == "ok" else "BAD"
+                _log(
+                    f"    {tag} {const:<34} {mark} "
+                    f"new={n_ms if n_ms else '-'} ms  ref={ref_ms if ref_ms else '-'} ms"
+                )
+                if not args.keep_variant_artifacts:
+                    for impl, t in ((NEW_IMPL, tag), (REF_IMPL, "base")):
+                        try:
+                            os.remove(_art_path(args.outdir, op, case_id, impl, t))
+                        except OSError:
+                            pass
+    _json_dump(os.path.join(args.outdir, "sweep.json"), rows)
+    md = ["# Sweep", "", f"`--sweep {args.sweep}`  measure={args.measure_mode}", ""]
+    md.append("| op | case | variant | const | acc | max_abs_err | new (ms) | ref (ms) | ref/new |")
+    md.append("|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        f = lambda v, sp="{:.3f}": sp.format(v) if isinstance(v, (int, float)) else "-"
+        md.append("| {op} | {case} | {variant} | `{new_const}` | {acc} | {err} | {n} | {r} | {s} |".format(
+            op=r["op"], case=r["case"], variant=r["variant"], new_const=r["new_const"],
+            acc=r["accuracy"], err=f(r["max_abs_err"], "{:.3g}"), n=f(r["new_ms"]),
+            r=f(r["ref_ms"]), s=f(r["speedup"], "{:.2f}x")))
+    # best accuracy-preserving variant per case
+    md += ["", "## Best accuracy-preserving variant per case", ""]
+    md.append("| op | case | best variant | const | new (ms) | ref (ms) | ref/new |")
+    md.append("|---|---|---|---|---|---|---|")
+    for op in ops:
+        for case_id in cases[op]:
+            good = [r for r in rows
+                    if r["op"] == op and r["case"] == case_id
+                    and r["accuracy"] == "ok" and r["new_ms"]]
+            if not good:
+                md.append(f"| {op} | {case_id} | - | no passing variant | - | - | - |")
+                continue
+            b = min(good, key=lambda r: r["new_ms"])
+            f = lambda v, sp="{:.3f}": sp.format(v) if isinstance(v, (int, float)) else "-"
+            md.append("| {op} | {case} | {v} | `{c}` | {n} | {r} | {s} |".format(
+                op=op, case=case_id, v=b["variant"], c=b["new_const"],
+                n=f(b["new_ms"]), r=f(b["ref_ms"]), s=f(b["speedup"], "{:.2f}x")))
+    path = os.path.join(args.outdir, "sweep.md")
+    with open(path, "w") as fh:
+        fh.write("\n".join(md) + "\n")
+    _log(f"  -> {path}")
+    return rows
 
 
 def compare(outdir, ops, cases, digest_n=16):
@@ -2251,6 +2552,43 @@ def selfcheck(outdir=None):
         failures += [] if ok else [f"{op}: collector broken ({detail})"]
         print(f"  {'PASS' if ok else 'FAIL'}  {op:<24} collector -> {detail}")
 
+    # the gqa torch fallback golden must agree with a naive bottom-right loop
+    def _naive_gqa(q, k, v, scale, causal):
+        B, S, Hq, D = q.shape
+        Skv, Hkv = k.shape[1], k.shape[2]
+        g = Hq // Hkv
+        o = torch.zeros_like(q, dtype=torch.float32)
+        for b in range(B):
+            for h in range(Hq):
+                kh = h // g
+                s = (q[b, :, h].float() @ k[b, :, kh].float().T) * scale
+                if causal:
+                    i = torch.arange(S)[:, None]
+                    j = torch.arange(Skv)[None, :]
+                    s = s.masked_fill(j > i + (Skv - S), float("-inf"))
+                o[b, :, h] = torch.softmax(s, -1) @ v[b, :, kh].float()
+        return o
+
+    for (S, Skv, Hq, Hkv, D, causal) in ((32, 32, 8, 4, 16, True),
+                                         (16, 48, 8, 2, 16, True),
+                                         (16, 16, 4, 1, 16, False)):
+        q = torch.randn(1, S, Hq, D, dtype=torch.bfloat16)
+        k = torch.randn(1, Skv, Hkv, D, dtype=torch.bfloat16)
+        v = torch.randn(1, Skv, Hkv, D, dtype=torch.bfloat16)
+        scale = D ** -0.5
+        kw = dict(query=q, key=k, value=v, scaleValue=-1.0, is_causal=causal)
+        try:
+            got = _gqa_torch_golden(kw).float()
+            ref = _naive_gqa(q, k, v, scale, causal)
+            delta = float((got - ref).abs().max())
+            ok = delta < 0.02
+            detail = f"S{S}x{Skv} causal={causal} max|d|={delta:.4f}"
+        except Exception as exc:
+            ok = False
+            detail = f"{type(exc).__name__}: {exc}"
+        failures += [] if ok else [f"gqa golden disagrees with naive: {detail}"]
+        print(f"  {'PASS' if ok else 'FAIL'}  {'gqa torch golden':<24} -> {detail}")
+
     print()
     if failures:
         for f in failures:
@@ -2520,7 +2858,9 @@ def _add_produce_args(p):
         help="MLIR_ENABLE_DUMP=<PASS> (1 = all passes); very verbose, goes to logs/",
     )
     p.add_argument("--timeout", type=int, default=3600)
-    p.add_argument("--measure-mode", choices=("loop", "do_bench"), default="loop")
+    p.add_argument(
+        "--measure-mode", choices=("loop", "do_bench", "npu-graph"), default="loop"
+    )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=5)
@@ -2612,6 +2952,27 @@ def main(argv=None):
     p_list = sub.add_parser("list", help="print the op/case registry and exit")
     _add_common(p_list)
 
+    p_sw = sub.add_parser(
+        "sweep",
+        help="time the CommonIR kernel over a grid of --new-const values, "
+        "accuracy-checked against the counterpart",
+    )
+    _add_common(p_sw)
+    _add_produce_args(p_sw)
+    _add_artifact_arg(p_sw)
+    p_sw.add_argument(
+        "--sweep",
+        required=True,
+        metavar="NAME=V1|V2,...",
+        help="comma separated knobs, '|' separated values: "
+        "'_PROJ_BK=128|256|512,_PROJ_BN=128|256'",
+    )
+    p_sw.add_argument(
+        "--keep-variant-artifacts",
+        action="store_true",
+        help="keep every variant's .pt (default: delete after comparing)",
+    )
+
     p_chk = sub.add_parser(
         "selfcheck", help="validate this harness itself (no NPU required)"
     )
@@ -2624,6 +2985,9 @@ def main(argv=None):
     p_w.add_argument("--op", required=True, choices=list(OP_ORDER))
     p_w.add_argument("--case", required=True)
     p_w.add_argument("--impl", required=True, choices=list(IMPLS))
+    p_w.add_argument(
+        "--impl-tag", default="", help="suffix for raw/, logs/, artifacts/ (sweeps)"
+    )
 
     args = ap.parse_args(argv)
 
@@ -2678,6 +3042,10 @@ def main(argv=None):
 
     if args.cmd == "produce":
         produce(args.outdir, ops, cases, args)
+        return 0
+
+    if args.cmd == "sweep":
+        sweep(args, ops, cases)
         return 0
 
     if args.cmd == "compare":
