@@ -640,3 +640,49 @@ rewrite fuses a data-dependent scatter store into the matmul
 dense `state_proj` workspace and scatters separately, and it runs 256 one-tile
 programs against the counterpart's 24 persistent ones. Splitting the scatter out
 is the next change, and it needs its own validation round.
+
+### Round 7: the `_BODY_HALO` bugs (both mine) and the compressor confirmation
+
+**`compressor`: the new default is confirmed end-to-end** (`out/after_comp`,
+`--measure-mode npu-graph`, all five cases `max_abs_err = 0`):
+
+| case | before (graph) | after (graph) |
+|---|---|---|
+| `prefill0_b2_rank3` | 5.179 | **3.547 (−31.5%)** |
+| `prefill1_hd128` | 2.045 | **1.666 (−18.5%)** |
+| `prefill_small` | 0.744 | 0.722 |
+| `decode3` | 0.133 | 0.123 |
+| `decode5_c128` | 0.088 | 0.082 |
+
+That run also shows `mode!` in every ratio, because the counterpart cannot be
+graph-captured — so `produce` now applies the same reconciliation `sweep` does:
+if one side of a case was captured and the other was not, the capturable side is
+re-measured in `loop` mode. Plain `run --measure-mode npu-graph` therefore
+produces same-kind numbers for every op, instead of ratios that mix device-only
+with host+device.
+
+**`_BODY_HALO` failed on its first attempt, in two ways, both my bugs:**
+
+1. `ub overflow, requires 1703936 bits while 1572864 available` — I converted the
+   whole `[BLOCK_D, 2*BLOCK_T]` strip to fp32 (64 KiB) instead of extracting the
+   `[BLOCK_D, BLOCK_T]` window first. Fixed: extract in the native dtype, then
+   widen. Also means the halo path wants `_BLOCK_T=32`, not 64.
+2. `aivec error / mte error` — a **runtime** vector-core fault on the 4096-token
+   case (it compiled, then read out of range): `nhalo =
+   (be - bs - (2*BLOCK_T - H)) // BLOCK_T + 1` uses Triton's `//`, which
+   **truncates toward zero** unlike Python's floor, so a negative numerator gave
+   `nhalo = 1` and a strip far past the end of the part. Fixed with an explicit
+   `tl.where(room >= 0, ...)`. Emulating C-style division over 1–8 `BLOCK_T`
+   spans, the old formula was wrong in 46 of the sampled cases (strips up to 25
+   tokens past the part); the new one never is.
+
+Both are fixed and re-verified locally (bounds, coverage, bit-identical
+accumulation order, and the `nhalo` arithmetic under truncating division), but
+**`_BODY_HALO` still defaults to 0** — it needs one clean NPU run before it can
+be the default. Run it with `_BLOCK_T=32`:
+
+```bash
+python commonir_bench.py sweep --outdir out/halo2 --ops causal_conv1d_fn \
+  --cases b4_d4096_s249,b10_d4096_s1024_pad_fp16,b10_d4096_s4096_pad_fp16 \
+  --sweep "_BODY_HALO=1,_BLOCK_T=32" --measure-mode host-split
+```

@@ -210,7 +210,12 @@ def _cc1d_kernel(
             # bounds, followed by the unchanged per-tap loop for the rest.
             tail_lo = 0
             if BODY_HALO and H > 0:
-                nhalo = (be - bs - (2 * BLOCK_T - H)) // BLOCK_T + 1
+                room = be - bs - (2 * BLOCK_T - H)
+                # NB: Triton's ``//`` truncates toward zero (C semantics),
+                # unlike Python's floor, so a negative ``room`` would yield 1
+                # here and read a strip past the end of the part -- that is a
+                # vector-core fault at runtime, not a compile error.
+                nhalo = tl.where(room >= 0, room // BLOCK_T + 1, 0)
                 nhalo = tl.maximum(tl.minimum(nhalo, nch), 0)
                 for m in range(0, nhalo):
                     c = bs + m * BLOCK_T
@@ -223,10 +228,11 @@ def _cc1d_kernel(
                     tle.dsa.copy(
                         x_ptr + xd + (start + c - H + sst)[None, :] * xs1,
                         sbuf, [BLOCK_D, 2 * BLOCK_T])
-                    strip = tle.dsa.to_tensor(sbuf).to(tl.float32)
+                    strip = tle.dsa.to_tensor(sbuf)
                     for j in range(0, WIDTH):
                         xv = tle.dsa.extract_slice(
-                            strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1])
+                            strip, [0, j], [BLOCK_D, BLOCK_T], [1, 1]
+                        ).to(tl.float32)
                         wj = tl.reshape(
                             tle.dsa.extract_slice(
                                 wt2, [j, 0], [1, BLOCK_D], [BLOCK_D, 1]),
@@ -302,7 +308,10 @@ _HEAD_DSA_AVG_LIMIT = 256.0
 # which is the whole 3.45x device gap.  With _BODY_HALO=1 the taps of a chunk
 # are cut from a single loaded strip, halving x traffic (2*BLOCK_T tokens are
 # loaded per BLOCK_T outputs; the strip must stay power-of-two because
-# tl.arange has no other size).
+# tl.arange has no other size).  UB: the strip is [BLOCK_D, 2*BLOCK_T] in the
+# input dtype plus one [BLOCK_D, BLOCK_T] fp32 window and the accumulator, so
+# use it with BLOCK_T=32 (BLOCK_T=64 overflows UB once the tail loop's xbuf is
+# also resident).
 _BODY_HALO = 0
 
 

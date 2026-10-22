@@ -2032,6 +2032,7 @@ def produce(outdir, ops, cases, args):
     _log(f"PRODUCE  device={args.device}  outdir={outdir}")
     _log("=" * 78)
     results = []
+    _case_rows = {}
     for op in ops:
         for case_id in cases[op]:
             for impl in IMPLS:
@@ -2096,6 +2097,7 @@ def produce(outdir, ops, cases, args):
                 _log(f"       -> {status:<9} {lat_s}  ({dt:6.1f}s wall)  log={log_path}")
                 if status == "error":
                     _log(f"       !! {raw.get('error')}")
+                _case_rows.setdefault((op, case_id), {})[impl] = len(results)
                 results.append(
                     dict(
                         op=op,
@@ -2116,8 +2118,74 @@ def produce(outdir, ops, cases, args):
                         log=os.path.relpath(log_path, outdir),
                     )
                 )
+    _reconcile_modes(args, outdir, results, _case_rows)
     _json_dump(os.path.join(outdir, "produce.json"), results)
     return results
+
+
+def _respawn_single(args, op, case_id, impl):
+    """Re-run one (op, case, impl) worker with the current args."""
+    log_path = _log_path(args.outdir, op, case_id, impl)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    cmd = [
+        sys.executable, _SELF, "worker",
+        "--outdir", args.outdir, "--op", op, "--case", case_id, "--impl", impl,
+        "--kernel-dir", args.kernel_dir, "--device", args.device,
+        "--measure-mode", args.measure_mode,
+        "--warmup", str(args.warmup), "--iters", str(args.iters),
+        "--rounds", str(args.rounds),
+        "--sparse-metadata", args.sparse_metadata,
+    ]
+    if getattr(args, "new_const", None):
+        cmd += ["--new-const", args.new_const]
+    if args.no_bench:
+        cmd.append("--no-bench")
+    if not args.save_artifacts:
+        cmd.append("--no-save-artifacts")
+    try:
+        with open(log_path, "w") as lf:
+            subprocess.run(
+                cmd, env=_worker_env(args, op, impl), stdout=lf,
+                stderr=subprocess.STDOUT, timeout=args.timeout,
+            )
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _reconcile_modes(args, outdir, results, case_rows):
+    """A ratio across 'device-only' and 'host+device' is meaningless.
+
+    When one side of a case cannot be graph-captured (most counterparts sync
+    the host inside the call), re-measure the capturable side in loop mode so
+    both numbers are the same kind of number.
+    """
+    if getattr(args, "measure_mode", None) != "npu-graph":
+        return
+    for (op, case_id), rows in case_rows.items():
+        modes = {impl: results[i].get("measure_mode") for impl, i in rows.items()}
+        if len(set(modes.values())) < 2:
+            continue
+        for impl, idx in rows.items():
+            if modes[impl] != "graph":
+                continue
+            _log(f"  {op}/{case_id}: {impl} captured, other side did not "
+                 f"-> re-measuring {impl} in loop mode")
+            keep = args.measure_mode
+            args.measure_mode = "loop"
+            _respawn_single(args, op, case_id, impl)
+            args.measure_mode = keep
+            raw = _json_load(_raw_path(outdir, op, case_id, impl), {}) or {}
+            bench = raw.get("bench") or {}
+            row = results[idx]
+            for key, val in (
+                ("median_ms", bench.get("median_ms")),
+                ("min_ms", bench.get("min_ms")),
+                ("measure_mode", bench.get("mode")),
+                ("host_ms", bench.get("host_ms")),
+                ("device_ms", bench.get("device_ms")),
+            ):
+                row[key] = val
+            row["status"] = raw.get("status", row["status"])
 
 
 def _expand_sweep(spec):
