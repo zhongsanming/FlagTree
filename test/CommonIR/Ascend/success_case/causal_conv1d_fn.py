@@ -250,6 +250,10 @@ _TORCH_DTYPE = {
 # (``--new-const _BLOCK_T=128``) without editing the kernel.  Defaults unchanged.
 _MAX_BLOCK_D = 128
 _BLOCK_T = 32
+# The per-column (DSA) head is only used while the average sequence is shorter
+# than this; set it to 0 to force the masked single-tile head, or to a huge
+# value to force the column head.  Used to attribute the head path's cost.
+_HEAD_DSA_AVG_LIMIT = 256.0
 
 
 def _pick_block_d(dim):
@@ -315,7 +319,7 @@ def run(
     # The per-column head pays off while the boundary columns are a large share
     # of the work, i.e. for short sequences; on long ones its extra code makes
     # the bulk body slower, so the masked head is kept there.
-    head_dsa = head_ok and (total_len / max(1, nseq)) < 256.0
+    head_dsa = head_ok and (total_len / max(1, nseq)) < _HEAD_DSA_AVG_LIMIT
     dsa_ok = (width == wp) and dim_whole
     minspan = hh + block_t if dsa_ok else (1 << 30)
     nsplit = 1

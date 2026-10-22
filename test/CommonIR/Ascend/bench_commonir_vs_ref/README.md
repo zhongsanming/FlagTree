@@ -538,3 +538,50 @@ python commonir_bench.py run --outdir out/hspl --ops causal_conv1d_fn \
 * `~62 µs` is the graph-replay floor on this box (`sparse/swa_decode` and
   `gqa/b1_s128` both land on it), so sub-0.1 ms graph numbers are not
   comparable; use loop or host-split there.
+
+### Round 5: host/device attribution and the tile ceiling
+
+**`causal_conv1d_fn` — host is ruled out; the gap is device, and it is
+size-dependent.** `--measure-mode host-split` (stubs every `JITFunction.run`):
+
+| case | impl | total | host | device |
+|---|---|---|---|---|
+| `b10_d4096_s1024_pad_fp16` | new | 2.096 | 0.242 | **1.854** |
+| `b10_d4096_s1024_pad_fp16` | ref | 1.018 | 0.383 | **0.635** |
+| `b4_d4096_s249` | new | 1.084 | 0.241 | **0.843** |
+| `b4_d4096_s249` | ref | 1.003 | 0.387 | **0.616** |
+
+The rewrite's host cost is *lower* than the counterpart's (0.24 vs 0.38 ms), so
+the two `.cpu().tolist()` calls are not the problem. The ref's device time is
+essentially **flat** (0.616 → 0.635 for 4.1x the tokens — its `BLOCK_M=128`
+token loop is a serial dependent chain) while the rewrite **scales**
+(0.843 → 1.854). So the rewrite loses at small token counts and would overtake
+the counterpart at larger ones; `causal_conv1d_fn/b10_d4096_s4096_pad_fp16` (in
+the `full` set) is the case that decides it.
+
+The residual device cost is most likely the **head path**: `head_dsa` is enabled
+exactly when `total_len / nseq < 256` (78 here), and it emits, per program,
+`width-1` unrolled output columns × `WIDTH` taps of `(BLOCK_D,)`-sized masked
+`tl.load`s plus `width-1` separate column stores — ~12 tiny ops per program on a
+416-program grid. That also explains why `_BLOCK_T` only bought 8%: it shrinks
+the *body* only. `_HEAD_DSA_AVG_LIMIT` is now a module constant, so this is
+directly testable (`0` forces the masked single-tile head).
+
+**`compressor` — `BN=256, BK=256` is accuracy-verified and the best variant.**
+
+| case | committed 128/128/128 | BN=256 BK=256 | ref | verdict |
+|---|---|---|---|---|
+| `prefill0_b2_rank3` | 5.234 | **3.570** (−32%) | 2.711 | 0.54x → **0.76x** |
+| `prefill1_hd128` | 2.045 | **1.622** (−21%) | 1.709 | 0.83x → **1.05x (now faster)** |
+| `prefill_small` | 0.744 | 0.809 | 1.471 | 1.82x |
+
+`max_abs_err = 0` on all three, so this change is safe to adopt.
+
+`BN=512` is **impossible**, and the reason is the L0C accumulator, not L1:
+`cc overflow, requires 2097152 bits while 1048576 bits available` — L0C is
+128 KiB, so a `[BM,BN]` fp32 accumulator caps at `BM*BN <= 32768` elements
+(128x256 exactly fills it). The width-in-one-tile variant therefore requires
+`BM=64, BN=512` (L0C exactly 128 KiB, L1 288 KiB at BK=128) — which is also the
+cleanest test of whether the remaining 1.3x on `prefill0_b2_rank3` is the
+per-tile grid (1 N-tile => no A-tile re-read, 4x fewer programs) or the fused
+data-dependent scatter.
