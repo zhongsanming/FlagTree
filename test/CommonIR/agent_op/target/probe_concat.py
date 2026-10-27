@@ -1,28 +1,36 @@
-"""Can two computed [ROWS, K] tiles be concatenated into one UB buffer?
+"""Decide how to feed two computed tiles to fold_reduce_rows, without concat.
 
-This is the single make-or-break step for wiring fold_reduce_rows into the KDA
-kernel, so it is checked on its own before any kernel is touched.
+The fused reductions need two results from one instruction:
 
-Why it is needed: the two fused reductions both need two tiles *adjacent* in UB
+    (s_q, s_k)          <- rows of  [ q*q ; k*k ]
+    (v_corr, out_part)  <- rows of  [ state*k ; state*q ]
 
-    (s_q, s_k)            = fold_reduce over [ q*q ; k*k ]        (2 rows)
-    (v_corr, out_part)    = fold_reduce over [ state*k ; state*q ] (2*BV rows)
+The obvious way to build such a tile is a concatenation, and TLE has
+`to_tensor` + `insert_slice` for that -- but it faults on device ("The address for
+the VEC instruction to read/write UB is out of bounds"), so that route is out as
+written (stage B below, kept for the record).
 
-because the op reads `repeat` rows from one buffer.  Plain triton cannot build
-that tile: there is no concat, tl.join/tl.split do not lower on this backend
-(6.6), and the products are computed values rather than loads.  TLE has
-`tle.dsa.to_tensor` + `tle.dsa.insert_slice`, which is presumably how it is meant
-to be done -- but "presumably" is what has cost us rounds before, so:
+There is a route that needs no concat at all, because both halves multiply the
+*same* tile:
 
-    stage 1  concat only:   does insert_slice place the tiles where we expect?
-    stage 2  concat + raw:  does fold_reduce_rows accept that tensor directly
-                            (the tutorial passes tensors to raw, not buffers)?
+    row    = arange(0, 2*BV)
+    x2     = load(X + (row % BV)[:, None] * K + arange(K))   # tile, duplicated
+    w2     = where(row[:, None] < BV, k[None, :], q[None, :])
+    prod   = x2 * w2                                         # [2*BV, K], computed
 
-Stage 2 failing while stage 1 passes means the argument plumbing needs
-to_buffer/to_tensor around the raw call; stage 1 failing means insert_slice is
-not the tool and the whole wiring idea needs rethinking.
+`row % BV` duplicates the tile, `where` picks the operand per half, and the result
+is an ordinary computed tensor -- no insertion into a buffer, nothing to stride
+wrongly. For the norms the same pattern gives [q*q ; k*k] with two rows.
+
+So the only open question is whether a *computed* tensor can be handed to raw()
+directly. The repo already does that for an input (sort_1d_pack takes
+`tmp = tl.zeros([TMP_SIZE])`), but not for something this large, so:
+
+    stage A  no-concat, computed tensor -> raw   (the route we would use)
+    stage B  insert_slice                (known to fault; run with --with-b)
 
     python3 probe_concat.py
+    python3 probe_concat.py --bv 32 --with-b
 """
 
 from __future__ import annotations
@@ -43,9 +51,35 @@ import triton.experimental.tle as tle
 
 
 @triton.jit
-def _concat_kernel(A, B, OUT, ROWS: tl.constexpr, ROWS2: tl.constexpr,
-                   K: tl.constexpr):
-    """Concatenate two [ROWS, K] tiles along the row axis through UB."""
+def _modular_kernel(X, K1, Q1, OUT, BV: tl.constexpr, BV2: tl.constexpr,
+                    K: tl.constexpr, HALF: tl.constexpr,
+                    ROW_BLK: tl.constexpr):
+    """[x*k ; x*q] built by duplicating x, then one fold_reduce_rows.
+
+    X stands in for a state tile; K1 and Q1 for the two per-token vectors.  The
+    tile is duplicated with `row % BV` so no concatenation is needed, and the
+    operand is selected per half with `where`.
+    """
+    row = tl.arange(0, BV2)
+    cols = tl.arange(0, K)
+
+    x2 = tl.load(X + (row % BV)[:, None] * K + cols[None, :])
+    k1 = tl.load(K1 + cols)
+    q1 = tl.load(Q1 + cols)
+    w2 = tl.where(row[:, None] < BV, k1[None, :], q1[None, :])
+    prod = x2 * w2                                   # [BV2, K], computed
+
+    dst_t = tl.zeros([BV2], dtype=tl.float32)
+    tmp_t = tl.zeros([BV2 * HALF], dtype=tl.float32)
+    dst_t, tmp_t = tle.dsa.ascend.raw(
+        "fold_reduce_rows", prod, BV2, HALF, ROW_BLK, out=[dst_t, tmp_t])
+    tl.store(OUT + row, dst_t)
+
+
+@triton.jit
+def _insert_slice_kernel(A, B, OUT, ROWS: tl.constexpr, ROWS2: tl.constexpr,
+                         K: tl.constexpr):
+    """The concatenation route.  Faults on device; kept to document that."""
     idx = tl.arange(0, ROWS)[:, None] * K + tl.arange(0, K)[None, :]
     a = tl.load(A + idx)
     b = tl.load(B + idx)
@@ -60,105 +94,79 @@ def _concat_kernel(A, B, OUT, ROWS: tl.constexpr, ROWS2: tl.constexpr,
     tl.store(OUT + oidx, t)
 
 
-@triton.jit
-def _concat_reduce_kernel(A, B, OUT, ROWS: tl.constexpr, ROWS2: tl.constexpr,
-                          K: tl.constexpr, HALF: tl.constexpr,
-                          ROW_BLK: tl.constexpr):
-    """Same concatenation, then one fold_reduce_rows over all ROWS2 rows."""
-    idx = tl.arange(0, ROWS)[:, None] * K + tl.arange(0, K)[None, :]
-    a = tl.load(A + idx)
-    b = tl.load(B + idx)
-
-    full = tle.dsa.alloc([ROWS2, K], dtype=tl.float32,
-                         mem_addr_space=tle.dsa.ascend.UB)
-    t = tle.dsa.to_tensor(full)
-    t = tle.dsa.insert_slice(t, a, [0, 0], [ROWS, K], [K, 1])
-    t = tle.dsa.insert_slice(t, b, [ROWS, 0], [ROWS, K], [K, 1])
-
-    dst_t = tl.zeros([ROWS2], dtype=tl.float32)
-    tmp_t = tl.zeros([ROWS2 * HALF], dtype=tl.float32)
-    dst_t, tmp_t = tle.dsa.ascend.raw(
-        "fold_reduce_rows", t, ROWS2, HALF, ROW_BLK, out=[dst_t, tmp_t])
-    tl.store(OUT + tl.arange(0, ROWS2), dst_t)
-
-
-def _stage(name, fn):
+def _report(name, fn, check):
     try:
         fn()
         torch.npu.synchronize()
-        return True, ""
-    except Exception as exc:  # a compile or device error is the result here
+    except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}".rstrip()
         lines = detail.splitlines()
         print(f"  {name}: FAIL  {lines[0][:100]}")
-        for line in lines[1:24]:
-            print(f"    {line}")
-        return False, detail
+        for line in lines[1:16]:
+            print(f"    {line.strip()[:110]}")
+        return False
+    rel = check()
+    print(f"  {name}: PASS  rel {rel:.2e}")
+    return rel < 1e-5
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="npu:0")
-    p.add_argument("--rows", type=int, default=16)
+    p.add_argument("--bv", type=int, default=16)
     p.add_argument("--dim", type=int, default=128)
+    p.add_argument("--with-b", action="store_true",
+                   help="also run the insert_slice route (known to fault)")
     args = p.parse_args()
 
     if not _HAS_NPU:
         raise SystemExit("this needs an NPU (torch_npu)")
     torch.npu.set_device(args.device)
 
-    ROWS, K = args.rows, args.dim
-    ROWS2 = 2 * ROWS
-    HALF = K // 2
-    row_blk = K * 4 // 32          # 32 B datablocks per row of K fp32
+    BV, K = args.bv, args.dim
+    BV2, HALF = 2 * BV, K // 2
+    row_blk = K * 4 // 32
     g = torch.Generator(device="cpu").manual_seed(7)
-    a = torch.randn(ROWS, K, generator=g).to(args.device)
-    b = torch.randn(ROWS, K, generator=g).to(args.device)
-    cat = torch.cat([a, b], 0)
+    x = torch.randn(BV, K, generator=g).to(args.device)
+    k1 = torch.randn(K, generator=g).to(args.device)
+    q1 = torch.randn(K, generator=g).to(args.device)
+    out = torch.zeros(BV2, device=args.device)
 
-    print(f"device={args.device}  ROWS={ROWS}  K={K}  -> concat [{ROWS2}, {K}]")
+    print(f"device={args.device}  BV={BV}  K={K}  HALF={HALF}")
 
-    # --- stage 1: concatenation alone -------------------------------------
-    out1 = torch.zeros(ROWS2, K, device=args.device)
-    ok1, _ = _stage("stage 1 concat",
-                    lambda: _concat_kernel[(1,)](a, b, out1, ROWS=ROWS,
-                                                 ROWS2=ROWS2, K=K))
-    if ok1:
-        err = (out1 - cat).abs().max().item()
-        print(f"  stage 1 concat: PASS  max|err| {err:.2e}"
-              f"  {'(exact)' if err == 0 else '(MISMATCH)'}")
-        ok1 = err == 0
+    ref = torch.cat([(x * k1).sum(1), (x * q1).sum(1)])
 
-    # --- stage 2: concatenation feeding the custom op ----------------------
-    ok2 = False
-    if ok1:
-        out2 = torch.zeros(ROWS2, device=args.device)
-        ok2, _ = _stage("stage 2 concat+raw",
-                        lambda: _concat_reduce_kernel[(1,)](
-                            a, b, out2, ROWS=ROWS, ROWS2=ROWS2, K=K,
-                            HALF=HALF, ROW_BLK=row_blk))
-        if ok2:
-            ref = (cat[:, :HALF] + cat[:, HALF:]).sum(1)
-            rel = (out2 - ref).abs().max().item() / ref.abs().max().item()
-            print(f"  stage 2 concat+raw: PASS  rel {rel:.2e}")
-            ok2 = rel < 1e-5
+    ok_a = _report(
+        "stage A no-concat -> raw",
+        lambda: _modular_kernel[(1,)](x, k1, q1, out, BV=BV, BV2=BV2, K=K,
+                                      HALF=HALF, ROW_BLK=row_blk),
+        lambda: (out - ref).abs().max().item() / ref.abs().max().item())
+
+    ok_b = None
+    if args.with_b:
+        a = torch.randn(BV, K, generator=g).to(args.device)
+        b = torch.randn(BV, K, generator=g).to(args.device)
+        out_b = torch.zeros(BV2, K, device=args.device)
+        cat = torch.cat([a, b], 0)
+        ok_b = _report(
+            "stage B insert_slice concat",
+            lambda: _insert_slice_kernel[(1,)](a, b, out_b, ROWS=BV,
+                                               ROWS2=BV2, K=K),
+            lambda: (out_b - cat).abs().max().item() / cat.abs().max().item())
 
     print()
-    print("verdict:")
-    if ok1 and ok2:
-        print("  both stages pass -> the wiring is feasible as planned: build")
-        print("  [.. ; ..] with insert_slice, hand the tensor straight to raw,")
-        print("  and the KDA kernel can fuse its reductions with no extra copies.")
-    elif ok1:
-        print("  concat works, raw rejects the tensor -> wrap it with")
-        print("  tle.dsa.to_buffer(.., UB) then tle.dsa.to_tensor(..) around the")
-        print("  call; still feasible, one more API step.")
+    if ok_a:
+        print("verdict: a computed tensor can go straight into raw, so the fused")
+        print("  reductions are wireable with NO buffer construction at all:")
+        print("  duplicate the tile with `row % BV`, pick the operand with `where`,")
+        print("  reduce all 2*BV rows in one call. Expected ~1.35x in the kernel.")
     else:
-        print("  insert_slice is not the tool (offsets/sizes/strides or dtype).")
-        print("  Wiring would need another way to get two computed tiles")
-        print("  adjacent in UB, i.e. the wiring plan is not viable as written.")
-    raise SystemExit(0 if (ok1 and ok2) else 1)
+        print("verdict: neither route feeds two tiles to the op. Wiring the fused")
+        print("  reduce would need a buffer-write mechanism we do not have, so")
+        print("  this line of work stops here: ship v1 (1.04-1.065x over v0) and")
+        print("  keep the analysis. The reduce-cost model still stands.")
+    raise SystemExit(0 if ok_a else 1)
 
 
 if __name__ == "__main__":
