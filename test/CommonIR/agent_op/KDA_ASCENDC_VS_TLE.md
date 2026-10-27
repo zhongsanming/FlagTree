@@ -438,6 +438,46 @@ python3 probe_dot.py --shapes 128 --dtypes bf16  # 先只要一个答案，几�
 * **一个 case 崩了会毒死整个进程。** 崩之后所有 tensor 回来都是 0，`rel.err` 就变成 0/0，
   于是后面八行全是 `ZeroDivisionError`——看起来像“全都不支持”，其实一个字都没测到。
   所以现在**每个 case 一个子进程**，一次崩只损失一行。
+* **子进程不能走 `python -c`。** `@triton.jit` 要 `inspect.getsourcelines()`，而 `-c` 的
+  `__file__` 是 `"<string>"`，直接报 "@jit functions should be defined in a Python file"。
+  现在子进程是**重新调用本文件**。
+
+#### 第一轮结果（bf16/fp16/fp32 × 64³/128³/256³）
+
+九行全部 `ok`：
+
+| case | ms | rel.err | per_dot |
+|---|---|---|---|
+| bf16→fp32 64³ | 0.1472 | 1.23e-07 | 0.147 µs |
+| bf16→fp32 128³ | 0.1369 | 2.35e-07 | 0.137 µs |
+| bf16→fp32 256³ | 0.1466 | 2.74e-07 | 0.147 µs |
+| fp32→fp32 64/128/256³ | ~0.14 | **0.00e+00** | — |
+
+两条结论：
+
+1. **cube 门开了。** bf16 输入 + fp32 累加器可用且正确：`rel.err ≈ 2.4e-7`，恰好是
+   “对 bf16 舍入后的输入做 fp32 累加”的舍入水平（参考值用的是 `a.float() @ b.float()`，
+   即 bf16 值的精确乘积）。fp32 输入也能跑，且与 torch 完全一致。
+   所以 chunked 的算力与精度前提都成立，三角求解既可留 fp32 也可 bf16+fp32。
+2. **但这组数字量的是主机下限，不是矩阵乘。** 三个尺寸全是 ~0.14 ms，TFLOP/s 只有
+   0.004/0.031/0.229 —— 0.14 ms 是 python + dispatch + launch 的地板（与 KDA 里拟合出的
+   ~0.3 ms 启动开销同一个量级）。所以 256³ 的**内核本身 ≤ 6.6 µs → ≥ 5.1 TFLOP/s**，
+   这只是个下界。
+
+要拿到真正需要的两个数（chunked 该选多大的 C），得用 `--repeat`：
+
+```bash
+python3 probe_dot.py --shapes 64,128 --dtypes bf16 --repeat 256   # 链式 dot 的每次延迟
+python3 probe_dot.py --shapes 1024,2048 --dtypes bf16             # 大 tile 的吞吐上限
+```
+
+`--repeat` 让同一个累加器被连续喂入 REPEAT 次（依赖链，不能流水），主机开销被摊薄 REPEAT 倍，
+得到的 `per_dot_us` 才是“一个 chunk 里每做一次小矩阵乘要付多少”，可以直接和
+“每 token 0.8 µs 固定 + 0.018×BV”那个预算对比。
+
+顺带一个对 KDA 本身有用的事实：**单次 launch 的主机地板就是 ~0.14 ms**。这解释了为什么
+T=1024 的 KDA 耗时（1.38 ms）里有一大块与计算无关，也意味着任何“拆成多次 launch”的
+方案（包括 AscendC 的 prepared 两段式）都要先付这么一笔。
 
 ---
 

@@ -22,6 +22,16 @@ Three things were learned building this, all of them load-bearing:
 * the tile is clamped and grid sizes asserted.  A tile larger than the shape
   yields a zero-block launch, which on this device is itself a hard abort.
 
+Measurement modes.  With `--repeat 1` a launch costs ~0.14 ms of host-side
+python/dispatch whatever the shape, so 64^3 and 256^3 both read 0.14 ms and the
+only usable number is a lower bound on throughput.  Use:
+
+    python3 probe_dot.py --shapes 64,128 --dtypes bf16 --repeat 256
+        -> chained (dependent) dots inside one launch: per-dot latency, which
+           is what a recurrence actually pays, with the host floor amortised
+    python3 probe_dot.py --shapes 1024,2048 --dtypes bf16
+        -> large tiles, one launch: achievable throughput
+
     python3 probe_dot.py                              # all dtypes, 64/128/256
     python3 probe_dot.py --shapes 128 --dtypes bf16    # one answer, seconds
     python3 probe_dot.py --shapes 64,128,256,512 --kblock 128
@@ -57,10 +67,16 @@ CASES = {
 
 
 @triton.jit
-def _dot_kernel(A, B, C, M, N, K,
+def _dot_kernel(A, B, C, M, N, K, REPEAT,
                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                 ACC: tl.constexpr):
-    """One program per (BM x BN) output tile, K walked in BK steps."""
+    """One program per (BM x BN) tile, K in BK steps, repeated REPEAT times.
+
+    REPEAT accumulates into the same accumulator, so the dots are a *dependent*
+    chain: that measures per-dot latency rather than peak throughput, and it is
+    the number a recurrence actually pays.  The host-side launch floor is
+    amortised over REPEAT, which is the whole point at these tile sizes.
+    """
     pid = tl.program_id(0)
     n_tiles_n = N // BN
     pm = pid // n_tiles_n
@@ -71,10 +87,11 @@ def _dot_kernel(A, B, C, M, N, K,
     rk = tl.arange(0, BK)
 
     acc = tl.zeros([BM, BN], tl.float32)
-    for k0 in range(0, K, BK):
-        a = tl.load(A + rm[:, None] * K + (k0 + rk)[None, :])
-        b = tl.load(B + (k0 + rk)[:, None] * N + rn[None, :])
-        acc = tl.dot(a, b, acc, out_dtype=ACC)
+    for _ in range(REPEAT):
+        for k0 in range(0, K, BK):
+            a = tl.load(A + rm[:, None] * K + (k0 + rk)[None, :])
+            b = tl.load(B + (k0 + rk)[:, None] * N + rn[None, :])
+            acc = tl.dot(a, b, acc, out_dtype=ACC)
     tl.store(C + rm[:, None] * N + rn[None, :], acc)
 
 
@@ -98,8 +115,9 @@ def run_child(args) -> int:
 
     grid = ((M // block) * (N // block),)
     assert grid[0] > 0, grid  # a zero-block launch hard-aborts the device
+    rep = max(1, args.repeat)
     run = lambda: _dot_kernel[grid](  # noqa: E731
-        a, b, c, M, N, K, BM=block, BN=block, BK=kblock, ACC=acc
+        a, b, c, M, N, K, rep, BM=block, BN=block, BK=kblock, ACC=acc
     )
 
     for _ in range(args.warmup):
@@ -113,12 +131,14 @@ def run_child(args) -> int:
         ts.append((time.perf_counter() - t0) * 1e3)
     ms = statistics.median(ts)
 
-    ref = a.float() @ b.float()
+    ref = rep * (a.float() @ b.float())
     err = (c - ref).abs().max().item()
     denom = ref.abs().max().item()
     rel = err / denom if denom > 0 else float("inf")
-    tflops = 2 * M * N * K / (ms * 1e-3) / 1e12
-    print(f"RESULT ok {ms:.4f} {tflops:.2f} {rel:.3e} block={block} kblock={kblock}")
+    tflops = 2 * M * N * K * rep / (ms * 1e-3) / 1e12
+    per_dot_us = ms * 1e3 / rep
+    print(f"RESULT ok {ms:.4f} {tflops:.2f} {rel:.3e} block={block} "
+          f"kblock={kblock} repeat={rep} per_dot_us={per_dot_us:.3f}")
     return 0
 
 
@@ -135,6 +155,7 @@ def run_case(tag: str, mnk: int, args) -> tuple:
         "--kblock", str(args.kblock),
         "--reps", str(args.reps),
         "--warmup", str(args.warmup),
+        "--repeat", str(args.repeat),
     ]
     label = f"{tag}->fp32 {mnk:4d}^3"
     try:
@@ -169,6 +190,9 @@ def main() -> None:
                         help="BK; K is walked in steps of this")
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="chained dots inside one launch; amortises the "
+                             "~0.14 ms host floor and exposes per-dot latency")
     # internal: the parent re-invokes this file to run one case in isolation
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dtype-tag", default=None, help=argparse.SUPPRESS)
@@ -205,8 +229,11 @@ def main() -> None:
     print("  bf16->fp32 ok  : the chunked form can use the cube with a wide accumulator")
     print("  fp32->fp32 ERR : the triangular solve has to stay on the vector unit, or")
     print("                   the chunk has to be restructured to stay in bf16")
-    print("  TFLOP/s        : if 64^3/128^3 sit far below 256^3, the chunk is too small")
-    print("                   to amortise tile overhead and chunk size has to grow")
+    print("  per_dot_us     : with --repeat, the dependent-chain cost of one dot;")
+    print("                   compare against a token's budget (~0.8 us fixed + 0.018*BV)")
+    print("  TFLOP/s        : with --repeat 1 and big shapes, achievable throughput;")
+    print("                   at 64^3/128^3 the host floor dominates and the number is")
+    print("                   only a lower bound")
     print("  any ERR        : the note is the child's last stderr line; rerun that case")
     print("                   by hand (add --child --dtype-tag <t> --mnk <n>) for the")
     print("                   full device error")
