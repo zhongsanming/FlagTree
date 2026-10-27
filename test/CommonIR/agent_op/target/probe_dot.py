@@ -10,19 +10,20 @@ answers, for the shapes that form would need:
   2. is an fp32 accumulator available from bf16/fp16 inputs?
   3. what does it cost (TFLOP/s, and per-tile latency at small tiles)?
 
-Design notes, both learned the hard way:
+Three things were learned building this, all of them load-bearing:
 
-* every case runs in its own subprocess.  An aicore abort wedges the NPU for
-  the rest of the process -- the first run of this probe reported a real device
-  error for one case and then "ZeroDivisionError" for the other eight, because
-  every later tensor came back zero.  Isolating the cases costs a process
-  start each and makes one bad tile cost one row instead of the whole run.
-* the tile is clamped to the matrix and grid sizes are asserted.  A tile
-  larger than the shape silently yields a zero-block launch, which on this
-  device is itself a hard error -- that is what poisoned the first run.
+* every case runs in its own subprocess, re-invoking *this file*.  An aicore
+  abort wedges the NPU for the rest of the process: the first run reported one
+  real device error and then "ZeroDivisionError" for the other eight, because
+  every later tensor came back zero.
+* the child must be this file, not `python -c`: a @triton.jit kernel needs a
+  real source path, and `-c` gives `__file__ = "<string>"` ("@jit functions
+  should be defined in a Python file").
+* the tile is clamped and grid sizes asserted.  A tile larger than the shape
+  yields a zero-block launch, which on this device is itself a hard abort.
 
-    python3 probe_dot.py                        # all dtypes, 64/128/256
-    python3 probe_dot.py --shapes 128 --dtypes bf16,fp16
+    python3 probe_dot.py                              # all dtypes, 64/128/256
+    python3 probe_dot.py --shapes 128 --dtypes bf16    # one answer, seconds
     python3 probe_dot.py --shapes 64,128,256,512 --kblock 128
 """
 
@@ -35,22 +36,31 @@ import subprocess
 import sys
 import time
 
-CASES = (("bf16", "torch.bfloat16", "tl.float32"),
-         ("fp16", "torch.float16", "tl.float32"),
-         ("fp32", "torch.float32", "tl.float32"))
-
-_SRC = '''
-import statistics, time
 import torch
-import torch_npu  # noqa: F401
+
+try:  # registers the "npu" backend
+    import torch_npu  # noqa: F401
+    _HAS_NPU = True
+except ImportError:  # pragma: no cover
+    _HAS_NPU = False
+
 import triton
 import triton.language as tl
+
+# name -> (input dtype, accumulator dtype).  The chunked algorithm wants a wide
+# accumulator even from narrow inputs, so bf16->fp32 is the interesting case.
+CASES = {
+    "bf16": (torch.bfloat16, tl.float32),
+    "fp16": (torch.float16, tl.float32),
+    "fp32": (torch.float32, tl.float32),
+}
 
 
 @triton.jit
 def _dot_kernel(A, B, C, M, N, K,
                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                 ACC: tl.constexpr):
+    """One program per (BM x BN) output tile, K walked in BK steps."""
     pid = tl.program_id(0)
     n_tiles_n = N // BN
     pm = pid // n_tiles_n
@@ -68,39 +78,29 @@ def _dot_kernel(A, B, C, M, N, K,
     tl.store(C + rm[:, None] * N + rn[None, :], acc)
 
 
-def main():
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--device", default="npu:0")
-    p.add_argument("--mnk", type=int, required=True)
-    p.add_argument("--block", type=int, required=True)
-    p.add_argument("--kblock", type=int, required=True)
-    p.add_argument("--reps", type=int, required=True)
-    p.add_argument("--warmup", type=int, required=True)
-    p.add_argument("--torch-dtype", required=True)
-    p.add_argument("--acc", required=True)
-    args = p.parse_args()
-
+# ---------------------------------------------------------------------------
+# child: run exactly one case and print a single RESULT line
+# ---------------------------------------------------------------------------
+def run_child(args) -> int:
     torch.npu.set_device(args.device)
-    torch_dtype = getattr(torch, args.torch_dtype.split(".")[-1])
-    acc = getattr(tl, args.acc.split(".")[-1])
+    torch_dtype, acc = CASES[args.dtype_tag]
 
     M = N = K = args.mnk
     block = min(args.block, M, N)
     kblock = min(args.kblock, K)
-    if M % block or N % block:
-        print(f"RESULT bad-tile {block} does not divide {M}x{N}")
-        return
-    if K % kblock:
-        print(f"RESULT bad-tile {kblock} does not divide K={K}")
-        return
+    if M % block or N % block or K % kblock:
+        print(f"RESULT bad-tile block={block} kblock={kblock} for {M}x{N}x{K}")
+        return 0
+
     a = torch.randn(M, K, device=args.device, dtype=torch.float32).to(torch_dtype)
     b = torch.randn(K, N, device=args.device, dtype=torch.float32).to(torch_dtype)
     c = torch.empty(M, N, device=args.device, dtype=torch.float32)
+
     grid = ((M // block) * (N // block),)
     assert grid[0] > 0, grid  # a zero-block launch hard-aborts the device
-    run = lambda: _dot_kernel[grid](a, b, c, M, N, K, BM=block, BN=block,
-                                    BK=kblock, ACC=acc)
+    run = lambda: _dot_kernel[grid](  # noqa: E731
+        a, b, c, M, N, K, BM=block, BN=block, BK=kblock, ACC=acc
+    )
 
     for _ in range(args.warmup):
         run()
@@ -118,47 +118,43 @@ def main():
     denom = ref.abs().max().item()
     rel = err / denom if denom > 0 else float("inf")
     tflops = 2 * M * N * K / (ms * 1e-3) / 1e12
-    print(f"RESULT ok {ms:.4f} {tflops:.2f} {rel:.3e} {block} {kblock}")
+    print(f"RESULT ok {ms:.4f} {tflops:.2f} {rel:.3e} block={block} kblock={kblock}")
+    return 0
 
 
-main()
-'''
-
-
-def run_case(name: str, torch_dtype: str, acc: str, mnk: int, args) -> tuple:
-    """Run one (dtype, shape) in a child process; return a result tuple."""
+# ---------------------------------------------------------------------------
+# parent: one subprocess per case
+# ---------------------------------------------------------------------------
+def run_case(tag: str, mnk: int, args) -> tuple:
     cmd = [
-        sys.executable, "-c", _SRC,
+        sys.executable, os.path.abspath(__file__), "--child",
         "--device", args.device,
+        "--dtype-tag", tag,
         "--mnk", str(mnk),
         "--block", str(args.block),
         "--kblock", str(args.kblock),
         "--reps", str(args.reps),
         "--warmup", str(args.warmup),
-        "--torch-dtype", torch_dtype,
-        "--acc", acc,
     ]
-    env = dict(os.environ)
+    label = f"{tag}->fp32 {mnk:4d}^3"
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
-        return (f"{name}->fp32 {mnk:4d}^3", "TIMEOUT", None, None, None, "")
+        return (label, "TIMEOUT", None, None, None, "case exceeded 600 s")
     for line in proc.stdout.splitlines():
         if line.startswith("RESULT "):
             parts = line.split()
             if parts[1] == "ok":
-                return (f"{name}->fp32 {mnk:4d}^3", "ok",
-                        float(parts[2]), float(parts[3]), float(parts[4]),
-                        f"b{parts[5]} k{parts[6]}")
-            return (f"{name}->fp32 {mnk:4d}^3", "bad", None, None, None,
-                    " ".join(parts[2:]))
+                return (label, "ok", float(parts[2]), float(parts[3]),
+                        float(parts[4]), " ".join(parts[5:]))
+            return (label, "bad", None, None, None, " ".join(parts[2:]))
     note = ""
     for line in reversed((proc.stderr or "").splitlines()):
         if line.strip():
             note = line.strip()[:110]
             break
-    return (f"{name}->fp32 {mnk:4d}^3",
-            f"ERR({proc.returncode})", None, None, None, note)
+    status = f"CRASH({-proc.returncode})" if proc.returncode < 0 else f"ERR({proc.returncode})"
+    return (label, status, None, None, None, note)
 
 
 def main() -> None:
@@ -173,22 +169,35 @@ def main() -> None:
                         help="BK; K is walked in steps of this")
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
+    # internal: the parent re-invokes this file to run one case in isolation
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--dtype-tag", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--mnk", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    wanted = {d.strip() for d in args.dtypes.split(",") if d.strip()}
+    if not _HAS_NPU:
+        raise SystemExit("torch_npu is not importable; this probe needs an NPU")
+
+    if args.child:
+        raise SystemExit(run_child(args))
+
+    wanted = [d.strip() for d in args.dtypes.split(",") if d.strip()]
+    unknown = [d for d in wanted if d not in CASES]
+    if unknown:
+        raise SystemExit(f"unknown dtype {unknown}; known: {sorted(CASES)}")
     shapes = [int(x) for x in args.shapes.split(",")]
-    cases = [c for c in CASES if c[0] in wanted]
 
     print(f"device={args.device}  block={args.block}  kblock={args.kblock}  "
           f"one subprocess per case")
     print(f"{'case':>17}  {'stat':>10} {'ms':>9} {'TFLOP/s':>8} {'rel.err':>9}  note")
     for mnk in shapes:
-        for name, torch_dtype, acc in cases:
-            tag, stat, ms, tflops, rel, note = run_case(name, torch_dtype, acc, mnk, args)
+        for tag in wanted:
+            label, stat, ms, tflops, rel, note = run_case(tag, mnk, args)
             if stat == "ok":
-                print(f"{tag:>17}  {stat:>10} {ms:9.4f} {tflops:8.2f} {rel:9.2e}  {note}")
+                print(f"{label:>17}  {stat:>10} {ms:9.4f} {tflops:8.2f} "
+                      f"{rel:9.2e}  {note}", flush=True)
             else:
-                print(f"{tag:>17}  {stat:>10} {'-':>9} {'-':>8} {'-':>9}  {note}",
+                print(f"{label:>17}  {stat:>10} {'-':>9} {'-':>8} {'-':>9}  {note}",
                       flush=True)
 
     print()
@@ -198,8 +207,9 @@ def main() -> None:
     print("                   the chunk has to be restructured to stay in bf16")
     print("  TFLOP/s        : if 64^3/128^3 sit far below 256^3, the chunk is too small")
     print("                   to amortise tile overhead and chunk size has to grow")
-    print("  any ERR        : the note is the last stderr line; rerun that single case")
-    print("                   by hand to see the full device error")
+    print("  any ERR        : the note is the child's last stderr line; rerun that case")
+    print("                   by hand (add --child --dtype-tag <t> --mnk <n>) for the")
+    print("                   full device error")
 
 
 if __name__ == "__main__":
