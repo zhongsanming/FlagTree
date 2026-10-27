@@ -43,23 +43,30 @@ def _fold_reduce_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
                         FULL: tl.constexpr, ROW_BLK: tl.constexpr):
     """Grid: one program; a [ROWS, FULL] tile in, ROWS sums out.
 
-    FULL = 2*HALF is passed in rather than computed here: tl.arange and
-    tle.dsa.alloc want compile-time literals, and `2 * HALF` inside the body is
-    what Triton rejected (CompilationError at the arange, 5:47).
+    Three conventions of `tle.dsa.ascend.raw`, all learned from
+    python/tutorials/tle/custom/test_custom_ops.py:
+
+      * inputs must be *tensors*: a buffer has to go through
+        `tle.dsa.to_tensor` (passing the buffer raises
+        "Unsupported argument type <..buffer>").
+      * `out=` also takes tensors, not buffers -- the tutorial passes
+        `tl.zeros([..])` for every output and rebinds the returned values.
+      * FULL = 2*HALF is passed in rather than computed here, because tl.arange
+        and tle.dsa.alloc want compile-time literals (`2 * HALF` in the body is
+        what the first version died on, at the arange).
     """
     idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
 
     src_ub = tle.dsa.alloc([ROWS, FULL], dtype=tl.float32,
                            mem_addr_space=tle.dsa.ascend.UB)
-    tmp_ub = tle.dsa.alloc([ROWS, HALF], dtype=tl.float32,
-                           mem_addr_space=tle.dsa.ascend.UB)
-    dst_ub = tle.dsa.alloc([ROWS], dtype=tl.float32,
-                           mem_addr_space=tle.dsa.ascend.UB)
-
     tle.dsa.copy(X + idx, src_ub, [ROWS, FULL])
-    tle.dsa.ascend.raw("fold_reduce_rows", src_ub, ROWS, HALF, ROW_BLK,
-                       out=[dst_ub, tmp_ub])
-    tle.dsa.copy(dst_ub, Y + tl.arange(0, ROWS), [ROWS])
+
+    dst_t = tl.zeros([ROWS], dtype=tl.float32)
+    tmp_t = tl.zeros([ROWS * HALF], dtype=tl.float32)
+    dst_t, tmp_t = tle.dsa.ascend.raw(
+        "fold_reduce_rows", tle.dsa.to_tensor(src_ub), ROWS, HALF, ROW_BLK,
+        out=[dst_t, tmp_t])
+    tl.store(Y + tl.arange(0, ROWS), dst_t)
 
 
 @triton.jit
