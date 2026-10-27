@@ -223,6 +223,10 @@ def run_prepared(q, k, v, a, b, A_log, dt_bias, state, indices, cu_seqlens,
 # Self-test: prep in torch, then serial in torch -- validates both kernels
 # ---------------------------------------------------------------------------
 def _torch_reference(q, k, v, a, b, A_log, dt_bias, S0, scale, lower_bound):
+    # dt_bias arrives flat ([H*D], the same tensor the kernel reads as a pointer);
+    # it has to be [H,D] to broadcast against a's [T,H,D].
+    H, D = A_log.numel(), a.shape[-1]
+    dt_bias = dt_bias.reshape(H, D)
     qn = q.float() / torch.sqrt((q.float() ** 2).sum(-1, keepdim=True) + 1e-6) * scale
     kn = k.float() / torch.sqrt((k.float() ** 2).sum(-1, keepdim=True) + 1e-6)
     decay = torch.exp(lower_bound / (1.0 + torch.exp(
@@ -257,7 +261,6 @@ def _selftest(args) -> int:
     ref_out, ref_S = _torch_reference(q.cpu(), k.cpu(), v.cpu(), a.cpu(), b.cpu(),
                                       A_log.cpu(), dt_bias.cpu(), S0.cpu(),
                                       args.scale, args.lower_bound)
-
     pool = torch.zeros(2, H, D, D, dtype=torch.float32, device=dev)
     pool[1] = S0.transpose(-1, -2)
     state = pool.transpose(-1, -2)
