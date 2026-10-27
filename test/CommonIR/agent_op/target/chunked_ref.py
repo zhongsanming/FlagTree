@@ -156,7 +156,7 @@ def serial_ref(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
 # ---------------------------------------------------------------------------
 def make_inputs(tokens: int, heads: int, dim: int, seed: int = 7,
                 dtype: torch.dtype = torch.float64, device: str = "cpu",
-                gate_gain: float = 1.0) -> dict:
+                gate_gain: float = 1.0, gate_offset: float = 0.0) -> dict:
     """Prepared qn/kn/decay/beta plus an initial state, in `dtype`.
 
     gate_gain scales the gate input before the sigmoid.  1.0 is the bench
@@ -164,6 +164,13 @@ def make_inputs(tokens: int, heads: int, dim: int, seed: int = 7,
     exp(-2.5) = 0.082 (the strongest *uniform* decay the bound allows); values
     well above 1 push the sigmoid towards 1 and the decay towards exp(-5),
     which is the stress case for the intra-chunk dynamic range.
+
+    gate_offset shifts the pre-sigmoid argument negative, which is the *slow*
+    decay regime: sigmoid -> 0, gate -> 0, decay -> 1.  offset=6 gives
+    decay ~0.988 per token, i.e. a long-memory recurrence, and that is the only
+    regime in which a large chunk is legal (exp(-gc) = exp(sum |g|) stays near 1
+    instead of overflowing).  Without it every large-C test is NaN by
+    construction, not by bug.
     """
     g = torch.Generator(device="cpu").manual_seed(seed)
     K = V = dim
@@ -179,7 +186,7 @@ def make_inputs(tokens: int, heads: int, dim: int, seed: int = 7,
     b = torch.randn(tokens, heads, generator=g)
 
     decay_base = torch.exp(A_log)[None, :, None]        # broadcast over T and K
-    gate = lower_bound / (1.0 + torch.exp(-(decay_base * (a + dt_bias))))
+    gate = lower_bound / (1.0 + torch.exp(-(decay_base * (a + dt_bias) - gate_offset)))
     decay = torch.exp(gate)
     beta = torch.sigmoid(b)
     qn = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * scale

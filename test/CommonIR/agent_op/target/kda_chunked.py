@@ -67,6 +67,7 @@ def _chunked_kernel(
     QN, KN, VV, DECAY, BETA, OUT, STATE, STARTS, INDICES,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, C: tl.constexpr,
     BV: tl.constexpr,
+    L: tl.constexpr, SOLVE_DOUBLE: tl.constexpr, BF16: tl.constexpr,
     SKIP_DOTS: tl.constexpr, SKIP_RELGRAM: tl.constexpr,
     SKIP_CUMSUM: tl.constexpr, SKIP_SOLVE: tl.constexpr,
 ):
@@ -100,6 +101,10 @@ def _chunked_kernel(
 
     eye = (cidx[:, None] == cidx[None, :]).to(tl.float32)      # [C,C]
     upper = cidx[:, None] < cidx[None, :]                      # s < t
+    # Inclusive lower-triangular ones: cumsum over the token axis is a matmul,
+    # one dot instead of a C-step scan.  Exact in arithmetic, reassociated in
+    # fp; loop-invariant, so it is built once.
+    tril1 = tl.where(cidx[:, None] >= cidx[None, :], 1.0, 0.0)
 
     for c0 in range(0, n_tok, C):
         rows = c0 + cidx
@@ -121,11 +126,26 @@ def _chunked_kernel(
         if SKIP_CUMSUM:
             gc = tl.zeros([C, K], tl.float32)
         else:
-            gc = tl.cumsum(tl.log(dc), axis=0)            # [C,K], <= 0
+            # gc = cumsum(log decay) over tokens == tril1 @ log(decay)
+            gc = tl.dot(tril1, tl.log(dc))                    # [C,K], <= 0
         lam = tl.exp(gc)                                  # [C,K], <= 1
         ktil = kn * lam                                   # k~ = lam * k
         qtil = qn * lam
         krec = kn * tl.exp(-gc)                           # k / lam  (the big one)
+
+        # The four matmuls are where the bytes move, so bf16 operands and fp32
+        # accumulation are the point; the state itself stays fp32 because its
+        # increment accumulates across chunks.
+        if BF16:
+            ktil_d = ktil.to(tl.bfloat16)
+            qtil_d = qtil.to(tl.bfloat16)
+            krec_d = krec.to(tl.bfloat16)
+            st_d = st.to(tl.bfloat16)
+        else:
+            ktil_d = ktil
+            qtil_d = qtil
+            krec_d = krec
+            st_d = st
 
         # A^T[s,t] and Aq^T[s,t], one matmul each instead of a [C,C,K] tensor.
         #
@@ -145,8 +165,8 @@ def _chunked_kernel(
             AT = eye
             AqT = eye
         else:
-            AT = tl.dot(krec, tl.trans(ktil))              # [C,C]
-            AqT = tl.where(keep_lo, tl.dot(krec, tl.trans(qtil)), 0.0)
+            AT = tl.dot(krec_d, tl.trans(ktil_d))          # [C,C]
+            AqT = tl.where(keep_lo, tl.dot(krec_d, tl.trans(qtil_d)), 0.0)
         # Mm u = rhs has Mm[t,s] = beta_t A[t,s], unit lower triangular, so its
         # transpose is unit *upper* in [s,t] -- which is the orientation the
         # column sweep below consumes.
@@ -156,13 +176,25 @@ def _chunked_kernel(
         if SKIP_DOTS:
             rhsT = beta[None, :] * tl.trans(vv)
         else:
-            rhsT = beta[None, :] * (tl.trans(vv) - tl.dot(st, tl.trans(ktil)))
+            rhsT = beta[None, :] * (tl.trans(vv) - tl.dot(st_d, tl.trans(ktil_d)))
 
-        # uT MmT = rhsT, solved as a column sweep: after step t, column t is
-        # final and is subtracted from every later column.
+        # uT MmT = rhsT, with MmT = I + U, U strictly upper and nilpotent of
+        # index C.  Then MmT^-1 = (I + U)^-1 = (I - V)^-1 with V = -U, and the
+        # geometric product gives (I-V)^-1 = prod_{i<L} (I + V^{2^i}) exactly,
+        # because expanding it yields one term per subset and every exponent m
+        # appears once with sign (-1)^popcount(m) = (-1)^m only when the base is
+        # V, not U.  (Alternating powers of U itself gets the sign of U^2, U^3
+        # wrong -- verified offline: 1e0 error with U, 1e-16 with V.)
+        # So: L matvecs and L-1 squarings instead of C dependent steps with two
+        # cross-lane reductions each.  L = ceil(log2 C): 4 at C=16, 6 at C=64.
         uT = rhsT
         if SKIP_SOLVE:
             uT = rhsT
+        elif SOLVE_DOUBLE:
+            pw = -tl.where(upper, MmT, 0.0)
+            for _ in tl.static_range(L):
+                uT = uT + tl.dot(uT, pw)
+                pw = tl.dot(pw, pw)
         else:
             for t in tl.static_range(C):
                 col = tl.sum(tl.where(cidx[None, :] == t, uT, 0.0), axis=1)   # [BV]
@@ -176,7 +208,9 @@ def _chunked_kernel(
         if SKIP_DOTS:
             outT = uT
         else:
-            outT = tl.dot(st, tl.trans(qtil)) + tl.dot(uT, AqT)
+            outT = (tl.dot(st_d, tl.trans(qtil_d))
+                    + tl.dot(uT.to(tl.bfloat16) if BF16 else uT,
+                             AqT.to(tl.bfloat16) if BF16 else AqT))
 
         # St = lam_last * St + uT @ kbar, with kbar_c = k_c exp(gc_last - gc_c).
         gc_last = tl.sum(tl.where(cidx[:, None] == C - 1, gc, 0.0), axis=0)
@@ -207,7 +241,8 @@ def _chunked_kernel(
 def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
                 decay: torch.Tensor, beta: torch.Tensor, state: torch.Tensor,
                 indices: torch.Tensor, cu_seqlens: torch.Tensor,
-                C: int = 16, BV: int = 32, ablate: str = "") -> torch.Tensor:
+                C: int = 16, BV: int = 32, ablate: str = "",
+                solve: str = "double", bf16: bool = False) -> torch.Tensor:
     """qn, kn, decay: [T,H,K] fp32; v: [T,H,V]; beta: [T,H]; state: [slots,H,K,V].
 
     `state` is mutated in place.  Returns out shaped like `v`.
@@ -225,6 +260,11 @@ def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
     assert state.stride(1) == K * V and state.stride(0) == H * K * V, "dense pool"
     if V % BV:
         raise ValueError(f"BV={BV} must divide V={V}")
+    if solve not in ("double", "sweep"):
+        raise ValueError(f"solve must be 'double' or 'sweep', got {solve!r}")
+    # ceil(log2 C): levels of the (I-U)(I-U^2)(I-U^4)... expansion, exact for a
+    # strictly-upper U of nilpotency index C.
+    L = max(1, (C - 1).bit_length())
     out = torch.empty_like(v)
     grid = (indices.numel(), H, V // BV)
     names = {n.strip() for n in ablate.split(",") if n.strip()}
@@ -233,6 +273,7 @@ def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
     _chunked_kernel[grid](
         qn, kn, v, decay, beta, out, state, cu_seqlens, indices,
         H=H, K=K, V=V, C=C, BV=BV,
+        L=L, SOLVE_DOUBLE=(solve == "double"), BF16=bf16,
         SKIP_DOTS="dots" in names,
         SKIP_RELGRAM="relgram" in names,
         SKIP_CUMSUM="cumsum" in names,
@@ -259,7 +300,8 @@ def _selftest(args) -> int:
             # Reference in fp64 on the CPU; the kernel gets the same values in fp32
             # on the device, so the comparison is "kernel error", not "input error".
             base = make_inputs(tok, args.heads, args.dim, args.seed,
-                               torch.float64, gate_gain=gain)
+                               torch.float64, gate_gain=gain,
+                               gate_offset=args.gate_offset)
             ref_out, ref_S = serial_ref(base["qn"], base["kn"], base["v"],
                                         base["decay"], base["beta"], base["S0"])
             inp = {k: t.float().to(dev) for k, t in base.items()}
@@ -277,6 +319,8 @@ def _selftest(args) -> int:
                 torch.tensor([0, inp["qn"].shape[0]], dtype=torch.int32, device=dev),
                 C=args.chunk,
                 BV=args.bv,
+                solve=args.solve,
+                bf16=args.bf16,
             )
             torch.npu.synchronize()
 
@@ -324,7 +368,8 @@ def _bench(args) -> int:
 
     dev = args.device
     H, K = args.heads, args.dim
-    base = make_inputs(args.tokens, H, K, args.seed, torch.float32)
+    base = make_inputs(args.tokens, H, K, args.seed, torch.float32,
+                       gate_offset=args.gate_offset)
     inp = {k: t.to(dev) for k, t in base.items()}
     # [slots,H,V,K] contiguous, viewed as [slots,H,K,V]: same construction as
     # the self-test, K-contiguous is what the kernel indexes against.
@@ -337,7 +382,8 @@ def _bench(args) -> int:
     def make_run(tag):
         return lambda st: run_chunked(
             inp["qn"], inp["kn"], inp["v"], inp["decay"], inp["beta"], st,
-            idx, qsl, C=args.chunk, BV=args.bv, ablate=tag)
+            idx, qsl, C=args.chunk, BV=args.bv, ablate=tag,
+            solve=args.solve, bf16=args.bf16)
 
     blocks = H * (K // args.bv)
     print(f"T={args.tokens} H={H} C={args.chunk} BV={args.bv} "
@@ -387,8 +433,18 @@ def main() -> None:
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--chunk", type=int, default=16)
     p.add_argument("--bv", type=int, default=32,
-                   help="value split; 32 or 16 keeps the UB budget; 128 only "
-                        "if the multibuffer is disabled")
+                   help="value split; 32 or 16 keeps the UB budget at C<=16; "
+                        "C=64 needs --bf16 to fit at all")
+    p.add_argument("--solve", default="double", choices=("double", "sweep"),
+                   help="'double' is the log2(C)-dot expansion, 'sweep' the "
+                        "C-step masked substitution (the original)")
+    p.add_argument("--bf16", type=int, default=0, choices=(0, 1),
+                   help="bf16 operands for the matmuls (fp32 accumulation); "
+                        "required to fit C=64 in UB, and halves the staging")
+    p.add_argument("--gate-offset", type=float, default=0.0,
+                   help="shift the gate argument negative: the slow-decay "
+                        "regime, where a large chunk is numerically legal "
+                        "(6 gives decay ~0.988/token)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--tol", type=float, default=2e-2)
