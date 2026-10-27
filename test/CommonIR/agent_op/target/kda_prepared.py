@@ -185,27 +185,33 @@ def _recur_kernel(
 # ---------------------------------------------------------------------------
 # Host
 # ---------------------------------------------------------------------------
-def run_prepared(q, k, v, a, b, A_log, dt_bias, state, indices, cu_seqlens,
-                 scale: float, lower_bound: float, BV: int = 16,
-                 C: int = 16, track_indices=None, track_lens=None):
-    """q,k,v,a: [T,H,D]; b: [T,H]; A_log: [H]; dt_bias: [H,D]; state mutated."""
+def prep_only(q, k, a, b, A_log, dt_bias, scale, lower_bound,
+              C: int = 16, scratch=None):
+    """Pass 1 alone, so its cost can be measured in isolation."""
     T, H, D = q.shape
-    V = v.shape[-1]
-    if state.stride(2) != 1 or state.stride(3) != D:
-        raise ValueError("state must be K-contiguous (stride(2)==1)")
-
-    f32 = torch.float32
-    qn = torch.empty(T, H, D, dtype=f32, device=q.device)
-    kn = torch.empty(T, H, D, dtype=f32, device=q.device)
-    gd = torch.empty(T, H, D, dtype=f32, device=q.device)
-    beta = torch.empty(T, H, dtype=f32, device=q.device)
-    out = torch.empty_like(v)
-
+    if scratch is None:
+        f32 = torch.float32
+        scratch = (
+            torch.empty(T, H, D, dtype=f32, device=q.device),   # qn
+            torch.empty(T, H, D, dtype=f32, device=q.device),   # kn
+            torch.empty(T, H, D, dtype=f32, device=q.device),   # gd
+            torch.empty(T, H, dtype=f32, device=q.device),      # beta
+        )
+    qn, kn, gd, beta = scratch
     _prep_kernel[(triton.cdiv(T, C), H)](
         q, k, a, b, A_log, dt_bias, qn, kn, gd, beta, T,
         scale, lower_bound, H=H, D=D, C=C,
         num_warps=1, num_stages=1, multibuffer=False,
     )
+    return scratch
+
+
+def recur_only(qn, kn, v, gd, beta, state, indices, cu_seqlens,
+               BV: int = 16, out=None, track_indices=None, track_lens=None):
+    """Pass 2 alone, so the fp32-inputs penalty is separated from the prep cost."""
+    T, H, D = qn.shape
+    if out is None:
+        out = torch.empty_like(v)
     track = track_indices is not None
     _recur_kernel[(D // BV, indices.numel(), H)](
         qn, kn, v, gd, beta, out, state, indices, cu_seqlens,
@@ -217,6 +223,21 @@ def run_prepared(q, k, v, a, b, A_log, dt_bias, state, indices, cu_seqlens,
         num_warps=1, num_stages=1, multibuffer=False,
     )
     return out
+
+
+def run_prepared(q, k, v, a, b, A_log, dt_bias, state, indices, cu_seqlens,
+                 scale: float, lower_bound: float, BV: int = 16,
+                 C: int = 16, track_indices=None, track_lens=None):
+    """q,k,v,a: [T,H,D]; b: [T,H]; A_log: [H]; dt_bias: [H,D]; state mutated."""
+    T, H, D = q.shape
+    if state.stride(2) != 1 or state.stride(3) != D:
+        raise ValueError("state must be K-contiguous (stride(2)==1)")
+
+    qn, kn, gd, beta = prep_only(q, k, a, b, A_log, dt_bias, scale,
+                                 lower_bound, C=C)
+    return recur_only(qn, kn, v, gd, beta, state, indices, cu_seqlens,
+                      BV=BV, track_indices=track_indices,
+                      track_lens=track_lens)
 
 
 # ---------------------------------------------------------------------------
@@ -306,35 +327,57 @@ def _bench(args) -> int:
     def clone(st):
         return st.transpose(-1, -2).clone().transpose(-1, -2)
 
-    def run(st):
-        return run_prepared(q, k, v, a, b, A_log, dt_bias, st, idx, qsl,
-                            args.scale, args.lower_bound, BV=args.bv, C=args.chunk)
+    # Scratch is allocated once and reused, so the timing is the kernels and not
+    # four caching-allocator calls per repetition.
+    scratch = prep_only(q, k, a, b, A_log, dt_bias, args.scale,
+                        args.lower_bound, C=args.chunk)
+    qn, kn, gd, beta = scratch
+    out_buf = torch.empty_like(v)
 
-    for _ in range(args.warmup):
-        run(clone(state0))
-    torch.npu.synchronize()
-    ts = []
-    for _ in range(args.reps):
-        st = clone(state0)
+    def timeit(fn, reset=None):
+        for _ in range(args.warmup):
+            fn()
         torch.npu.synchronize()
-        t0 = time.perf_counter()
-        run(st)
-        torch.npu.synchronize()
-        ts.append((time.perf_counter() - t0) * 1e3)
-    ms = statistics.median(ts)
+        ts = []
+        for _ in range(args.reps):
+            if reset is not None:
+                reset()
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+            fn()
+            torch.npu.synchronize()
+            ts.append((time.perf_counter() - t0) * 1e3)
+        return statistics.median(ts)
+
+    ms_both = timeit(lambda: run_prepared(q, k, v, a, b, A_log, dt_bias,
+                                          state0, idx, qsl, args.scale,
+                                          args.lower_bound, BV=args.bv,
+                                          C=args.chunk))
+    ms_prep = timeit(lambda: prep_only(q, k, a, b, A_log, dt_bias, args.scale,
+                                       args.lower_bound, C=args.chunk,
+                                       scratch=scratch))
+    ms_recur = timeit(
+        lambda: recur_only(qn, kn, v, gd, beta, state0, idx, qsl,
+                           BV=args.bv, out=out_buf),
+        reset=lambda: None,
+    )
 
     blocks = H * (D // args.bv)
     print(f"T={T} H={H} C={args.chunk} BV={args.bv} blocks={blocks} "
           f"reps={args.reps}")
-    print(f"  {'variant':<22} {'ms':>8} {'ns/token':>9}")
-    print(f"  {'two-launch prepared':<22} {ms:8.3f} {ms * 1e6 / T:9.1f}")
-    for name, ref_ms in (("serial fused (v1)", 8.86), ("serial prep-ablated", 5.01)):
-        if T == 8192:
-            print(f"  {name + ' [earlier]':<22} {ref_ms:8.3f} "
-                  f"{ref_ms * 1e6 / T:9.1f}   -> {ref_ms / ms:5.2f}x")
+    print(f"  {'variant':<24} {'ms':>8} {'ns/token':>9}")
+    print(f"  {'two launches, together':<24} {ms_both:8.3f} "
+          f"{ms_both * 1e6 / T:9.1f}")
+    print(f"  {'  pass 1 prep only':<24} {ms_prep:8.3f} "
+          f"{ms_prep * 1e6 / T:9.1f}")
+    print(f"  {'  pass 2 recurrence only':<24} {ms_recur:8.3f} "
+          f"{ms_recur * 1e6 / T:9.1f}")
+    print(f"  {'  sum of the two':<24} {ms_prep + ms_recur:8.3f} "
+          f"{(ms_prep + ms_recur) * 1e6 / T:9.1f}")
     if T == 8192:
-        print(f"  {'chunked C=16 [earlier]':<22} {12.193:8.3f} "
-              f"{12.193 * 1e6 / T:9.1f}   -> {12.193 / ms:5.2f}x")
+        for name, ref_ms in (("serial fused v1 [earlier]", 8.86),
+                             ("serial recur only [earlier]", 5.01)):
+            print(f"  {name:<24} {ref_ms:8.3f} {ref_ms * 1e6 / T:9.1f}")
     return 0
 
 
