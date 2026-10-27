@@ -117,8 +117,13 @@ def _chunked_kernel(
         krec = kn * tl.exp(-gc)                           # k / lam  (the big one)
 
         # A^T[s,t] and Aq^T[s,t], one matmul each instead of a [C,C,K] tensor.
+        # Both are full C x C products, and the s > t half carries
+        # exp(gc_t - gc_s) > 1, which reaches 1e16 at C=16 (1e32 at the |g|=5
+        # bound).  Only s <= t is meaningful: MmT masks it below, and AqT must
+        # be masked too, otherwise dot(uT, AqT) sums the garbage half and the
+        # output comes out around 1e17 instead of O(1e-2).
         AT = tl.dot(krec, tl.trans(ktil))                 # [C,C]
-        AqT = tl.dot(krec, tl.trans(qtil))
+        AqT = tl.where(upper, 0.0, tl.dot(krec, tl.trans(qtil)))
         # Mm u = rhs has Mm[t,s] = beta_t A[t,s], unit lower triangular, so its
         # transpose is unit *upper* in [s,t] -- which is the orientation the
         # column sweep below consumes.
@@ -228,8 +233,8 @@ def _selftest(args) -> int:
         )
         torch.npu.synchronize()
 
-        out_err = (out.double().cpu() - ref_out).abs().max().item()
-        state_err = (state[1].double().cpu() - ref_S).abs().max().item()
+        out_err = (out.float().cpu().double() - ref_out).abs().max().item()
+        state_err = (state[1].float().cpu().double() - ref_S).abs().max().item()
         out_rel = out_err / ref_out.abs().max().item()
         state_rel = state_err / ref_S.abs().max().item()
         good = out_rel < args.tol and state_rel < args.tol
