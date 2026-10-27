@@ -67,6 +67,8 @@ def _chunked_kernel(
     QN, KN, VV, DECAY, BETA, OUT, STATE, STARTS, INDICES,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, C: tl.constexpr,
     BV: tl.constexpr,
+    SKIP_DOTS: tl.constexpr, SKIP_RELGRAM: tl.constexpr,
+    SKIP_CUMSUM: tl.constexpr, SKIP_SOLVE: tl.constexpr,
 ):
     seq = tl.program_id(0)
     h = tl.program_id(1)
@@ -112,7 +114,14 @@ def _chunked_kernel(
         beta = tl.load(BETA + (bos + rows) * H + h, mask=live, other=0.0)
         voff = (bos + rows)[:, None] * (H * V) + h * V + vs[None, :]
         vv = tl.load(VV + voff, mask=live[:, None], other=0.0).to(tl.float32)
-        gc = tl.cumsum(tl.log(dc), axis=0)                # [C,K], <= 0
+        # --- ablation switches (timing probes, wrong math) ----------------
+        # The kernel as written is ~300x slower than its own matmul content, so
+        # the question is which part of the chunk body that overhead lives in.
+        # These four switches remove one part at a time.
+        if SKIP_CUMSUM:
+            gc = tl.zeros([C, K], tl.float32)
+        else:
+            gc = tl.cumsum(tl.log(dc), axis=0)            # [C,K], <= 0
         lam = tl.exp(gc)                                  # [C,K], <= 1
         ktil = kn * lam                                   # k~ = lam * k
         qtil = qn * lam
@@ -132,34 +141,50 @@ def _chunked_kernel(
         # term is the s = C-1 row, which survives both masks for every t, so the
         # output stays at ~1e17 either way.
         keep_lo = cidx[:, None] <= cidx[None, :]           # s <= t
-        AT = tl.dot(krec, tl.trans(ktil))                  # [C,C]
-        AqT = tl.where(keep_lo, tl.dot(krec, tl.trans(qtil)), 0.0)
+        if SKIP_RELGRAM:
+            AT = eye
+            AqT = eye
+        else:
+            AT = tl.dot(krec, tl.trans(ktil))              # [C,C]
+            AqT = tl.where(keep_lo, tl.dot(krec, tl.trans(qtil)), 0.0)
         # Mm u = rhs has Mm[t,s] = beta_t A[t,s], unit lower triangular, so its
         # transpose is unit *upper* in [s,t] -- which is the orientation the
         # column sweep below consumes.
         MmT = eye + tl.where(upper, AT * beta[None, :], 0.0)
 
         # rhs = beta * (v - k~ St^T), transposed to [BV,C] so `st` stays [BV,K].
-        rhsT = beta[None, :] * (tl.trans(vv) - tl.dot(st, tl.trans(ktil)))
+        if SKIP_DOTS:
+            rhsT = beta[None, :] * tl.trans(vv)
+        else:
+            rhsT = beta[None, :] * (tl.trans(vv) - tl.dot(st, tl.trans(ktil)))
 
         # uT MmT = rhsT, solved as a column sweep: after step t, column t is
         # final and is subtracted from every later column.
         uT = rhsT
-        for t in tl.static_range(C):
-            col = tl.sum(tl.where(cidx[None, :] == t, uT, 0.0), axis=1)   # [BV]
-            row = tl.sum(tl.where(cidx[:, None] == t, MmT, 0.0), axis=0)  # [C]
-            coef = tl.where(cidx > t, row, 0.0)                          # s > t
-            uT = uT - col[:, None] * coef[None, :]
+        if SKIP_SOLVE:
+            uT = rhsT
+        else:
+            for t in tl.static_range(C):
+                col = tl.sum(tl.where(cidx[None, :] == t, uT, 0.0), axis=1)   # [BV]
+                row = tl.sum(tl.where(cidx[:, None] == t, MmT, 0.0), axis=0)  # [C]
+                coef = tl.where(cidx > t, row, 0.0)                          # s > t
+                uT = uT - col[:, None] * coef[None, :]
 
         # out^T = St q~^T + uT Aq^T, taken before the state update.  AqT is
         # already Aq transposed by construction (AqT[s,t] = Aq[t,s]), so it is
         # used directly -- transposing it again would contract the wrong axis.
-        outT = tl.dot(st, tl.trans(qtil)) + tl.dot(uT, AqT)
+        if SKIP_DOTS:
+            outT = uT
+        else:
+            outT = tl.dot(st, tl.trans(qtil)) + tl.dot(uT, AqT)
 
         # St = lam_last * St + uT @ kbar, with kbar_c = k_c exp(gc_last - gc_c).
         gc_last = tl.sum(tl.where(cidx[:, None] == C - 1, gc, 0.0), axis=0)
         kbar = kn * tl.exp(gc_last[None, :] - gc)
-        st = tl.exp(gc_last)[None, :] * st + tl.dot(uT, kbar)
+        if SKIP_DOTS:
+            st = tl.exp(gc_last)[None, :] * st
+        else:
+            st = tl.exp(gc_last)[None, :] * st + tl.dot(uT, kbar)
 
         ooff = ((bos + rows)[:, None] * (H * V) + h * V
                 + (iv * BV + tl.arange(0, BV))[None, :])
@@ -182,7 +207,7 @@ def _chunked_kernel(
 def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
                 decay: torch.Tensor, beta: torch.Tensor, state: torch.Tensor,
                 indices: torch.Tensor, cu_seqlens: torch.Tensor,
-                C: int = 16, BV: int = 32) -> torch.Tensor:
+                C: int = 16, BV: int = 32, ablate: str = "") -> torch.Tensor:
     """qn, kn, decay: [T,H,K] fp32; v: [T,H,V]; beta: [T,H]; state: [slots,H,K,V].
 
     `state` is mutated in place.  Returns out shaped like `v`.
@@ -202,9 +227,16 @@ def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
         raise ValueError(f"BV={BV} must divide V={V}")
     out = torch.empty_like(v)
     grid = (indices.numel(), H, V // BV)
+    names = {n.strip() for n in ablate.split(",") if n.strip()}
+    if "all" in names:
+        names = {"dots", "relgram", "cumsum", "solve"}
     _chunked_kernel[grid](
         qn, kn, v, decay, beta, out, state, cu_seqlens, indices,
         H=H, K=K, V=V, C=C, BV=BV,
+        SKIP_DOTS="dots" in names,
+        SKIP_RELGRAM="relgram" in names,
+        SKIP_CUMSUM="cumsum" in names,
+        SKIP_SOLVE="solve" in names,
         num_warps=1, num_stages=1, multibuffer=False,
     )
     return out
@@ -302,37 +334,44 @@ def _bench(args) -> int:
     idx = torch.tensor([1], dtype=torch.int32, device=dev)
     qsl = torch.tensor([0, args.tokens], dtype=torch.int32, device=dev)
 
-    def run(st):
-        return run_chunked(inp["qn"], inp["kn"], inp["v"], inp["decay"],
-                           inp["beta"], st, idx, qsl, C=args.chunk, BV=args.bv)
+    def make_run(tag):
+        return lambda st: run_chunked(
+            inp["qn"], inp["kn"], inp["v"], inp["decay"], inp["beta"], st,
+            idx, qsl, C=args.chunk, BV=args.bv, ablate=tag)
 
-    for _ in range(args.warmup):
-        run(_clone_kcontig(state0))
-    torch.npu.synchronize()
-    ts = []
-    for _ in range(args.reps):
-        st = _clone_kcontig(state0)
-        torch.npu.synchronize()
-        t0 = time.perf_counter()
-        run(st)
-        torch.npu.synchronize()
-        ts.append((time.perf_counter() - t0) * 1e3)
-    ms = statistics.median(ts)
-    us_per_tok = ms * 1e3 / args.tokens
     blocks = H * (K // args.bv)
-
     print(f"T={args.tokens} H={H} C={args.chunk} BV={args.bv} "
           f"blocks={blocks} reps={args.reps}")
-    print(f"  chunked recurrence   {ms:9.3f} ms   {us_per_tok:8.1f} ns/token")
+    print(f"  {'variant':<10} {'ms':>8} {'ns/token':>9} {'saved':>7}")
+
+    base_ms = None
+    for tag in [t.strip() for t in args.ablate.split(",") if t.strip()]:
+        run = make_run("" if tag == "none" else tag)
+        for _ in range(args.warmup):
+            run(_clone_kcontig(state0))
+        torch.npu.synchronize()
+        ts = []
+        for _ in range(args.reps):
+            st = _clone_kcontig(state0)
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+            run(st)
+            torch.npu.synchronize()
+            ts.append((time.perf_counter() - t0) * 1e3)
+        ms = statistics.median(ts)
+        if base_ms is None:
+            base_ms = ms
+        saved = 100.0 * (1.0 - ms / base_ms)
+        print(f"  {tag:<10} {ms:8.3f} {ms * 1e6 / args.tokens:9.1f} "
+              f"{saved:6.1f}%", flush=True)
+
     # Earlier measurements on this same card, for scale only.
     for serial_tok, full_ms, abl_ms in ((8192, 8.86, 5.01), (16384, 17.6, 10.0)):
         if serial_tok == args.tokens:
-            print(f"  serial, full (T={serial_tok})    {full_ms:9.3f} ms   "
-                  f"{full_ms * 1e3 / serial_tok:8.1f} ns/token   "
-                  f"-> {full_ms / ms:5.1f}x")
-            print(f"  serial, prep-ablated       {abl_ms:9.3f} ms   "
-                  f"{abl_ms * 1e3 / serial_tok:8.1f} ns/token   "
-                  f"-> {abl_ms / ms:5.1f}x")
+            print(f"  {'serial':<10} {full_ms:8.3f} "
+                  f"{full_ms * 1e6 / serial_tok:9.1f}   full kernel, prep included")
+            print(f"  {'serial-abl':<10} {abl_ms:8.3f} "
+                  f"{abl_ms * 1e6 / serial_tok:9.1f}   serial recurrence alone")
     return 0
 
 
@@ -355,6 +394,9 @@ def main() -> None:
     p.add_argument("--tol", type=float, default=2e-2)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--reps", type=int, default=20)
+    p.add_argument("--ablate", default="none,solve,relgram,cumsum,dots,all",
+                   help="comma list of timing probes: none,solve,relgram,"
+                        "cumsum,dots,all (deliberately wrong math)")
     args = p.parse_args()
 
     if not args.selftest and not args.bench:
