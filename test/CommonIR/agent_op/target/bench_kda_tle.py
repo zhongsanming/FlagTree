@@ -208,6 +208,7 @@ def apply_env(env: dict) -> None:
     for key in (
         "KDA_CORES", "KDA_BV", "KDA_MAX_BV", "KDA_PREFETCH",
         "KDA_FLAT_STATE", "KDA_STAGES", "KDA_MULTIBUFFER", "KDA_NUM_WARPS",
+        "KDA_ABLATE",
     ):
         os.environ.pop(key, None)
     if _AMBIENT_CORES is not None:
@@ -334,7 +335,12 @@ def cmd_sweep(args, v0, v1) -> None:
     tokens_list = [int(x) for x in args.tokens.split(",")]
     configs = sweep_configs(args.configs)
     results = []
+    errors: dict[str, str] = {}
 
+    # Print the modules actually loaded: a half-updated tree is the single most
+    # common reason every column reads ERR, and the paths make it obvious.
+    print(f"v0: {getattr(v0, '__file__', '?')}")
+    print(f"v1: {getattr(v1, '__file__', '?')}")
     print(f"cores={os.environ.get('KDA_CORES', '40')}  "
           f"warmup={args.warmup}  reps={args.reps}  configs={len(configs)}")
     header = f"{'case':>18}  " + "  ".join(f"{c['name']:>18}" for c in configs)
@@ -362,12 +368,20 @@ def cmd_sweep(args, v0, v1) -> None:
                     stats = timeit(run, state0, args.warmup, args.reps)
                     stats["cfg"] = v1.config_summary() if cfg["impl"] == "v1" else None
                 except Exception as exc:  # compile failure, hang guard, etc.
-                    stats = {"error": f"{type(exc).__name__}: {exc}".splitlines()[0]}
+                    if os.environ.get("KDA_TRACEBACK") == "1":
+                        raise
+                    stats = {"error": f"{type(exc).__name__}: {exc}".strip()}
+                    errors.setdefault(cfg["name"], stats["error"].splitlines()[0])
                 row["arms"][cfg["name"]] = stats
                 cells.append(f"{stats.get('median_ms', float('nan')):18.4f}"
                              if "median_ms" in stats else f"{'ERR':>18}")
             results.append(row)
             print(f"{f'H{heads} T{tokens}':>18}  " + "  ".join(cells), flush=True)
+
+    if errors:
+        print("\nerrors (first per config; KDA_TRACEBACK=1 for the full traceback):")
+        for name, message in errors.items():
+            print(f"  {name}: {message}")
 
     if args.out:
         with open(args.out, "w") as fh:

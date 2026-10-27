@@ -295,6 +295,32 @@ def _opt_recurrent_kernel_v1(
 # ---------------------------------------------------------------------------
 # Launcher: same keyword contract as v0._run_optimized
 # ---------------------------------------------------------------------------
+_ABLATIONS = ("norms", "gate", "vred", "outred", "load")
+
+
+def _ablation_flags() -> dict:
+    """Parse KDA_ABLATE (comma list, or 'all') into constexpr flags.
+
+    Probes are timing-only: they deliberately compute the wrong answer, so they
+    must never be used outside a bench run.  'all' keeps the loads and drops
+    every other per-token stage, which is the floor the serial chain costs.
+    """
+    spec = os.environ.get("KDA_ABLATE", "").strip()
+    if not spec:
+        names = set()
+    elif spec in ("all", "*"):
+        names = set(_ABLATIONS) - {"load"}
+    else:
+        names = {part.strip() for part in spec.split(",") if part.strip()}
+        unknown = names - set(_ABLATIONS)
+        if unknown:
+            raise ValueError(
+                f"KDA_ABLATE has unknown entries {sorted(unknown)}; "
+                f"known: {sorted(_ABLATIONS)} or 'all'"
+            )
+    return {f"SKIP_{name.upper()}": (name in names) for name in _ABLATIONS}
+
+
 def _run_optimized_v1(
     *, q, k, v, a, b,
     A_log, dt_bias, output, state, indices, starts,
@@ -322,6 +348,11 @@ def _run_optimized_v1(
         and state.stride(0) == heads * key_dim * key_dim
     )
 
+    ablate = _ablation_flags()
+    prefetch = _env_int("KDA_PREFETCH", 0) != 0
+    if prefetch and ablate["SKIP_LOAD"]:
+        raise ValueError("KDA_ABLATE=load needs KDA_PREFETCH=0")
+
     grid = (key_dim // bv, num_seqs, heads)
     _opt_recurrent_kernel_v1[grid](
         q, k, v, a, b,
@@ -335,7 +366,12 @@ def _run_optimized_v1(
         S0=state.stride(0), S1=state.stride(1),
         SK=state.stride(2), SV=state.stride(3),
         FLAT_STATE=flat,
-        PREFETCH=_env_int("KDA_PREFETCH", 0) != 0,
+        PREFETCH=prefetch,
+        SKIP_NORMS=ablate["SKIP_NORMS"],
+        SKIP_GATE=ablate["SKIP_GATE"],
+        SKIP_VRED=ablate["SKIP_VRED"],
+        SKIP_OUTRED=ablate["SKIP_OUTRED"],
+        SKIP_LOAD=ablate["SKIP_LOAD"],
         num_warps=_env_int("KDA_NUM_WARPS", 1),
         num_stages=_env_int("KDA_STAGES", 1),
         multibuffer=_env_int("KDA_MULTIBUFFER", 0) != 0,
