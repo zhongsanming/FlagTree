@@ -1,4 +1,4 @@
-"""Validate the fold_reduce_rows custom op in isolation, before any kernel uses it.
+"""Correctness check for the fold_reduce_rows custom op.  Timing removed.
 
 The op is the multi-result reduce that triton cannot express (see
 custom_ops/reduction_ops/fold_reduce_rows.cpp and KDA_ASCENDC_VS_TLE.md 6.10):
@@ -6,16 +6,31 @@ one vadd that folds each row's two halves, then one vcadd over all rows, so
 `repeat` results cost two instructions instead of `repeat` separate tl.sum
 chains.
 
-This checks two things, in this order:
+This file used to also report "op us vs triton us", with the repeats inside the
+kernel and a launch floor subtracted.  That measurement could not be made
+honest, and the 0.000 us columns it produced were the tell:
 
-  1. correctness against torch, for several row counts and both supported
-     dtypes -- a wrong result here means the strides are wrong, and that is
-     much cheaper to find now than inside the KDA kernel;
-  2. cost against the triton-only equivalent (`tl.sum(a + b, axis=1)`), so the
-     gain can be measured before it is relied upon.
+  * the op path calls raw(src_t, ..) with loop-invariant inputs and the same out
+    buffers, so CSE folds 64 or 256 calls into one; the triton path's tl.sum does
+    not depend on the loop variable, so it is hoisted and `acc += s` becomes
+    REPEAT*s.  Neither side does the work;
+  * subtracting one constant ~140 us only works if the launch cost is constant,
+    and it is not (128.7 .. 140.6 us measured across row counts);
+  * it cannot be fixed cheaply: defeating hoisting needs an input that changes
+    per iteration, which costs a copy or a store that one side would not pay.
+
+The honest number is in-situ, and it is already measured: in the real kernel,
+adding a fifth reduction cost +13 % (6.6), i.e. ~141 ns/token per reduce, so
+fusing 4 -> 2 should give 1082 -> ~801 ns/token = 1.35x.  Measuring it properly
+means wiring the op into the kernel, where it sits in an 8192-iteration loop and
+neither hoisting nor the launch floor applies.
+
+So this script is now only the correctness gate: it validates the CIFACE
+argument order, the fold, vcadd MODE=0 and the datablock stride semantics against
+torch.  It passed at rows=1/2/16/32/64.
 
     python3 probe_fold_reduce.py
-    python3 probe_fold_reduce.py --rows 32 --mask 64 --reps 30
+    python3 probe_fold_reduce.py --rows 1,2,16,32,64
 """
 
 from __future__ import annotations
