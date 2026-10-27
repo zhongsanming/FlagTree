@@ -481,6 +481,70 @@ T=1024 的 KDA 耗时（1.38 ms）里有一大块与计算无关，也意味着�
 
 ---
 
+### 6.7 chunked 路线的实测经济账：每个 op 的成本决定一切
+
+chunked 内核跑通且数值正确（§6.6），但**比它要替换的串行递推慢 2.4×**：
+
+| 变体 | ns/token | |
+|---|---|---|
+| chunked C=16 BV=32 T=8192 | 1488 | |
+| chunked BV=16 | 2671 | relgram 随 V-tile 重复 4→8 份 |
+| chunked BV=64 | — | UB 溢出 1,671,168 vs 1,572,864 bits |
+| 串行·完整 | 1082 | |
+| 串行·prep-ablated | **612** | 同口径 |
+
+归因探针（`kda_chunked.py --bench`，故意算错数）：
+
+| 关掉 | ns/token | 省 | 推出单位成本 |
+|---|---|---|---|
+| solve（16 步列扫描） | 695 | 46.7% | **695 ns/步 = 1251 cycles/步** |
+| dots（6 个） | 340 | 22.8% | **906 ns/每个 dot = 1631 cycles** |
+| cumsum | 202 | 13.6% | 16 步串行扫描 |
+| relgram（2 dots + mask） | 179 | 12.0% | |
+| 全部（floor） | 96 | 93.6% | 循环 + 加载 + store |
+
+四项单删相加 95.1% ≈ 一起删的 93.6% —— **几乎完全可加，即四块都是纯成本、互不重叠**。
+
+两条单位成本是本项目最有复用价值的数字：
+
+* **一次小矩阵乘（含操作数 staging）= 906 ns ≈ 1631 cycles**。cube 探针里链式 dot 只要 122 ns，
+  差别就是每个 chunk 重新 stage 操作数（UB→L1 ND2NZ）+ 结果搬回。这是“小 matmul 在 Ascend 上
+  全是 overhead”的定量版本。
+* **一步跨 lane 规约 ≈ 1250 cycles**（与串行内核里反推的 480 cycles 同量级，这里是两次规约/步）。
+
+### 结论：在 C=16 下 chunked 的上限只有 1.34×
+
+把每一块都用 matmul 重写（求解换 doubling 的 7 个 dot、cumsum 换 `tril_ones @ g` 一个 dot、
+staging 换 bf16、relgram 同步减半）：
+
+```
+floor 96 + solve 397 + cumsum 57 + dots 170 + relgram 89 = 808 ns/token
+vs 串行·完整 1082 → 1.34x ；vs 串行·递推 612 → 0.76x（仍然更慢）
+```
+
+也就是说**在 C=16 这个尺寸上，chunked 无论怎么优化都追不上串行版**，因为：
+
+1. 每个 chunk 至少需要 ~6 个 dot，而一个 dot 就是 906 ns；
+2. 求解是 C 步/C 个 token = **每 token 一步**，不随 C 摊销；
+3. C 被 `exp(-gc) ≤ exp(5C)` 钉在 16（§6.6）。
+
+### 但 C 由 gate 决定，所以结论是有条件的
+
+同样的 kernel 在 **C=64** 下：dot 成本摊薄 4×（340 → 85）、cumsum 摊薄、求解用 doubling 变成
+log C 个 dot（0.156 dot/token = 140 ns），预算变成约 **420 ns/token → 2.6×**。
+
+而 C 能否取 64 完全取决于线上 gate 的衰减速度：`exp(-gc) = exp(Σ|g|)` 超过 fp32 上限就不可用。
+bench 的合成输入（decay≈0.082/token）把 C 锁在 17；若线上多数通道 decay≈0.99（长记忆），
+C=64/128 完全安全。
+
+**所以 chunked 路线的去留取决于一个数：线上 `exp(gate)` 的分位数。** 在那之前：
+
+* 不做 chunked 的进一步优化（C=16 的上限 1.34× 不值得）；
+* 先拿**无条件收益**：串行版的 prep 占 470 ns/token（1082−612）且是 token 局部的，
+  批量化后可降到 ~100–150 → 总计 **~712–762 ns/token = 1.45×**，风险低、复用现有代码。
+
+---
+
 ## 7. 验证与基准计划（由远程执行）
 
 脚本：`target/bench_kda_tle.py`（自包含，不依赖 sglang）
