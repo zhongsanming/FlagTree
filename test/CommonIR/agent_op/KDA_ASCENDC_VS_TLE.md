@@ -645,17 +645,26 @@ C=16 时约 **6550 cycles/token-head ÷ ~10 个 op ≈ 650 cycles/op**。同一�
 那次 "1.35×" 的前提是 `[2,BV,K]` 这种拼装**免费**。它不是：`where`／`broadcast`／`reshape`
 恰好就是成本模型里计的那 650 cycles。所以接入后净收益 ≈ 0，state 那一对甚至是负的。
 
-**因此结论要修正到比 §6.10 更具体的一层：缺口不在 "缺 AscendC 原语"，而在前端的 tensor 代数。**
-真正能解锁 1.35× 的不是硬件指令，而是**便宜的 concat / slice / split** —— 一旦 `tl.split`
-能 lowering：(a) op 只需要一个 dst（不需要双 dst 这个绕法），(b) state 那一对变成
-`mul + raw` = 2 op（代替 5），(c) 单这一对就能省 ~3 op/token ≈ 26%。
+> **上面这段有一个错误，已修正。** 我当时断言"拼 tile 要 where/broadcast/reshape 共 3–5 个 op"，
+> 但 `tle.dsa` 里本来就有 `tile_concat(lhs, rhs, dim)`，它 lower 成 **`hivm.hir.vconcat`，
+> 一个 op**；拆分侧也有 `extract_slice`（在 `causal_conv1d_fn.py:123` 已经被用于在循环里
+> 从 UB tensor 取第 j 行，所以它本来就是可用的）。我没查这两个接口就下了结论，这是错的。
 
-所以对这个项目来说，给 TLE 加 AscendC 原语的收益排序是：
+按真实成本重算（op 数，单位是 §6.10 模型里的 triton 级 op）：
 
-1. **前端 slice/concat/split lowering** —— 唯一能把 26% 拿回来的；
-2. 多结果规约（已完成，`fold_reduce_rows`）—— 依赖 1 才能生效；
-3. `MulAddDst`、`Brcb` 等（5–8%）；
-4. `IBSet/IBWait`（对我们 ≈ 0，见 §6.7）。
+| | 基座 v1 | 融合版（用 `tile_concat` + `extract_slice`） |
+|---|---|---|
+| norms | `q*q`+sum、`k*k`+sum = **4** | `q*q`、`k*k`、`concat`、1 raw = **4** → 持平 |
+| state | `state*k`+sum+sub、`state*q`+sum = **5** | `state*k`、`state*q`、`concat`、raw、2×`extract_slice` = **5**（若 slice 是零成本视图则 4） |
+
+**一次规约 ≈ 一次 concat**，所以融合在 op 数上是**持平**：既不是我之前说的 26% 收益，
+也不是后来担心的变负。剩下的问题降级成"每条指令的单价"：一次 `vconcat` + 一次 `vcadd`
+是否比 `tl.sum` 内部展开更便宜 —— 这只能在真实 kernel 里测，而它的上限是 **~13%**
+（9 个 op 里的 1 个）。
+
+顺带一个要更正的旧结论：§6.6/§6.9 里我用"Triton 取不出第 r 行"来论证 chunked 的批量
+prep 必须依赖 UB 机制。**那句也错了** —— `extract_slice` 能做这件事。chunked 路线终止的
+真实原因仍然是 C ≤ 17 与每 op 单价（§6.7 的经济账），与"取行能力"无关。
 
 ---
 
