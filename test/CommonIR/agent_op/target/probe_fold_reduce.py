@@ -40,29 +40,33 @@ import triton.experimental.tle as tle
 
 @triton.jit
 def _fold_reduce_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
-                        ROW_BLK: tl.constexpr):
-    """Grid: one program; a [ROWS, 2*HALF] tile in, ROWS sums out."""
-    full = 2 * HALF
-    idx = tl.arange(0, ROWS)[:, None] * full + tl.arange(0, full)[None, :]
+                        FULL: tl.constexpr, ROW_BLK: tl.constexpr):
+    """Grid: one program; a [ROWS, FULL] tile in, ROWS sums out.
 
-    src_ub = tle.dsa.alloc([ROWS, full], dtype=tl.float32,
+    FULL = 2*HALF is passed in rather than computed here: tl.arange and
+    tle.dsa.alloc want compile-time literals, and `2 * HALF` inside the body is
+    what Triton rejected (CompilationError at the arange, 5:47).
+    """
+    idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
+
+    src_ub = tle.dsa.alloc([ROWS, FULL], dtype=tl.float32,
                            mem_addr_space=tle.dsa.ascend.UB)
     tmp_ub = tle.dsa.alloc([ROWS, HALF], dtype=tl.float32,
                            mem_addr_space=tle.dsa.ascend.UB)
     dst_ub = tle.dsa.alloc([ROWS], dtype=tl.float32,
                            mem_addr_space=tle.dsa.ascend.UB)
 
-    tle.dsa.copy(X + idx, src_ub, [ROWS, full])
+    tle.dsa.copy(X + idx, src_ub, [ROWS, FULL])
     tle.dsa.ascend.raw("fold_reduce_rows", src_ub, ROWS, HALF, ROW_BLK,
                        out=[dst_ub, tmp_ub])
     tle.dsa.copy(dst_ub, Y + tl.arange(0, ROWS), [ROWS])
 
 
 @triton.jit
-def _triton_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr):
+def _triton_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
+                   FULL: tl.constexpr):
     """The reference cost: what the same job costs without the custom op."""
-    full = 2 * HALF
-    idx = tl.arange(0, ROWS)[:, None] * full + tl.arange(0, full)[None, :]
+    idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
     a = tl.load(X + idx)
     lo = tl.reshape(a, [ROWS, 2, HALF])
     s = tl.sum(lo, axis=1)
@@ -114,7 +118,7 @@ def main() -> None:
 
         try:
             _fold_reduce_kernel[(1,)](x, y, ROWS=rows, HALF=args.mask,
-                                      ROW_BLK=row_blk)
+                                      FULL=full, ROW_BLK=row_blk)
             torch.npu.synchronize()
             ref = (x[:, :args.mask] + x[:, args.mask:]).sum(1)
             err = (y - ref).abs().max().item()
@@ -122,16 +126,26 @@ def main() -> None:
             good = rel < args.tol
             ok = ok and good
             t_op = _run(lambda: _fold_reduce_kernel[(1,)](
-                x, y, ROWS=rows, HALF=args.mask, ROW_BLK=row_blk),
+                x, y, ROWS=rows, HALF=args.mask, FULL=full, ROW_BLK=row_blk),
                 args.reps, args.warmup)
             t_tri = _run(lambda: _triton_kernel[(1,)](
-                x, y_ref, ROWS=rows, HALF=args.mask), args.reps, args.warmup)
+                x, y_ref, ROWS=rows, HALF=args.mask, FULL=full),
+                args.reps, args.warmup)
             print(f"{rows:5d} {err:11.2e} {rel:9.2e} {t_op:8.2f} "
                   f"{t_tri:10.2f} {t_tri / t_op:7.2f}x")
         except Exception as exc:  # compile or device error is a result here
             ok = False
-            print(f"{rows:5d}  ERR {type(exc).__name__}: "
-                  f"{str(exc).splitlines()[0][:90]}")
+            detail = f"{type(exc).__name__}: {exc}".rstrip()
+            first = detail.splitlines()[0]
+            print(f"{rows:5d}  ERR {first[:100]}")
+            # The full message carries the triton location and the argument that
+            # was rejected; truncating it to one line is what cost a round trip
+            # before, so print the rest indented instead of dropping it.
+            rest = detail.splitlines()[1:]
+            for line in rest[:24]:
+                print(f"           {line}")
+            if len(rest) > 24:
+                print(f"           ... {len(rest) - 24} more lines")
 
     print()
     print("what to read:")
