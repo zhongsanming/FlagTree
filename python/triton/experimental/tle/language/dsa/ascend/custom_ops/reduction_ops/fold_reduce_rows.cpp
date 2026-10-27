@@ -25,15 +25,24 @@
 //
 // Semantics
 // ---------
-//   src : [repeat, 2*mask] in UB, row-major, row stride src_rep_stride blocks
-//   dst : [repeat]        in UB, contiguous (one result per row)
-//   tmp : [repeat, mask]  in UB scratch, supplied by the caller
+//   src : [repeat0 + repeat1, 2*mask] in UB, row-major, rows
+//         src_rep_stride datablocks apart
+//   dst0: [repeat0] in UB, contiguous   -- results of rows [0, repeat0)
+//   dst1: [repeat1] in UB, contiguous   -- results of rows [repeat0, repeat0+repeat1)
+//   tmp : [repeat0 + repeat1, mask] in UB scratch, supplied by the caller
 //
-//   dst[r] = sum_{i < mask} ( src[r, i] + src[r, i + mask] )
+//   dst0[r] = sum_{i < mask} ( src[r, i] + src[r, i + mask] )
 //
-// Two instructions: a strided vadd that folds the halves into tmp, then one
-// vcadd over all `repeat` rows. MODE=0 so each repeat writes its own result
-// instead of accumulating into SPR.
+// Two destinations rather than one contiguous vector because the two results are
+// consumed separately downstream, and triton cannot split a tensor (no slicing,
+// tl.split/tl.join do not lower on this backend).  One CIFACE call is one
+// triton-level op, which is where the saving is -- the cost model says an op
+// costs ~650 cycles of fixed overhead regardless of what it does, so the win is
+// op count, not instruction count.
+//
+// Three instructions: a strided vadd that folds the halves into tmp, then one
+// vcadd per destination over its own row range.  MODE=0 so each repeat writes its
+// own result instead of accumulating into SPR.
 //
 // fp32 and fp16 are registered; bf16 has no vcadd on this core (bfloat16_t is
 // accepted only for the fold, so it is left out rather than silently wrong).
@@ -69,42 +78,51 @@ set_mask(int32_t len, int32_t dtype_size) {
 
 template <typename T>
 __aiv__ __attribute__((always_inline)) void
-fold_reduce_rows_impl(__ubuf__ T *dst, __ubuf__ T *tmp, __ubuf__ T *src,
-                      const int32_t repeat_times, const int32_t mask,
+fold_reduce_rows_impl(__ubuf__ T *dst0, __ubuf__ T *dst1, __ubuf__ T *tmp,
+                      __ubuf__ T *src, const int32_t repeat0,
+                      const int32_t repeat1, const int32_t mask,
                       const int32_t src_rep_stride) {
   // tmp is written tightly: one row of `mask` lanes, so the next row starts
-  // mask * sizeof(T) / 32 datablocks later.
+  // mask * sizeof(T) / 32 datablocks later, and one row is that many 32 B blocks
+  // times the elements in a block.
   const int32_t tmp_rep_stride =
       static_cast<int32_t>(mask * static_cast<int32_t>(sizeof(T)) / 32);
+  const int32_t elems_per_row =
+      tmp_rep_stride * static_cast<int32_t>(32 / sizeof(T));
+  const int32_t rows = repeat0 + repeat1;
 
   // Fold: tmp[r][i] = src[r][i] + src[r][i + mask].  Block strides are 1 (the
   // lanes of a row are consecutive datablocks); the two sources advance by the
   // same row stride, one of them starting `mask` lanes in.
   set_mask(mask, sizeof(T));
-  vadd(tmp, src, src + mask, repeat_times,
+  vadd(tmp, src, src + mask, rows,
        /*dst_blk*/ 1, /*src0_blk*/ 1, /*src1_blk*/ 1,
        /*dst_rep*/ tmp_rep_stride, /*src0_rep*/ src_rep_stride,
        /*src1_rep*/ src_rep_stride);
   pipe_barrier(PIPE_V);
 
-  // One reduce for all rows.  MODE=0: one result per repeat, into dst.
+  // One reduce per destination, each over its own slice of tmp.
   set_mask(mask, sizeof(T));
-  vcadd(dst, tmp, repeat_times,
-        /*dst_rep*/ 1, /*src_blk*/ 1, /*src_rep*/ tmp_rep_stride,
-        /*MODE*/ 0);
+  vcadd(dst0, tmp, repeat0, /*dst_rep*/ 1, /*src_blk*/ 1,
+        /*src_rep*/ tmp_rep_stride, /*MODE*/ 0);
+  set_mask(mask, sizeof(T));
+  vcadd(dst1, tmp + repeat0 * elems_per_row, repeat1, /*dst_rep*/ 1,
+        /*src_blk*/ 1, /*src_rep*/ tmp_rep_stride, /*MODE*/ 0);
 }
 
 #define REGISTER_CIFACE_FOLD_REDUCE_ROWS(TYPE_NAME, T)                         \
   __aiv__ __attribute__((always_inline)) void                                  \
       _mlir_ciface_custom_fold_reduce_rows_##TYPE_NAME(                        \
-          memref_t<__ubuf__ T, 1> *src, const int32_t repeat_times,            \
-          const int32_t mask, const int32_t src_rep_stride,                    \
-          memref_t<__ubuf__ T, 1> *dst, memref_t<__ubuf__ T, 1> *tmp) {        \
+          memref_t<__ubuf__ T, 1> *src, const int32_t repeat0,                 \
+          const int32_t repeat1, const int32_t mask,                           \
+          const int32_t src_rep_stride, memref_t<__ubuf__ T, 1> *dst0,         \
+          memref_t<__ubuf__ T, 1> *dst1, memref_t<__ubuf__ T, 1> *tmp) {       \
     auto src_ptr = src->aligned + src->offset;                                 \
-    auto dst_ptr = dst->aligned + dst->offset;                                 \
+    auto dst0_ptr = dst0->aligned + dst0->offset;                              \
+    auto dst1_ptr = dst1->aligned + dst1->offset;                              \
     auto tmp_ptr = tmp->aligned + tmp->offset;                                 \
-    fold_reduce_rows_impl<T>(dst_ptr, tmp_ptr, src_ptr, repeat_times, mask,    \
-                             src_rep_stride);                                  \
+    fold_reduce_rows_impl<T>(dst0_ptr, dst1_ptr, tmp_ptr, src_ptr, repeat0,    \
+                             repeat1, mask, src_rep_stride);                   \
   }
 
 extern "C" {

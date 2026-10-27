@@ -528,24 +528,31 @@ class fold_reduce_rows:
     """
     /*
      * Function:
-     *   Fold each row's two halves together, then reduce all rows to one result
-     *   each, in two instructions.  This is the multi-result reduce that
+     *   Fold each row's two halves together, then reduce rows to one result
+     *   each, in three instructions.  This is the multi-result reduce that
      *   triton cannot express: a tl.sum over C rows becomes C separate
-     *   reductions, and tl.join/tl.split do not lower on this backend.
+     *   reductions, tl.join/tl.split do not lower on this backend, and a single
+     *   contiguous result vector could not be split back apart afterwards.
      *
-     *   dst[r] = sum_{i < mask} ( src[r, i] + src[r, i + mask] )
+     *   dst0[r] = sum_{i < mask} ( src[r, i] + src[r, i + mask] )   r < repeat0
+     *   dst1[r] = same, for rows [repeat0, repeat0 + repeat1)
+     *
+     *   Two destinations because the caller consumes the two results
+     *   separately (a norm pair, a v/out pair) and cannot slice.
      *
      * Inputs:
-     *   src: UB tensor holding [repeat_times, 2 * mask] row-major, rows
+     *   src: UB tensor holding [repeat0 + repeat1, 2 * mask] row-major, rows
      *     src_rep_stride datablocks apart
-     *   repeat_times: number of rows, i.e. number of results
+     *   repeat0: rows feeding dst0
+     *   repeat1: rows feeding dst1, starting at row repeat0
      *   mask: lanes per half; mask == 64 covers one 256 B register per repeat
      *   src_rep_stride: address stride between adjacent rows, in 32 B datablocks
      *
      * Outputs:
-     *   out: required two-element sequence
-     *     - out[0] / dst: UB tensor of repeat_times results, contiguous
-     *     - out[1] / tmp: UB scratch of [repeat_times, mask], same dtype
+     *   out: required three-element sequence
+     *     - out[0] / dst0: UB tensor of repeat0 results, contiguous
+     *     - out[1] / dst1: UB tensor of repeat1 results, contiguous
+     *     - out[2] / tmp: UB scratch of [(repeat0 + repeat1) * mask], same dtype
      */
     """
 
@@ -553,16 +560,14 @@ class fold_reduce_rows:
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
-    def __init__(self, src, repeat_times, mask, src_rep_stride, out=None):
-        assert out is not None and len(out) == 2, (
-            "fold_reduce_rows requires out to be [dst, tmp]")
+    def __init__(self, src, repeat0, repeat1, mask, src_rep_stride, out=None):
+        assert out is not None and len(out) == 3, (
+            "fold_reduce_rows requires out to be [dst0, dst1, tmp]")
         dt = _element_dtype(src)
-        assert _element_dtype(out[0]) == dt, (
-            f"fold_reduce_rows requires dst dtype ({_element_dtype(out[0])}) "
-            f"to match src dtype ({dt})")
-        assert _element_dtype(out[1]) == dt, (
-            f"fold_reduce_rows requires tmp dtype ({_element_dtype(out[1])}) "
-            f"to match src dtype ({dt})")
+        for i, name in enumerate(("dst0", "dst1", "tmp")):
+            assert _element_dtype(out[i]) == dt, (
+                f"fold_reduce_rows requires {name} dtype "
+                f"({_element_dtype(out[i])}) to match src dtype ({dt})")
         if dt == tl.float16:
             self.symbol = "custom_fold_reduce_rows_half"
         elif dt == tl.float32:

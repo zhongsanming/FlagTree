@@ -36,9 +36,6 @@ torch.  It passed at rows=1/2/16/32/64.
 from __future__ import annotations
 
 import argparse
-import statistics
-import sys
-import time
 
 import torch
 
@@ -54,74 +51,27 @@ import triton.experimental.tle as tle
 
 
 @triton.jit
-def _fold_reduce_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
-                        FULL: tl.constexpr, ROW_BLK: tl.constexpr,
-                        REPEAT: tl.constexpr):
-    """Grid: one program; a [ROWS, FULL] tile in, ROWS sums out.
+def _fold_reduce_kernel(X, Y0, Y1, ROWS: tl.constexpr, ROWS2: tl.constexpr,
+                        HALF: tl.constexpr, FULL: tl.constexpr,
+                        ROW_BLK: tl.constexpr):
+    """One op, two destinations: rows [0, ROWS) -> Y0, [ROWS, ROWS2) -> Y1.
 
-    REPEAT exists because one launch costs ~140 us of host time here, which is
-    larger than the op: timing a single call per launch measures the launch
-    floor (the first version of this probe did exactly that and reported
-    128-141 us for every row count, the same trap probe_dot hit).  The repeats
-    are accumulated, so they are a dependent chain the compiler cannot elide,
-    and per-op cost is (ms - floor)/REPEAT.
-
-    Three conventions of `tle.dsa.ascend.raw`, all learned from
-    python/tutorials/tle/custom/test_custom_ops.py:
-
-      * inputs must be *tensors*: a buffer has to go through
-        `tle.dsa.to_tensor` (passing the buffer raises
-        "Unsupported argument type <..buffer>").
-      * `out=` also takes tensors, not buffers -- the tutorial passes
-        `tl.zeros([..])` for every output and rebinds the returned values.
-      * FULL = 2*HALF is passed in rather than computed here, because tl.arange
-        and tle.dsa.alloc want compile-time literals.
+    The source is a *computed* tensor (a plain tl.load), which probe_concat
+    proved raw() accepts, so nothing is staged through a buffer.  Two
+    destinations rather than one vector because the caller consumes the two
+    results separately and triton cannot slice a tensor.
     """
-    idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
+    idx = tl.arange(0, ROWS2)[:, None] * FULL + tl.arange(0, FULL)[None, :]
+    src = tl.load(X + idx)
 
-    src_ub = tle.dsa.alloc([ROWS, FULL], dtype=tl.float32,
-                           mem_addr_space=tle.dsa.ascend.UB)
-    tle.dsa.copy(X + idx, src_ub, [ROWS, FULL])
-    src_t = tle.dsa.to_tensor(src_ub)
-
-    acc = tl.zeros([ROWS], dtype=tl.float32)
-    dst_t = tl.zeros([ROWS], dtype=tl.float32)
-    tmp_t = tl.zeros([ROWS * HALF], dtype=tl.float32)
-    for _ in range(REPEAT):
-        dst_t, tmp_t = tle.dsa.ascend.raw(
-            "fold_reduce_rows", src_t, ROWS, HALF, ROW_BLK,
-            out=[dst_t, tmp_t])
-        acc += dst_t
-    tl.store(Y + tl.arange(0, ROWS), acc)
-
-
-@triton.jit
-def _triton_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
-                   FULL: tl.constexpr, REPEAT: tl.constexpr):
-    """The reference cost: what the same job costs without the custom op."""
-    idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
-    a = tl.load(X + idx)
-    lo = tl.reshape(a, [ROWS, 2, HALF])
-    acc = tl.zeros([ROWS], dtype=tl.float32)
-    s = tl.zeros([ROWS], dtype=tl.float32)
-    for _ in range(REPEAT):
-        s = tl.sum(tl.sum(lo, axis=2), axis=1)
-        acc += s
-    tl.store(Y + tl.arange(0, ROWS), acc)
-
-
-def _run(fn, reps: int, warmup: int) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.npu.synchronize()
-    ts = []
-    for _ in range(reps):
-        torch.npu.synchronize()
-        t0 = time.perf_counter()
-        fn()
-        torch.npu.synchronize()
-        ts.append((time.perf_counter() - t0) * 1e6)
-    return statistics.median(ts)
+    d0 = tl.zeros([ROWS], dtype=tl.float32)
+    d1 = tl.zeros([ROWS], dtype=tl.float32)
+    tmp = tl.zeros([ROWS2 * HALF], dtype=tl.float32)
+    d0, d1, tmp = tle.dsa.ascend.raw(
+        "fold_reduce_rows", src, ROWS, ROWS, HALF, ROW_BLK,
+        out=[d0, d1, tmp])
+    tl.store(Y0 + tl.arange(0, ROWS), d0)
+    tl.store(Y1 + tl.arange(0, ROWS), d1)
 
 
 def main() -> None:
@@ -129,16 +79,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--rows", default="1,2,16",
-                   help="rows per program; comma separated")
+                   help="rows per destination; comma separated")
     p.add_argument("--mask", type=int, default=64)
-    p.add_argument("--repeat", type=int, default=64,
-                   help="op calls per launch; the launch floor (~140 us) is "
-                        "subtracted, so this must be >> 1 to see anything")
-    p.add_argument("--floor-us", type=float, default=140.0,
-                   help="measured one-launch host floor, subtracted from both "
-                        "columns before dividing by --repeat")
-    p.add_argument("--reps", type=int, default=20)
-    p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--tol", type=float, default=1e-5)
     args = p.parse_args()
 
@@ -146,63 +88,46 @@ def main() -> None:
         raise SystemExit("this needs an NPU (torch_npu)")
     torch.npu.set_device(args.device)
 
+    half = args.mask
+    full = 2 * half
+    row_blk = full * 4 // 32              # 32 B datablocks per row of fp32
     ok = True
-    print(f"device={args.device}  HALF={args.mask}  repeat={args.repeat}  "
-          f"reps={args.reps}  launch floor assumed {args.floor_us:.0f} us")
-    print(f"{'rows':>5} {'max |err|':>11} {'rel':>9} {'op us':>8} "
-          f"{'triton us':>10} {'speedup':>8}")
-    for rows in (int(x) for x in str(args.rows).split(",")):
-        full = 2 * args.mask
-        row_blk = full * 4 // 32          # 32 B datablocks per row
-        g = torch.Generator(device="cpu").manual_seed(rows)
-        x = torch.randn(rows, full, generator=g).to(args.device)
-        y = torch.zeros(rows, device=args.device)
-        y_ref = torch.zeros(rows, device=args.device)
+    print(f"device={args.device}  HALF={half}  FULL={full}")
+    print(f"{'rows':>5} {'max |err| d0':>13} {'max |err| d1':>13} {'rel':>9}")
 
+    for rows in (int(x) for x in str(args.rows).split(",")):
+        rows2 = 2 * rows
+        g = torch.Generator(device="cpu").manual_seed(rows)
+        x = torch.randn(rows2, full, generator=g).to(args.device)
+        y0 = torch.zeros(rows, device=args.device)
+        y1 = torch.zeros(rows, device=args.device)
         try:
-            rep = max(1, args.repeat)
-            _fold_reduce_kernel[(1,)](x, y, ROWS=rows, HALF=args.mask,
-                                      FULL=full, ROW_BLK=row_blk, REPEAT=rep)
+            _fold_reduce_kernel[(1,)](x, y0, y1, ROWS=rows, ROWS2=rows2,
+                                      HALF=half, FULL=full, ROW_BLK=row_blk)
             torch.npu.synchronize()
-            # REPEAT accumulations, so the reference is scaled to match
-            ref = rep * (x[:, :args.mask] + x[:, args.mask:]).sum(1)
-            err = (y - ref).abs().max().item()
-            rel = err / ref.abs().max().item()
+            folded = x[:, :half] + x[:, half:]
+            ref0 = folded[:rows].sum(1)
+            ref1 = folded[rows:].sum(1)
+            e0 = (y0 - ref0).abs().max().item()
+            e1 = (y1 - ref1).abs().max().item()
+            scale = max(ref0.abs().max().item(), ref1.abs().max().item())
+            rel = max(e0, e1) / scale
             good = rel < args.tol
             ok = ok and good
-            t_op = _run(lambda: _fold_reduce_kernel[(1,)](
-                x, y, ROWS=rows, HALF=args.mask, FULL=full, ROW_BLK=row_blk,
-                REPEAT=rep), args.reps, args.warmup)
-            t_tri = _run(lambda: _triton_kernel[(1,)](
-                x, y_ref, ROWS=rows, HALF=args.mask, FULL=full, REPEAT=rep),
-                args.reps, args.warmup)
-            # strip the launch floor before dividing by the repeat count
-            op_us = max(t_op - args.floor_us, 1e-3) / rep
-            tri_us = max(t_tri - args.floor_us, 1e-3) / rep
-            print(f"{rows:5d} {err:11.2e} {rel:9.2e} {op_us:8.3f} "
-                  f"{tri_us:10.3f} {tri_us / op_us:7.2f}x")
-        except Exception as exc:  # compile or device error is a result here
+            print(f"{rows:5d} {e0:13.2e} {e1:13.2e} {rel:9.2e} "
+                  f"{'PASS' if good else 'FAIL'}")
+        except Exception as exc:
             ok = False
-            detail = f"{type(exc).__name__}: {exc}".rstrip()
-            first = detail.splitlines()[0]
-            print(f"{rows:5d}  ERR {first[:100]}")
-            # The full message carries the triton location and the argument that
-            # was rejected; truncating it to one line is what cost a round trip
-            # before, so print the rest indented instead of dropping it.
-            rest = detail.splitlines()[1:]
-            for line in rest[:24]:
-                print(f"           {line}")
-            if len(rest) > 24:
-                print(f"           ... {len(rest) - 24} more lines")
+            detail = f"{type(exc).__name__}: {exc}".rstrip().splitlines()
+            print(f"{rows:5d}  ERR {detail[0][:90]}")
+            for line in detail[1:20]:
+                print(f"           {line.strip()[:110]}")
 
     print()
-    print("what to read:")
-    print("  rel ~1e-7        : the op is right (fp32 accumulation over 2*HALF lanes)")
-    print("  ERR              : the CIFACE arg order or the strides are wrong; the")
-    print("                     op takes (src, repeat, mask, src_rep_stride,")
-    print("                     dst, tmp) and src_rep_stride is in 32 B datablocks")
-    print("  speedup >> 1     : the primitive is worth wiring into the KDA kernel,")
-    print("                     where four reduces per token are 66 % of the time")
+    print("this is a correctness gate only (see the module docstring): an op call")
+    print("per launch cannot be timed above the ~140 us launch floor, and a repeat")
+    print("loop around it is either hoisted or needs a dependency that biases the")
+    print("comparison. The cost is estimated in situ instead.")
     raise SystemExit(0 if ok else 1)
 
 

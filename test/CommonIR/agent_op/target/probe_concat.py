@@ -51,14 +51,14 @@ import triton.experimental.tle as tle
 
 
 @triton.jit
-def _modular_kernel(X, K1, Q1, OUT, BV: tl.constexpr, BV2: tl.constexpr,
+def _modular_kernel(X, K1, Q1, OUT0, OUT1, BV: tl.constexpr, BV2: tl.constexpr,
                     K: tl.constexpr, HALF: tl.constexpr,
                     ROW_BLK: tl.constexpr):
     """[x*k ; x*q] built by duplicating x, then one fold_reduce_rows.
 
-    X stands in for a state tile; K1 and Q1 for the two per-token vectors.  The
-    tile is duplicated with `row % BV` so no concatenation is needed, and the
-    operand is selected per half with `where`.
+    This is the shape the KDA kernel needs: the two results are `v_corr` and
+    `out_part`, and they come back in two separate tensors so nothing has to be
+    sliced afterwards.
     """
     row = tl.arange(0, BV2)
     cols = tl.arange(0, K)
@@ -69,11 +69,13 @@ def _modular_kernel(X, K1, Q1, OUT, BV: tl.constexpr, BV2: tl.constexpr,
     w2 = tl.where(row[:, None] < BV, k1[None, :], q1[None, :])
     prod = x2 * w2                                   # [BV2, K], computed
 
-    dst_t = tl.zeros([BV2], dtype=tl.float32)
-    tmp_t = tl.zeros([BV2 * HALF], dtype=tl.float32)
-    dst_t, tmp_t = tle.dsa.ascend.raw(
-        "fold_reduce_rows", prod, BV2, HALF, ROW_BLK, out=[dst_t, tmp_t])
-    tl.store(OUT + row, dst_t)
+    d0 = tl.zeros([BV], dtype=tl.float32)
+    d1 = tl.zeros([BV], dtype=tl.float32)
+    tmp = tl.zeros([BV2 * HALF], dtype=tl.float32)
+    d0, d1, tmp = tle.dsa.ascend.raw(
+        "fold_reduce_rows", prod, BV, BV, HALF, ROW_BLK, out=[d0, d1, tmp])
+    tl.store(OUT0 + tl.arange(0, BV), d0)
+    tl.store(OUT1 + tl.arange(0, BV), d1)
 
 
 @triton.jit
@@ -131,17 +133,25 @@ def main() -> None:
     x = torch.randn(BV, K, generator=g).to(args.device)
     k1 = torch.randn(K, generator=g).to(args.device)
     q1 = torch.randn(K, generator=g).to(args.device)
-    out = torch.zeros(BV2, device=args.device)
+    out0 = torch.zeros(BV, device=args.device)
+    out1 = torch.zeros(BV, device=args.device)
 
     print(f"device={args.device}  BV={BV}  K={K}  HALF={HALF}")
 
-    ref = torch.cat([(x * k1).sum(1), (x * q1).sum(1)])
+    ref0 = (x * k1).sum(1)
+    ref1 = (x * q1).sum(1)
+    scale = max(ref0.abs().max().item(), ref1.abs().max().item())
+
+    def check_a():
+        e = max((out0 - ref0).abs().max().item(),
+                (out1 - ref1).abs().max().item())
+        return e / scale
 
     ok_a = _report(
         "stage A no-concat -> raw",
-        lambda: _modular_kernel[(1,)](x, k1, q1, out, BV=BV, BV2=BV2, K=K,
-                                      HALF=HALF, ROW_BLK=row_blk),
-        lambda: (out - ref).abs().max().item() / ref.abs().max().item())
+        lambda: _modular_kernel[(1,)](x, k1, q1, out0, out1, BV=BV, BV2=BV2,
+                                      K=K, HALF=HALF, ROW_BLK=row_blk),
+        check_a)
 
     ok_b = None
     if args.with_b:
