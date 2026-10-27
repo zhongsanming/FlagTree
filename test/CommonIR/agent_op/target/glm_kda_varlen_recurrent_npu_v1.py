@@ -55,6 +55,16 @@ import sys
 import triton
 import triton.language as tl
 
+# TLE is needed only by FUSE_RED=1, which replaces the two norm reductions with
+# fold_reduce_rows.  Guarded so the file still imports on a build without TLE:
+# the reference sits in a statically-false branch and is therefore never traced.
+try:
+    import triton.experimental.tle as tle
+    _HAS_TLE = True
+except Exception:  # pragma: no cover - build without TLE
+    tle = None
+    _HAS_TLE = False
+
 # ---------------------------------------------------------------------------
 # v0: validation, dispatch and the generic fallback stay there
 # ---------------------------------------------------------------------------
@@ -126,6 +136,9 @@ def _opt_recurrent_kernel_v1(
     SV: tl.constexpr,
     FLAT_STATE: tl.constexpr,
     PREFETCH: tl.constexpr,
+    FUSE_RED: tl.constexpr,
+    FUSE_HALF: tl.constexpr,
+    FUSE_ROW_BLK: tl.constexpr,
     SKIP_NORMS: tl.constexpr,
     SKIP_GATE: tl.constexpr,
     SKIP_VRED: tl.constexpr,
@@ -250,6 +263,24 @@ def _opt_recurrent_kernel_v1(
         # reductions, or the load dependency.
         if SKIP_NORMS:
             q = q * scale
+        elif FUSE_RED:
+            # Both norms from one fold_reduce_rows call.
+            #
+            # Op count is a wash against the base (q*q, k*k, concat, raw = 4 vs
+            # q*q+sum, k*k+sum = 4), so this exists to answer one question the
+            # cost model cannot: is a vconcat plus a vcadd cheaper than what
+            # tl.sum lowers to?  The state pair is deliberately absent -- the
+            # out = sum(sd*q) + (k.q)*v identity needs k.q, which is another
+            # reduction, so that fusion is 8 ops against the base's 5.
+            pair = tle.dsa.tile_concat((q * q)[None, :], (k * k)[None, :], 0)
+            s0 = tl.zeros([1], tl.float32)
+            s1 = tl.zeros([1], tl.float32)
+            tmpn = tl.zeros([2 * FUSE_HALF], tl.float32)
+            s0, s1, tmpn = tle.dsa.ascend.raw(
+                "fold_reduce_rows", pair, 1, 1, FUSE_HALF, FUSE_ROW_BLK,
+                out=[s0, s1, tmpn])
+            q = q * (scale / tl.sqrt(s0 + 1e-6))
+            k = k * (1.0 / tl.sqrt(s1 + 1e-6))
         else:
             s_q = tl.sum(q * q, axis=0)
             s_k = tl.sum(k * k, axis=0)
@@ -414,6 +445,11 @@ def _run_optimized_v1(
     if prefetch and ablate["SKIP_LOAD"]:
         raise ValueError("KDA_ABLATE=load needs KDA_PREFETCH=0")
     sched_overlap, sched_fused = _sched_flags()
+    fuse = _env_int("KDA_FUSE_RED", 0) != 0
+    if fuse and not _HAS_TLE:
+        raise ValueError("KDA_FUSE_RED needs TLE (triton.experimental.tle)")
+    if fuse and any(ablate.values()):
+        raise ValueError("KDA_FUSE_RED and KDA_ABLATE are mutually exclusive")
     if (sched_overlap or sched_fused) and any(ablate.values()):
         # The probes assume the baseline order, so keeping both knobs live
         # would make the attribution table meaningless.
@@ -438,6 +474,9 @@ def _run_optimized_v1(
         SKIP_VRED=ablate["SKIP_VRED"],
         SKIP_OUTRED=ablate["SKIP_OUTRED"],
         SKIP_LOAD=ablate["SKIP_LOAD"],
+        FUSE_RED=fuse,
+        FUSE_HALF=key_dim // 2,
+        FUSE_ROW_BLK=key_dim * 4 // 32,
         SCHED_OVERLAP=sched_overlap,
         SCHED_FUSED=sched_fused,
         num_warps=_env_int("KDA_NUM_WARPS", 1),
@@ -478,5 +517,6 @@ def config_summary() -> dict:
         "multibuffer": _env_int("KDA_MULTIBUFFER", 0) != 0,
         "num_warps": _env_int("KDA_NUM_WARPS", 1),
         "ablate": os.environ.get("KDA_ABLATE", "") or None,
+        "fuse_red": _env_int("KDA_FUSE_RED", 0) != 0,
         "sched": os.environ.get("KDA_SCHED", "base"),
     }

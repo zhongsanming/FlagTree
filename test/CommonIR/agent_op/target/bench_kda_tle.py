@@ -208,7 +208,7 @@ def apply_env(env: dict) -> None:
     for key in (
         "KDA_CORES", "KDA_BV", "KDA_MAX_BV", "KDA_PREFETCH",
         "KDA_FLAT_STATE", "KDA_STAGES", "KDA_MULTIBUFFER", "KDA_NUM_WARPS",
-        "KDA_ABLATE", "KDA_SCHED",
+        "KDA_ABLATE", "KDA_SCHED", "KDA_FUSE_RED",
     ):
         os.environ.pop(key, None)
     if _AMBIENT_CORES is not None:
@@ -297,6 +297,8 @@ _ALL_CONFIGS = [
     # reductions independent of the outer-product update.
     {"name": "v1_sched_ovl", "impl": "v1", "env": {"KDA_SCHED": "overlap"}},
     {"name": "v1_sched_fused", "impl": "v1", "env": {"KDA_SCHED": "fused"}},
+    # Norm pair through the fold_reduce_rows custom op (TLE + rebuilt bitcode).
+    {"name": "v1_fuse_norms", "impl": "v1", "env": {"KDA_FUSE_RED": 1}},
     # Timing probes (wrong math, attribution only).
     {"name": "v1_abl_norms", "impl": "v1", "env": {"KDA_ABLATE": "norms"}},
     {"name": "v1_abl_gate", "impl": "v1", "env": {"KDA_ABLATE": "gate"}},
@@ -308,6 +310,7 @@ _ALL_CONFIGS = [
 
 _DEFAULT_CONFIGS = tuple(cfg["name"] for cfg in _ALL_CONFIGS[:11])
 _SCHED_CONFIGS = ("v1_bv_auto", "v1_sched_ovl", "v1_sched_fused")
+_FUSE_CONFIGS = ("v1_bv_auto", "v1_fuse_norms")
 _ABLATE_CONFIGS = ("v1_bv_auto",) + tuple(
     cfg["name"] for cfg in _ALL_CONFIGS if cfg["name"].startswith("v1_abl_")
 )
@@ -325,6 +328,8 @@ def sweep_configs(selection: str = "default") -> list[dict]:
         wanted = set(_DEFAULT_CONFIGS)
     elif selection == "sched":
         wanted = set(_SCHED_CONFIGS)
+    elif selection == "fuse":
+        wanted = set(_FUSE_CONFIGS)
     elif selection == "ablate":
         wanted = set(_ABLATE_CONFIGS)
     else:
