@@ -1,4 +1,28 @@
-"""Chunked KDA recurrence in Triton — first cut: correctness before speed.
+"""Chunked KDA recurrence in Triton — PARKED (see KDA_ASCENDC_VS_TLE.md 6.8).
+
+Status, so nobody mistakes this for a working fast path:
+
+    C=16, --solve sweep, fp32   correct (1e-7) and 1488 ns/token = 0.7x the
+                               serial kernel -> not worth shipping
+    C=32, --solve double        FAILED, undiagnosed
+    C=64, --bf16                never run
+
+The C=32 failure is not evidence about the algorithm: the doubling solve, the
+`tril_ones @ g` cumsum and --gate-offset were all written in the same commit and
+only ever ran on device as C=16 with --solve sweep. The smallest experiment that
+would separate "my bug" from "the algorithm" is C=16 with --solve double; if
+anyone restarts this, do that first, and note that even on success the measured
+economics (6.7) cap C=16 at 1.34x.
+
+Why the whole route is parked rather than tuned: a chunked form wins by making
+matmuls large, and here they cannot be. A small dot with fresh operands costs
+~906 ns on this backend (1631 cycles, mostly UB->L1 staging), C is bounded by
+exp(-gc) <= exp(5C) < fp32 max (C <= 17 for any gate distribution), and the
+triangular solve is one step per token whatever C is. See 6.7 for the arithmetic
+and chunked_ref.py for the fp64 reference, which is validated to 1e-15 and is
+unaffected by any of this.
+
+Original scope note:
 
 Scope of this file, deliberately narrow so it can be validated on its own:
 
