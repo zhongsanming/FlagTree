@@ -178,34 +178,29 @@ Triton 侧这三项都不成立：
 `num_stages=3` H4 持平、H8 −1.0%；`multibuffer=1` 无变化。三条路都没效果，说明 DMA
 要么已经被编译器重叠，要么根本不是关键路径。`PREFETCH` 选项保留（默认关）以免以后再试一次。
 
-### P1.6 规约调度：把 `out` 从外积依赖里摘出来（实测指向的第一大头）
+### P1.6 规约调度 —— 实测失败（§6.6），但借它找到了真正的成本
 
 baseline 的顺序让两次 `tl.sum` 串行：`v ← sum(state·k)` → `state += k vᵀ` →
-`out ← sum(state·q)`，所以第二个规约必须等外积。但 §6.5 测出这两个阶段占 49%，
-且是**延迟受限**（BV=16 行填不满流水）——于是“让它们同时飞”就是最便宜的一大步。
+`out ← sum(state·q)`，所以第二个规约必须等外积。我用恒等式 `out = sum(sd·q) + (k·q)·v`
+把两者变成独立（`KDA_SCHED=overlap`），并试了 `tl.join → [BV,K,2] → sum → tl.split`
+的多结果规约（`fused`）。
 
-用恒等式改写（数值重结合，已获准）：
+结果：**`overlap` 慢 13–16%，`fused` 编译不过。** 因为摘依赖的代价是多一次 `k·q` 规约，
+而跨 lane 规约是吞吐受限、不能重叠的。结论反过来更有用：**一个 token 里的 4 次跨 lane
+规约就是那 ~1400 周期的主要构成，能动的只有“每 token 几次”这个数字。**
+代码保留（默认仍是 `base`）作为这条路的记录，不要再试它的变体。
 
-```
-sd = state · decay
-vc = Σ_j sd[b,j] k[j]        ┐ 两次规约都只依赖 sd，彼此独立
-op = Σ_j sd[b,j] q[j]        ┘ → 可重叠；out 也不再等外积
-v  = (v − vc) · β
-out= op + (k·q)·v            ← k·q 是 token 局部的 [K] 点积，本就早早就算完了
-state = sd + k vᵀ
-```
+### P1.5 批量 prep —— 已被 §6.6 降级：不做
 
-实现为 `KDA_SCHED=overlap`；`fused` 再用 `tl.join → [BV,K,2] → sum(axis=1) → tl.split`
-把两次规约合成一次（赌后端能发成一条带 2 repeats 的规约）。纯 Triton，不需要 TLE。
-预期 1.2–1.4×；判据：**比 baseline 快不到 10% 就回滚**，说明后端调度器不吃这套。
-
-### P1.5 批量 prep（覆盖 gate + norms ≈ 43%）
+（保留作为记录。）它只能批 token 本地的两个规约（`s_q`/`s_k`，~17%）与 gate（~26%），
+上限 ~1.3×，且需要在 TLE 里重写内核；chunked 会把同样的工作连同 state 规约一起吃掉，
+所以除非 `probe_dot.py` 证明 cube 不可用，否则不做这一步。
 
 §6 的拟合把每 token 拆成 `0.79 µs 固定 + 0.018 µs × BV`；BV=16 时固定部分占 **74%**，
 而其中真正的向量吞吐只有几十条指令——也就是说这 0.79 µs 几乎全是**依赖链延迟**
 （两次跨 lane 规约 + sqrt + gate 的 exp/div 链 + beta 链），与 tile 宽度无关。
 注意：按 §6.5 的消融，这里能用批量解决的只是 gate + norms（~43%），两次 state 规约
-已经由 P1.6 处理，两者的收益不可相加：它们共享同一条链。
+已经由 P1.6 处理（失败），两者的收益不可相加：它们共享同一条链。
 
 对策：把一个 chunk（BT=8/16）的 prep **按 token 批量算一次**，让 BT 倍的独立工作
 填满流水的深度，把“每 token 一次长链”变成“每 chunk 一次长链 + BT 次短的 state 更新”。
@@ -390,6 +385,51 @@ T=8192，`KDA_ABLATE` 探针（故意算错数，只用于定位那 1400 周期�
 而不是直接上 TLE。天花板是 `abl_all` 给出的 **3.4×**（8.86 → 2.62）；所有微优化都撞这个顶，
 再往前只能靠 token 轴并行。
 
+### 6.6 P1.6 实测：失败，而且给出了比“成功”更有用的结论
+
+`KDA_SCHED=overlap` 实测 **更慢**，`fused` 直接编译不过（`tl.join`/`tl.split` 这条
+多结果规约路径在这套 BiSheng 流水线里走不通）：
+
+| case | base | overlap | Δ |
+|---|---|---|---|
+| H4 T8192 | 8.859 ms | 10.020 ms | **+13.1%** |
+| H8 T8192 | 11.522 ms | 13.351 ms | **+15.9%** |
+| fused | — | `MLIRCompilationError` | 不可用 |
+
+原因不是“连接依赖”假设错了，而是**我对成本的归因错了**：
+
+* `overlap` 为了摘掉第二个规约对外积的依赖，必须多算一个 `k·q` 点积——**每 token 多了一次
+  跨 lane 规约**（在第 3 个规约）。四个规约变五个，代价 +13%，和实测完全吻合。
+* 也就是说：跨 lane 规约是**吞吐/发射受限**，不是“延迟可重叠”。从消融反推，一次
+  `[BV,K]` 规约在 T8192/H4 上大约值 2.2 ms（≈ 480 cycles/token/次）。
+* **一个 token 里有 4 次跨 lane 规约**（`s_q`、`s_k`、`vred`、`outred`），这就组成了那
+  个 ~1400 周期的固定预算的大部分。调 BV、预取、重排、合并——都改不了“每 token 四次”
+  这个数字。
+
+**只有一个数字值得改：每 token 的规约次数。** 只有两类办法能改它：
+
+1. **按 token 批量**（把 4 次/token 变成 4 次/BT token）—— 但只能批 token 本地的两个
+   （`s_q`/`s_k`），state 那两个是串行依赖，批不了；而且 `fused` 已经证明这套后端
+   发不出多结果规约，所以需要 TLE 的 UB + `extract_slice` 才能把批量结果按行取回。
+2. **把规约换成矩阵乘**（chunked delta rule）：`Σ_j` 变成 cube 上的 `tl.dot`，吞吐受限
+   而非延迟受限，而且一次处理 BT 个 token。
+
+所以路线图再改一次：
+
+* **放弃 P1.5（TLE 批量 prep）。** 它只能动 4 个规约里的 2 个（~17%）加上 gate（26%），
+  上限 1.3× 左右，而为了这些要在 TLE 里重写内核；chunked 把同样的工作连同 state 规约
+  一起吃掉，性价比不在一个量级。
+* **直接去 P4（chunked delta rule）**，但先花一次极小的实验确认前提：cube/`tl.dot` 在这套
+  流水线上能不能用、能不能 bf16 输入配 fp32 累加器、小 tile（64³/128³）的吞吐够不够。
+  这就是 `target/probe_dot.py`——**如果那里不成立，chunked 整条路线就不成立**，
+  那时候才回头去做 P1.5 的 1.3×。
+
+```bash
+cd test/CommonIR/agent_op/target
+python3 probe_dot.py                       # 约 9 次编译，几秒钟
+python3 probe_dot.py --shapes 64,128,256,512
+```
+
 ---
 
 ## 7. 验证与基准计划（由远程执行）
@@ -425,6 +465,7 @@ python3 bench_kda_tle.py sweep --configs ablate --tokens 8192 --out a.json
 | `test/CommonIR/agent_op/target/glm_kda_varlen_recurrent_npu_v1.py` | v1 kernel：core-aware BV、可选预取/扁平 state/`num_stages`，归一化倒数折叠；复用 v0 的校验与回退 |
 | `test/CommonIR/agent_op/target/bench_kda_tle.py` | 自包含标定 / 扫点 / 正确性脚本 |
 | `test/CommonIR/agent_op/target/test_kda_tle.py` | pytest 形式的正确性与状态语义检查 |
+| `test/CommonIR/agent_op/target/probe_dot.py` | cube 前提探针：`tl.dot` 各 dtype、小 tile 吞吐 |
 
 本轮追加：`KDA_ABLATE`（5 个计时探针，故意算错数）与 `--configs`（选列，控制编译次数），
 以及 §6 的实测结论。v1 的默认行为与上一轮完全一致（所有 `SKIP_*` 为 False 时生成同一份代码）。
