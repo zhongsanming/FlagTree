@@ -117,13 +117,21 @@ def _chunked_kernel(
         krec = kn * tl.exp(-gc)                           # k / lam  (the big one)
 
         # A^T[s,t] and Aq^T[s,t], one matmul each instead of a [C,C,K] tensor.
-        # Both are full C x C products, and the s > t half carries
-        # exp(gc_t - gc_s) > 1, which reaches 1e16 at C=16 (1e32 at the |g|=5
-        # bound).  Only s <= t is meaningful: MmT masks it below, and AqT must
-        # be masked too, otherwise dot(uT, AqT) sums the garbage half and the
-        # output comes out around 1e17 instead of O(1e-2).
-        AT = tl.dot(krec, tl.trans(ktil))                 # [C,C]
-        AqT = tl.where(upper, 0.0, tl.dot(krec, tl.trans(qtil)))
+        #
+        # Orientation, because getting it backwards is silent: with
+        #     AT[m,n] = sum_j kn[m,j] kn[n,j] exp(gc_n - gc_m),  m=s, n=t,
+        # and gc decreasing in t, exp(gc_n-gc_m) > 1 exactly when t < s.  So the
+        # *divergent* half is s > t and everything the algorithm reads lives in
+        # s <= t.  MmT keeps s < t (its diagonal comes from `eye`); AqT needs
+        # s <= t, because out_t = sum_{s<=t} Aq[t,s] u_s and the diagonal
+        # (exp(0) = 1) is the token's own term.
+        #
+        # Masking the wrong half is not caught by the magnitude: the largest
+        # term is the s = C-1 row, which survives both masks for every t, so the
+        # output stays at ~1e17 either way.
+        keep_lo = cidx[:, None] <= cidx[None, :]           # s <= t
+        AT = tl.dot(krec, tl.trans(ktil))                  # [C,C]
+        AqT = tl.where(keep_lo, tl.dot(krec, tl.trans(qtil)), 0.0)
         # Mm u = rhs has Mm[t,s] = beta_t A[t,s], unit lower triangular, so its
         # transpose is unit *upper* in [s,t] -- which is the orientation the
         # column sweep below consumes.
@@ -237,10 +245,14 @@ def _selftest(args) -> int:
         state_err = (state[1].float().cpu().double() - ref_S).abs().max().item()
         out_rel = out_err / ref_out.abs().max().item()
         state_rel = state_err / ref_S.abs().max().item()
+        # A magnitude ratio separates the two failure modes we have actually
+        # hit: wildly wrong values (~1e15) mean a divergent half was summed,
+        # while ~2 means the right values went to the wrong places.
+        mag = out.float().abs().max().item() / ref_out.abs().max().item()
         good = out_rel < args.tol and state_rel < args.tol
         ok = ok and good
         print(f"gate_gain={gain:6.1f}  out rel {out_rel:.3e}  state rel "
-              f"{state_rel:.3e}  tol {args.tol:.0e}  "
+              f"{state_rel:.3e}  |out| ratio {mag:9.2e}  "
               f"{'PASS' if good else 'FAIL'}")
 
     print(f"\nchunk={args.chunk} bv={args.bv} tokens={args.tokens} "
