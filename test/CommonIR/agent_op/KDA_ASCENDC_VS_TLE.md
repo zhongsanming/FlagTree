@@ -619,6 +619,44 @@ C=16 时约 **6550 cycles/token-head ÷ ~10 个 op ≈ 650 cycles/op**。同一�
 动个位数百分比。要真正突破，需要的是减少 op 数的原语（多结果规约、把 norm 折进 matmul），
 那是编译器/后端层面的能力，不是内核层面能解决的。
 
+### 6.11 多结果规约原语：做出来了、验证了，但无法盈利地接入
+
+按上一节的推论，我给 TLE 加了一个 custom op `fold_reduce_rows`（折叠两半 + 一次 `vcadd`，
+两个 dst），并逐步验证到每一步都成立：
+
+| 验证项 | 结果 |
+|---|---|
+| `tl.join`/`tl.split` 多结果规约 | 编不过（§6.6） |
+| 单 dst 版（`[repeat,2*mask]` → 1 个结果向量） | **rel = 0.00e+00** |
+| 双 dst 版（两结果直接分开返回） | **rel = 0.00e+00**（rows 1/2/16） |
+| 计算出来的 tensor 能否直接喂给 `raw` | **能**（不需要 `insert_slice`/buffer 构造） |
+| `insert_slice` 拼接两个 tile | **设备侧 UB 越界**，不可用 |
+| 用 `row % BV` + `where` 复制构造 KDA 需要的形状 | **PASS，rel = 0** |
+
+到这里原语本身无懈可击。但把它接进 kernel 需要的**tile 构造本身就是 op**，而每个 op 在这个
+后端要付 ~650 cycles（§6.10），所以拿 op 个数一算就否了：
+
+| | 基座 v1 | 融合版 | 结论 |
+|---|---|---|---|
+| norms（`q*q`/`k*k` + 2 次规约） | 4 op | `q*q`+`k*k`+`where`+1 raw = **4 op** | 持平 |
+| state（`state*k`+规约、`state*q`+规约） | 5 op | 2 broadcast + `where` + `reshape` + mul + 1 raw = **6 op** | **更差** |
+| overlap 恒等式还要一个 `k·q` | — | +2 op（又一次规约） | 更差 |
+
+那次 "1.35×" 的前提是 `[2,BV,K]` 这种拼装**免费**。它不是：`where`／`broadcast`／`reshape`
+恰好就是成本模型里计的那 650 cycles。所以接入后净收益 ≈ 0，state 那一对甚至是负的。
+
+**因此结论要修正到比 §6.10 更具体的一层：缺口不在 "缺 AscendC 原语"，而在前端的 tensor 代数。**
+真正能解锁 1.35× 的不是硬件指令，而是**便宜的 concat / slice / split** —— 一旦 `tl.split`
+能 lowering：(a) op 只需要一个 dst（不需要双 dst 这个绕法），(b) state 那一对变成
+`mul + raw` = 2 op（代替 5），(c) 单这一对就能省 ~3 op/token ≈ 26%。
+
+所以对这个项目来说，给 TLE 加 AscendC 原语的收益排序是：
+
+1. **前端 slice/concat/split lowering** —— 唯一能把 26% 拿回来的；
+2. 多结果规约（已完成，`fold_reduce_rows`）—— 依赖 1 才能生效；
+3. `MulAddDst`、`Brcb` 等（5–8%）；
+4. `IBSet/IBWait`（对我们 ≈ 0，见 §6.7）。
+
 ---
 
 ## 7. 验证与基准计划（由远程执行）
