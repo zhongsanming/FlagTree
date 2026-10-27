@@ -131,6 +131,8 @@ def _opt_recurrent_kernel_v1(
     SKIP_VRED: tl.constexpr,
     SKIP_OUTRED: tl.constexpr,
     SKIP_LOAD: tl.constexpr,
+    SCHED_OVERLAP: tl.constexpr,
+    SCHED_FUSED: tl.constexpr,
 ):
     """One program per (value tile, sequence, head); state tile held in UB.
 
@@ -263,23 +265,63 @@ def _opt_recurrent_kernel_v1(
             decay = tl.exp(gate)
             beta = 1.0 / (1.0 + tl.exp(-b))
 
-        # state *= exp(gate); v = beta * (v - sum(state * k)); state += k v^T
-        state = state * decay[None, :]
-        if SKIP_VRED:
-            v = v * beta
-        else:
-            v = v - tl.sum(state * k[None, :], axis=1)
-            v = v * beta
-        state = state + k[None, :] * v[:, None]
+        # ── state update ────────────────────────────────────────────────
+        # Baseline (the shape upstream uses):
+        #     state *= decay; v = beta*(v - sum(state*k)); state += k v^T
+        #     out = sum(state*q)
+        # `out` therefore sits downstream of the outer-product update, so the
+        # two reductions cannot overlap and the loop pays both latencies back
+        # to back.  The measurements (see KDA_ASCENDC_VS_TLE.md 6) put those
+        # two stages at ~49 % of the wall clock.
+        #
+        # SCHED_OVERLAP/SCHED_FUSED use the identity
+        #     out = sum(state_d*q) + (k.q)*v,   state_d = state*decay
+        # so both reductions depend only on state_d, become independent, and
+        # `out` no longer waits for the update.  This is a reassociation, legal
+        # because the contract is tolerance-based, not bit-exact.  The probes
+        # assume the baseline order, so the launcher makes the two mutually
+        # exclusive.
+        if SCHED_OVERLAP or SCHED_FUSED:
+            state_d = state * decay[None, :]
+            if SCHED_FUSED:
+                # One reduce, two results: reduce the interleaved [BV, K, 2]
+                # tile over K, then split the trailing axis (which is 2).
+                pair = tl.sum(
+                    tl.join(state_d * k[None, :], state_d * q[None, :]),
+                    axis=1,
+                )
+                v_corr, out_part = tl.split(pair)
+            else:
+                v_corr = tl.sum(state_d * k[None, :], axis=1)
+                out_part = tl.sum(state_d * q[None, :], axis=1)
+            kq = tl.sum(k * q, axis=0)
 
-        if TRACK_STATE:
-            if track_slot > 0 and i + 1 == track_len:
-                tl.store(ptrack, state, mask=mask_h)
+            v = (v - v_corr) * beta
+            state = state_d + k[None, :] * v[:, None]
 
-        if SKIP_OUTRED:
-            out = v * 0.5
+            if TRACK_STATE:
+                if track_slot > 0 and i + 1 == track_len:
+                    tl.store(ptrack, state, mask=mask_h)
+
+            out = out_part + kq * v
         else:
-            out = tl.sum(state * q[None, :], axis=1)
+            state = state * decay[None, :]
+            if SKIP_VRED:
+                v = v * beta
+            else:
+                v = v - tl.sum(state * k[None, :], axis=1)
+                v = v * beta
+            state = state + k[None, :] * v[:, None]
+
+            if TRACK_STATE:
+                if track_slot > 0 and i + 1 == track_len:
+                    tl.store(ptrack, state, mask=mask_h)
+
+            if SKIP_OUTRED:
+                out = v * 0.5
+            else:
+                out = tl.sum(state * q[None, :], axis=1)
+
         tl.store(o_base + pcur * stride_t,
                  out.to(OUT.dtype.element_ty), mask=mask_v)
 
@@ -321,6 +363,25 @@ def _ablation_flags() -> dict:
     return {f"SKIP_{name.upper()}": (name in names) for name in _ABLATIONS}
 
 
+_SCHED_MODES = {"base": (False, False), "overlap": (True, False), "fused": (True, True)}
+
+
+def _sched_flags() -> tuple[bool, bool]:
+    """Parse KDA_SCHED into (SCHED_OVERLAP, SCHED_FUSED).
+
+    base     upstream shape: out = sum(state_new*q), i.e. downstream of the
+             outer-product update and unable to overlap with the v reduction.
+    overlap  out = sum(state_d*q) + (k.q)*v, both reductions independent.
+    fused    same, with the two reductions emitted as one interleaved reduce.
+    """
+    spec = os.environ.get("KDA_SCHED", "base").strip().lower() or "base"
+    if spec not in _SCHED_MODES:
+        raise ValueError(
+            f"KDA_SCHED must be one of {sorted(_SCHED_MODES)}, got {spec!r}"
+        )
+    return _SCHED_MODES[spec]
+
+
 def _run_optimized_v1(
     *, q, k, v, a, b,
     A_log, dt_bias, output, state, indices, starts,
@@ -352,6 +413,11 @@ def _run_optimized_v1(
     prefetch = _env_int("KDA_PREFETCH", 0) != 0
     if prefetch and ablate["SKIP_LOAD"]:
         raise ValueError("KDA_ABLATE=load needs KDA_PREFETCH=0")
+    sched_overlap, sched_fused = _sched_flags()
+    if (sched_overlap or sched_fused) and any(ablate.values()):
+        # The probes assume the baseline order, so keeping both knobs live
+        # would make the attribution table meaningless.
+        raise ValueError("KDA_SCHED and KDA_ABLATE are mutually exclusive")
 
     grid = (key_dim // bv, num_seqs, heads)
     _opt_recurrent_kernel_v1[grid](
@@ -372,6 +438,8 @@ def _run_optimized_v1(
         SKIP_VRED=ablate["SKIP_VRED"],
         SKIP_OUTRED=ablate["SKIP_OUTRED"],
         SKIP_LOAD=ablate["SKIP_LOAD"],
+        SCHED_OVERLAP=sched_overlap,
+        SCHED_FUSED=sched_fused,
         num_warps=_env_int("KDA_NUM_WARPS", 1),
         num_stages=_env_int("KDA_STAGES", 1),
         multibuffer=_env_int("KDA_MULTIBUFFER", 0) != 0,
@@ -410,4 +478,5 @@ def config_summary() -> dict:
         "multibuffer": _env_int("KDA_MULTIBUFFER", 0) != 0,
         "num_warps": _env_int("KDA_NUM_WARPS", 1),
         "ablate": os.environ.get("KDA_ABLATE", "") or None,
+        "sched": os.environ.get("KDA_SCHED", "base"),
     }
