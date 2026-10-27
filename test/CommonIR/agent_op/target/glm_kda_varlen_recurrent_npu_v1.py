@@ -126,6 +126,11 @@ def _opt_recurrent_kernel_v1(
     SV: tl.constexpr,
     FLAT_STATE: tl.constexpr,
     PREFETCH: tl.constexpr,
+    SKIP_NORMS: tl.constexpr,
+    SKIP_GATE: tl.constexpr,
+    SKIP_VRED: tl.constexpr,
+    SKIP_OUTRED: tl.constexpr,
+    SKIP_LOAD: tl.constexpr,
 ):
     """One program per (value tile, sequence, head); state tile held in UB.
 
@@ -222,36 +227,59 @@ def _opt_recurrent_kernel_v1(
             bn = tl.load(b_base + pnxt * stride_t_b).to(tl.float32)
         else:
             tcur = pcur * stride_t
+            if SKIP_LOAD:
+                # Timing probe only: read token 0 of the sequence for every
+                # token, so the DMA is loop-invariant and cache-resident.  The
+                # difference against the control is how much of the per-token
+                # cost is the load dependency rather than the compute chain.
+                tcur = bos * stride_t
             q = tl.load(q_base + tcur, mask=mask_k, other=0.0).to(tl.float32)
             k = tl.load(k_base + tcur, mask=mask_k, other=0.0).to(tl.float32)
             v = tl.load(v_base + tcur, mask=mask_v, other=0.0).to(tl.float32)
             a = tl.load(a_base + tcur, mask=mask_k, other=0.0).to(tl.float32)
             b = tl.load(b_base + pcur * stride_t_b).to(tl.float32)
 
-        # L2 normalization with the reciprocal hoisted: one vector multiply per
-        # tensor instead of a vector divide plus a multiply.  Valid because the
-        # contract is tolerance-based, not bit-exact.
-        s_q = tl.sum(q * q, axis=0)
-        s_k = tl.sum(k * k, axis=0)
-        q = q * (scale / tl.sqrt(s_q + 1e-6))
-        k = k * (1.0 / tl.sqrt(s_k + 1e-6))
+        # --- ablations -----------------------------------------------------
+        # Timing probes, not correct math.  The measured per-token budget is an
+        # affine fit: ~0.79 us of BV-independent time plus ~0.018 us per BV
+        # unit, i.e. 74 % of the time at BV=16 is a serial chain that does not
+        # scale with the tile.  These switches attribute that chain: the two
+        # cross-lane reductions, the gate/beta exponentials, the two state
+        # reductions, or the load dependency.
+        if SKIP_NORMS:
+            q = q * scale
+        else:
+            s_q = tl.sum(q * q, axis=0)
+            s_k = tl.sum(k * k, axis=0)
+            q = q * (scale / tl.sqrt(s_q + 1e-6))
+            k = k * (1.0 / tl.sqrt(s_k + 1e-6))
 
-        x = a + b_bias
-        gate = lower_bound / (1.0 + tl.exp(-(decay_base * x)))
-        decay = tl.exp(gate)
-        beta = 1.0 / (1.0 + tl.exp(-b))
+        if SKIP_GATE:
+            decay = tl.full([D], 1.0, tl.float32)
+            beta = 0.5
+        else:
+            x = a + b_bias
+            gate = lower_bound / (1.0 + tl.exp(-(decay_base * x)))
+            decay = tl.exp(gate)
+            beta = 1.0 / (1.0 + tl.exp(-b))
 
         # state *= exp(gate); v = beta * (v - sum(state * k)); state += k v^T
         state = state * decay[None, :]
-        v = v - tl.sum(state * k[None, :], axis=1)
-        v = v * beta
+        if SKIP_VRED:
+            v = v * beta
+        else:
+            v = v - tl.sum(state * k[None, :], axis=1)
+            v = v * beta
         state = state + k[None, :] * v[:, None]
 
         if TRACK_STATE:
             if track_slot > 0 and i + 1 == track_len:
                 tl.store(ptrack, state, mask=mask_h)
 
-        out = tl.sum(state * q[None, :], axis=1)
+        if SKIP_OUTRED:
+            out = v * 0.5
+        else:
+            out = tl.sum(state * q[None, :], axis=1)
         tl.store(o_base + pcur * stride_t,
                  out.to(OUT.dtype.element_ty), mask=mask_v)
 
@@ -345,4 +373,5 @@ def config_summary() -> dict:
         "stages": _env_int("KDA_STAGES", 1),
         "multibuffer": _env_int("KDA_MULTIBUFFER", 0) != 0,
         "num_warps": _env_int("KDA_NUM_WARPS", 1),
+        "ablate": os.environ.get("KDA_ABLATE", "") or None,
     }

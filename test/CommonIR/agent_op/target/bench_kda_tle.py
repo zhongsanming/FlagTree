@@ -280,30 +280,64 @@ def cmd_calib(args, v1) -> None:
 # ---------------------------------------------------------------------------
 # sweep
 # ---------------------------------------------------------------------------
-def sweep_configs() -> list[dict]:
-    return [
-        {"name": "v0_autotune", "impl": "v0", "env": {}},
-        {"name": "v1_bv_auto", "impl": "v1", "env": {}},
-        {"name": "v1_bv_auto_pf", "impl": "v1", "env": {"KDA_PREFETCH": 1}},
-        {"name": "v1_bv_auto_st2", "impl": "v1", "env": {"KDA_STAGES": 2}},
-        {"name": "v1_bv_auto_st3", "impl": "v1", "env": {"KDA_STAGES": 3}},
-        {"name": "v1_bv_auto_mb", "impl": "v1", "env": {"KDA_MULTIBUFFER": 1}},
-        {"name": "v1_bv_auto_flat", "impl": "v1", "env": {"KDA_FLAT_STATE": 1}},
-        {"name": "v1_bv16", "impl": "v1", "env": {"KDA_BV": 16}},
-        {"name": "v1_bv32", "impl": "v1", "env": {"KDA_BV": 32}},
-        {"name": "v1_bv64", "impl": "v1", "env": {"KDA_BV": 64}},
-        {"name": "v1_bv128", "impl": "v1", "env": {"KDA_BV": 128}},
-    ]
+_ALL_CONFIGS = [
+    {"name": "v0_autotune", "impl": "v0", "env": {}},
+    {"name": "v1_bv_auto", "impl": "v1", "env": {}},
+    {"name": "v1_bv_auto_pf", "impl": "v1", "env": {"KDA_PREFETCH": 1}},
+    {"name": "v1_bv_auto_st2", "impl": "v1", "env": {"KDA_STAGES": 2}},
+    {"name": "v1_bv_auto_st3", "impl": "v1", "env": {"KDA_STAGES": 3}},
+    {"name": "v1_bv_auto_mb", "impl": "v1", "env": {"KDA_MULTIBUFFER": 1}},
+    {"name": "v1_bv_auto_flat", "impl": "v1", "env": {"KDA_FLAT_STATE": 1}},
+    {"name": "v1_bv16", "impl": "v1", "env": {"KDA_BV": 16}},
+    {"name": "v1_bv32", "impl": "v1", "env": {"KDA_BV": 32}},
+    {"name": "v1_bv64", "impl": "v1", "env": {"KDA_BV": 64}},
+    {"name": "v1_bv128", "impl": "v1", "env": {"KDA_BV": 128}},
+    # Timing probes (wrong math, attribution only).
+    {"name": "v1_abl_norms", "impl": "v1", "env": {"KDA_ABLATE": "norms"}},
+    {"name": "v1_abl_gate", "impl": "v1", "env": {"KDA_ABLATE": "gate"}},
+    {"name": "v1_abl_vred", "impl": "v1", "env": {"KDA_ABLATE": "vred"}},
+    {"name": "v1_abl_outred", "impl": "v1", "env": {"KDA_ABLATE": "outred"}},
+    {"name": "v1_abl_load", "impl": "v1", "env": {"KDA_ABLATE": "load"}},
+    {"name": "v1_abl_all", "impl": "v1", "env": {"KDA_ABLATE": "all"}},
+]
+
+_DEFAULT_CONFIGS = tuple(cfg["name"] for cfg in _ALL_CONFIGS[:11])
+_ABLATE_CONFIGS = ("v1_bv_auto",) + tuple(
+    cfg["name"] for cfg in _ALL_CONFIGS if cfg["name"].startswith("v1_abl_")
+)
+
+
+def sweep_configs(selection: str = "default") -> list[dict]:
+    """Pick columns.  `default` is the 11-config table, `ablate` is the
+    attribution run, `all` adds everything.  Every distinct
+    (BV, PREFETCH, FLAT_STATE, ABLATE, num_stages, multibuffer) combination
+    costs one Triton compile."""
+    if selection in ("all", "*"):
+        return list(_ALL_CONFIGS)
+    if selection in ("", "default"):
+        wanted = set(_DEFAULT_CONFIGS)
+    elif selection == "ablate":
+        wanted = set(_ABLATE_CONFIGS)
+    else:
+        wanted = {name.strip() for name in selection.split(",") if name.strip()}
+        known = {cfg["name"] for cfg in _ALL_CONFIGS}
+        unknown = wanted - known
+        if unknown:
+            raise SystemExit(
+                f"unknown --configs {sorted(unknown)}; known: {sorted(known)}"
+            )
+    return [cfg for cfg in _ALL_CONFIGS if cfg["name"] in wanted]
 
 
 def cmd_sweep(args, v0, v1) -> None:
     heads_list = [int(x) for x in args.heads.split(",")]
     tokens_list = [int(x) for x in args.tokens.split(",")]
+    configs = sweep_configs(args.configs)
     results = []
 
     print(f"cores={os.environ.get('KDA_CORES', '40')}  "
-          f"warmup={args.warmup}  reps={args.reps}")
-    header = f"{'case':>18}  " + "  ".join(f"{c['name']:>18}" for c in sweep_configs())
+          f"warmup={args.warmup}  reps={args.reps}  configs={len(configs)}")
+    header = f"{'case':>18}  " + "  ".join(f"{c['name']:>18}" for c in configs)
     print(header)
     print("-" * len(header))
 
@@ -314,7 +348,7 @@ def cmd_sweep(args, v0, v1) -> None:
             kw = arms(case)
             row = {"heads": heads, "tokens": tokens, "arms": {}}
             cells = []
-            for cfg in sweep_configs():
+            for cfg in configs:
                 apply_env(cfg["env"])
                 if cfg["impl"] == "v0":
                     run = lambda st, kw=kw: v0.glm_kda_varlen_recurrent_npu(
@@ -412,6 +446,9 @@ def main() -> None:
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1979)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--configs", default="default",
+                        help="'default', 'ablate', 'all', or a comma-separated "
+                             "list of sweep config names")
     args = parser.parse_args()
 
     if args.command == "check" and args.tokens == "1024,2048,4096,8192,16384":

@@ -155,6 +155,11 @@ Triton 侧这三项都不成立：
 
 ## 5. prefill H4、H8 的优化路线（按性价比排序）
 
+> **第一次实测后本节已重排（见 §6）。** P1（DMA 双缓冲 / 软件流水）被证伪：预取、
+> `num_stages`、`multibuffer` 全部 ±1%。真正的开销是**每 token 一条 ~1400 周期的
+> 串行依赖链**（与 BV 无关），所以现在的大头是 P1.5（批量 prep），而不是 DMA。
+> 下面的 P0/P1/P2/P3/P4 保留原编号以便和上一轮对话对应，新增项插入为 P1.5。
+
 ### P0 标定（先做，否则后面全是猜）
 
 1. `bench_kda_tle.py calib`：固定每 block 工作量、扫 grid=1..64，延迟第一次跃升前的最后一个
@@ -164,15 +169,34 @@ Triton 侧这三项都不成立：
    * `num_stages>1` / `multibuffer=True` 是否真的把 token 循环的 DMA 叠起来；
    * v0 是否已经等价于 v1 的默认配置（若如此，收益只剩 P1/P3）。
 
-### P1 每 token 的 DMA 双缓冲（预期收益最大，可迁移自 AscendC 的 `double buffered`）
+### P1 每 token 的 DMA 双缓冲 —— 实测证伪，不要再做
 
-v0 在循环体里 `tl.load` q/k/a/v 四份，若编译器没有做软件流水，每个 token 都要等一次
-MTE2 延迟。AscendC 明确做了“先把下一个 token 预取到 `buf[nxt]`”这一步。
-Triton 侧两条路：
-* (a) `KDA_STAGES` / `KDA_MULTIBUFFER` 交给后端流水线（零代码改动，先测）；
-* (b) 手写一拍预取：循环外先取 `bos`，循环内先用当前值、再取 `min(i+1, seq_len-1)`
-  （索引钳位、无分支）。已实现于 `target/glm_kda_varlen_recurrent_npu_v1.py` 的
-  `PREFETCH` 选项。
+原假设：v0 在循环体里 `tl.load` q/k/a/v，每个 token 要等一次 MTE2 延迟，
+应该像 AscendC 那样“先把下一个 token 预取到 `buf[nxt]`”。
+
+实测（T=16384）：`PREFETCH=1` H4 17.57 → 17.84 ms、H8 23.38 → 23.51 ms（**更慢**）；
+`num_stages=3` H4 持平、H8 −1.0%；`multibuffer=1` 无变化。三条路都没效果，说明 DMA
+要么已经被编译器重叠，要么根本不是关键路径。`PREFETCH` 选项保留（默认关）以免以后再试一次。
+
+### P1.5 批量 prep（实测指向的唯一大头）
+
+§6 的拟合把每 token 拆成 `0.79 µs 固定 + 0.018 µs × BV`；BV=16 时固定部分占 **74%**，
+而其中真正的向量吞吐只有几十条指令——也就是说这 0.79 µs 几乎全是**依赖链延迟**
+（两次跨 lane 规约 + sqrt + gate 的 exp/div 链 + beta 链），与 tile 宽度无关。
+
+对策：把一个 chunk（BT=8/16）的 prep **按 token 批量算一次**，让 BT 倍的独立工作
+填满流水的深度，把“每 token 一次长链”变成“每 chunk 一次长链 + BT 次短的 state 更新”。
+这与 AscendC 用 producer 把 prep 挪出关键路径是同一个目的，但**不需要跨核信号量**。
+
+实现障碍（正是 TLE 的价值所在）：批量算出的是 `[BT, D]`，而串行 state 更新每次只需要
+其中的第 r 行。纯 Triton 要么让 BT 成为最后一维再做递归 `tl.split`（等价于一次转置，
+Ascend 上很可能更贵），要么用 mask+reduce 取行（把省下的延迟又还回去）。
+TLE 的 `tle.dsa.alloc(UB)` + `tle.dsa.copy` + `tle.dsa.extract_slice` 正好可以
+“批量算 → 落到 UB → 循环里按行取”，`causal_conv1d_fn.py` 已经用了同一套写法。
+**这是“TLE 相对纯 Triton”的第一个可量化能力优势，不是纸面差异。**
+
+预期：把 74% 里的大部分延迟摊掉，1.5–2.5×（上限是把固定部分降到 0，H4/T16384
+17.6 → 4.6 ms；实际受 state 更新本身的依赖限制）。
 
 ### P2 grid 与 BV 对齐到“一波”
 
@@ -248,37 +272,122 @@ H=8 的 BV=16 与 BV=32 在 roofline 上等价（都是 80% 占用），但 BV=3
 
 ---
 
-## 6. 验证与基准计划（由远程执行）
+## 6. 第一次实测结果（单卡 910B / 40 AIV，CANN 9.1.0，triton 3.5.x）
 
-脚本：`target/bench_kda_tle.py`（自包含，不依赖 sglang）
+`bench_kda_tle.py sweep`，中位数（ms），warmup=5 / reps=20，单序列、2 个 state slot：
 
-```bash
-cd test/CommonIR/agent_op/target
-python3 bench_kda_tle.py calib
-python3 bench_kda_tle.py check  --out v1_check.json
-python3 bench_kda_tle.py sweep  --out v1_sweep.json
+| case | v0 | v1 | v1_pf | v1_st3 | v1_flat | BV16 | BV32 | BV64 | BV128 |
+|---|---|---|---|---|---|---|---|---|---|
+| H4 T1k | 1.439 | 1.400 | 1.413 | 1.400 | **1.381** | 1.396 | 1.714 | 2.293 | ERR |
+| H4 T2k | 2.543 | 2.455 | 2.486 | 2.462 | **2.411** | 2.448 | 3.078 | 4.212 | ERR |
+| H4 T4k | 4.793 | 4.597 | 4.651 | 4.591 | **4.499** | 4.583 | 5.842 | 8.105 | ERR |
+| H4 T8k | 9.224 | 8.856 | 8.963 | 8.842 | **8.660** | 8.838 | 11.359 | 15.903 | ERR |
+| H4 T16k | 18.361 | 17.571 | 17.839 | 17.599 | **17.252** | 17.597 | 22.604 | 31.500 | ERR |
+| H8 T1k | 1.800 | 1.733 | 1.725 | 1.713 | 1.760 | 2.464 | **1.713** | 2.280 | ERR |
+| H8 T2k | 3.252 | 3.101 | 3.115 | 3.096 | 3.181 | 4.592 | 3.095 | 4.225 | ERR |
+| H8 T4k | 6.171 | 5.871 | 5.896 | 5.854 | 5.998 | 8.844 | 5.849 | 8.106 | ERR |
+| H8 T8k | 12.138 | 11.535 | 11.621 | 11.495 | 11.783 | 17.617 | 11.464 | 15.925 | ERR |
+| H8 T16k | 24.718 | 23.378 | 23.514 | **23.150** | 23.735 | 36.827 | 23.155 | 31.493 | ERR |
+
+（`v0` 为 autotune；`v1` 即 `KDA_BV=auto`；`v1_st2`、`v1_mb` 与 `v1` 差 <0.3%，未列。）
+
+### 6.1 v1 只赢了 4–6%
+
+T=16384：H4 18.36 → 17.57（auto，**−4.3%**）→ 17.25（flat，**−6.0%**）；
+H8 24.72 → 23.38（auto，**−5.4%**）→ 23.15（st3，**−6.3%**）。
+收益主要来自归一化倒数折叠（每 token 少两次 128 通道除法）和 BV 选择，不来自任何
+结构改动。**v0 的 kernel 已经接近它这个形状的局部最优。**
+
+### 6.2 BV / wave 模型方向对、幅度错
+
+BV=128 全部 `ERR`（UB 溢出复现）；BV=32/64 比 BV=16 只慢 28%/79%，不是模型预测的 2×/4×。
+原因：单 block 时间不是 ∝ BV，而是**仿射**：
+
+```
+per_token(µs, H4) = 0.79 (固定) + 0.0177 × BV      # 拟合 R²≈0.999，T≥4096 稳定
+per_token(µs, H8) = 0.90 (固定) + 0.0170 × BV
 ```
 
-* `calib`：固定每 block 工作量、扫 grid=1..64，延迟第一次跃升前的最后一个 grid 即有效
-  AIV 数（预期 40）。
-* `check`：与纯 PyTorch 串行参考实现对比（T∈{64,128,256}、H∈{4,8}），给 max|Δ|、cos 与
-  rtol/atol 判定。
-* `sweep`：T∈{1024,2048,4096,8192,16384} × H∈{4,8}，对
-  `{v0_autotune, v1(默认/BV16/32/64/128/prefetch/stages/multibuffer/flat)}` 取中位数。
+| H | T | per-token µs | 固定部分 | 固定占比 |
+|---|---|---|---|---|
+| 4 | 1024 | 1.363 | 1.071 | 78.6% |
+| 4 | 16384 | 1.074 | 0.791 | 73.7% |
+| 8 | 1024 | 1.673 | 1.119 | 66.9% |
+| 8 | 16384 | 1.413 | 0.904 | 64.0% |
 
-需要回传：`calib` 的 suggested AIV 数、`sweep` 的 JSON、`check` 的 JSON，以及任何编译/运行
-报错原文。
+固定部分 ≈ 0.3 ms 的 launch/调度开销 + 0.77 µs/token（T 越大占比越高；T=1024 时那
+0.3 ms 约占 22%，含 Python/dispatch，不计在内核对 kernel 无意义）。
 
-判定标准（先写死，避免事后解释）：
+**关键推论：BV=16 时 74% 的时间是与 tile 宽度无关的每 token 串行链。** 而这一链的实际
+向量吞吐只有几十条 128-lane 指令（完美流水下 T=16384 应 ≈0.4 ms），所以它是
+**纯延迟受限**，不是吞吐受限。state 那部分反而是健康的：`0.0177 µs/BV` ≈ 每条 128-lane
+指令 3 个周期，已经接近硬件吞吐极限。
 
-* `check` 必须 PASS（rtol=3e-2，atol=2e-3，bf16 输出）；
-* `sweep` 里 v1 至少要在 (T=8192,H=4) 与 (T=8192,H=8) 上不慢于 v0，否则回滚对应选项；
-* 与 AscendC 的对比用现有的 `bench_glm_kda_varlen_recurrent_npu.py` 那一套
-  （需要 sglang），在 8 卡机上可以正常跑；对照口径取 `prepared` 列。
+这同时修正了 §3 的错误估计：prep 的**吞吐**占比确实只有 ~5%，但它在**串行关键路径**上，
+按 wall-clock 占约 74%。AscendC 的 producer 买到的不是“省掉 prep 的算力”，而是“把这段
+延迟挪出关键路径”——所以它的 19% 是保守的。
+
+### 6.3 预取 / 软件流水全部无效（P1 被证伪）
+
+`v1_pf` 比 `v1` **慢** 1%，`v1_st3` 在 H8 上只快 1%（H4 持平），`v1_mb` 无变化。
+说明 DMA 不是关键路径（或编译器已重叠）。不要再在这条路上投入。
+
+### 6.4 `FLAT_STATE` 不对称：H4 +2%、H8 −1.5%
+
+H4（BV=16，8 KB tile）稳定快 2–4%，H8（BV=32，16 KB tile）稳定慢 1.5%。
+推测是 1-D 无 mask 搬在更大 tile 上丢了按 datablock 切分，但收益太小不值得为它分叉，
+保持默认关、按形状手动开。
+
+### 6.5 下一步：先归因，再决定要不要上 TLE
+
+`v1` 新增了 5 个计时探针（`KDA_ABLATE=norms|gate|vred|outred|load`，**故意算错数**，
+只用于归因）：
+
+```bash
+python3 bench_kda_tle.py sweep --tokens 8192 --configs ablate --out ablate.json
+```
+
+判读方法（T=8192，H4，基线 `v1` ≈ 8.86 ms）：
+
+* `abl_load` 明显下降 → 加载依赖是真因，回 P1（但要换实现方式，不是再试 `num_stages`）；
+* `abl_norms` / `abl_gate` 明显下降 → prep 链是真因，直接做 P1.5（批量 prep + TLE UB）；
+* `abl_vred` / `abl_outred` 明显下降 → 是那两次 state 规约的延迟，批量 prep 帮不上，
+  得改成“两个规约合并一次下三角计算”或直接上 chunked 算法；
+* 四项都降一点、每项 ~15% → 典型的长链，按 P1.5 做即可；
+* `abl_all` 给出下界，即“把 prep 完全拿掉”能到多少。
+
+然后按结论选：prep 主导 → 写 TLE 批量 prep 版（`tle.dsa.alloc/copy/extract_slice`，
+BT=8/16）；规约主导 → 直接评估 chunked delta rule（P4），因为规约的延迟在串行递推里
+本来就无解，只有换算法才能在 token 轴上并行。
 
 ---
 
-## 7. 本轮交付的文件
+## 7. 验证与基准计划（由远程执行）
+
+脚本：`target/bench_kda_tle.py`（自包含，不依赖 sglang）
+
+**磁盘**：脚本自身只写 `--out` 指定的一个 JSON。占盘的是 Triton 编译缓存
+（`$TRITON_CACHE_DIR`，每个不同 kernel 一个目录）；`--configs default|ablate|all|<名字>`
+控制编译次数，`GLM53_KDA_AUTOTUNE=0` 可把 v0 的 24 次 autotune 编译降到 1 次。
+
+```bash
+cd test/CommonIR/agent_op/target
+python3 bench_kda_tle.py calib                                        # 期望 ~40 AIV
+GLM53_KDA_AUTOTUNE=0 python3 bench_kda_tle.py check --out c.json      # 容差判定
+python3 bench_kda_tle.py sweep --configs ablate --tokens 8192 --out a.json
+```
+
+判定标准（先写死，避免事后解释）：
+
+* `check` 必须 PASS（rtol=3e-2，atol=2e-3，bf16 输出）；`v1` 不得比 `v0` 离参考更远；
+* 没有实测证据就不加配置：`sweep` 里新配置必须至少在一半的形状上快于当前最优，
+  否则回滚（`v1_pf` 就是因为这条被关掉的）；
+* 本轮**不**把 AscendC 的 `prepared` 列作为门槛（需要 sglang，且是两套 tiling，
+  混进同一张表容易得出错误结论）；AscendC 只作参考，见 §1/§2。
+
+---
+
+## 8. 本轮交付的文件
 
 | 文件 | 作用 |
 |---|---|
@@ -286,6 +395,9 @@ python3 bench_kda_tle.py sweep  --out v1_sweep.json
 | `test/CommonIR/agent_op/target/glm_kda_varlen_recurrent_npu_v1.py` | v1 kernel：core-aware BV、可选预取/扁平 state/`num_stages`，归一化倒数折叠；复用 v0 的校验与回退 |
 | `test/CommonIR/agent_op/target/bench_kda_tle.py` | 自包含标定 / 扫点 / 正确性脚本 |
 | `test/CommonIR/agent_op/target/test_kda_tle.py` | pytest 形式的正确性与状态语义检查 |
+
+本轮追加：`KDA_ABLATE`（5 个计时探针，故意算错数）与 `--configs`（选列，控制编译次数），
+以及 §6 的实测结论。v1 的默认行为与上一轮完全一致（所有 `SKIP_*` 为 False 时生成同一份代码）。
 
 说明：开发环境没有 Python 也没有 NPU，上述代码**未经过任何执行验证**。第一次远程运行
 同时充当编译检查，出现的 API 级报错（例如 `multibuffer=` 关键字、`tl.reshape` 形状列表）
