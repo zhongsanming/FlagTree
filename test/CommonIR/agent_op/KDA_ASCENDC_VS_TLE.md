@@ -426,9 +426,18 @@ T=8192，`KDA_ABLATE` 探针（故意算错数，只用于定位那 1400 周期�
 
 ```bash
 cd test/CommonIR/agent_op/target
-python3 probe_dot.py                       # 约 9 次编译，几秒钟
-python3 probe_dot.py --shapes 64,128,256,512
+python3 probe_dot.py                           # 全部 dtype × 64/128/256
+python3 probe_dot.py --shapes 128 --dtypes bf16  # 先只要一个答案，几秒
 ```
+
+探针本身踩过两个坑，记在这里以免再犯：
+
+* **tile 大于矩阵 = 零 block launch = 硬崩。** `block=128` 对 64³ 会得到 grid=(0,)，
+  在这套栈上直接报 aicore inner error。所以现在 tile 会被 clamp、且 grid>0 有断言。
+  推论：将来 chunked 内核必须在 host 侧校验 `shape % tile == 0`，不能指望 kernel 容错。
+* **一个 case 崩了会毒死整个进程。** 崩之后所有 tensor 回来都是 0，`rel.err` 就变成 0/0，
+  于是后面八行全是 `ZeroDivisionError`——看起来像“全都不支持”，其实一个字都没测到。
+  所以现在**每个 case 一个子进程**，一次崩只损失一行。
 
 ---
 
