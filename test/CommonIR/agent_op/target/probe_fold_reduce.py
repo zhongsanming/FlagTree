@@ -40,8 +40,16 @@ import triton.experimental.tle as tle
 
 @triton.jit
 def _fold_reduce_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
-                        FULL: tl.constexpr, ROW_BLK: tl.constexpr):
+                        FULL: tl.constexpr, ROW_BLK: tl.constexpr,
+                        REPEAT: tl.constexpr):
     """Grid: one program; a [ROWS, FULL] tile in, ROWS sums out.
+
+    REPEAT exists because one launch costs ~140 us of host time here, which is
+    larger than the op: timing a single call per launch measures the launch
+    floor (the first version of this probe did exactly that and reported
+    128-141 us for every row count, the same trap probe_dot hit).  The repeats
+    are accumulated, so they are a dependent chain the compiler cannot elide,
+    and per-op cost is (ms - floor)/REPEAT.
 
     Three conventions of `tle.dsa.ascend.raw`, all learned from
     python/tutorials/tle/custom/test_custom_ops.py:
@@ -52,33 +60,39 @@ def _fold_reduce_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
       * `out=` also takes tensors, not buffers -- the tutorial passes
         `tl.zeros([..])` for every output and rebinds the returned values.
       * FULL = 2*HALF is passed in rather than computed here, because tl.arange
-        and tle.dsa.alloc want compile-time literals (`2 * HALF` in the body is
-        what the first version died on, at the arange).
+        and tle.dsa.alloc want compile-time literals.
     """
     idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
 
     src_ub = tle.dsa.alloc([ROWS, FULL], dtype=tl.float32,
                            mem_addr_space=tle.dsa.ascend.UB)
     tle.dsa.copy(X + idx, src_ub, [ROWS, FULL])
+    src_t = tle.dsa.to_tensor(src_ub)
 
+    acc = tl.zeros([ROWS], dtype=tl.float32)
     dst_t = tl.zeros([ROWS], dtype=tl.float32)
     tmp_t = tl.zeros([ROWS * HALF], dtype=tl.float32)
-    dst_t, tmp_t = tle.dsa.ascend.raw(
-        "fold_reduce_rows", tle.dsa.to_tensor(src_ub), ROWS, HALF, ROW_BLK,
-        out=[dst_t, tmp_t])
-    tl.store(Y + tl.arange(0, ROWS), dst_t)
+    for _ in range(REPEAT):
+        dst_t, tmp_t = tle.dsa.ascend.raw(
+            "fold_reduce_rows", src_t, ROWS, HALF, ROW_BLK,
+            out=[dst_t, tmp_t])
+        acc += dst_t
+    tl.store(Y + tl.arange(0, ROWS), acc)
 
 
 @triton.jit
 def _triton_kernel(X, Y, ROWS: tl.constexpr, HALF: tl.constexpr,
-                   FULL: tl.constexpr):
+                   FULL: tl.constexpr, REPEAT: tl.constexpr):
     """The reference cost: what the same job costs without the custom op."""
     idx = tl.arange(0, ROWS)[:, None] * FULL + tl.arange(0, FULL)[None, :]
     a = tl.load(X + idx)
     lo = tl.reshape(a, [ROWS, 2, HALF])
-    s = tl.sum(lo, axis=1)
-    s = tl.sum(s, axis=1)
-    tl.store(Y + tl.arange(0, ROWS), s)
+    acc = tl.zeros([ROWS], dtype=tl.float32)
+    s = tl.zeros([ROWS], dtype=tl.float32)
+    for _ in range(REPEAT):
+        s = tl.sum(tl.sum(lo, axis=2), axis=1)
+        acc += s
+    tl.store(Y + tl.arange(0, ROWS), acc)
 
 
 def _run(fn, reps: int, warmup: int) -> float:
@@ -99,9 +113,15 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="npu:0")
-    p.add_argument("--rows", type=int, default=16,
-                   help="rows per program (comma list allowed)")
+    p.add_argument("--rows", default="1,2,16",
+                   help="rows per program; comma separated")
     p.add_argument("--mask", type=int, default=64)
+    p.add_argument("--repeat", type=int, default=64,
+                   help="op calls per launch; the launch floor (~140 us) is "
+                        "subtracted, so this must be >> 1 to see anything")
+    p.add_argument("--floor-us", type=float, default=140.0,
+                   help="measured one-launch host floor, subtracted from both "
+                        "columns before dividing by --repeat")
     p.add_argument("--reps", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--tol", type=float, default=1e-5)
@@ -112,7 +132,8 @@ def main() -> None:
     torch.npu.set_device(args.device)
 
     ok = True
-    print(f"device={args.device}  HALF={args.mask}  reps={args.reps}")
+    print(f"device={args.device}  HALF={args.mask}  repeat={args.repeat}  "
+          f"reps={args.reps}  launch floor assumed {args.floor_us:.0f} us")
     print(f"{'rows':>5} {'max |err|':>11} {'rel':>9} {'op us':>8} "
           f"{'triton us':>10} {'speedup':>8}")
     for rows in (int(x) for x in str(args.rows).split(",")):
@@ -124,22 +145,27 @@ def main() -> None:
         y_ref = torch.zeros(rows, device=args.device)
 
         try:
+            rep = max(1, args.repeat)
             _fold_reduce_kernel[(1,)](x, y, ROWS=rows, HALF=args.mask,
-                                      FULL=full, ROW_BLK=row_blk)
+                                      FULL=full, ROW_BLK=row_blk, REPEAT=rep)
             torch.npu.synchronize()
-            ref = (x[:, :args.mask] + x[:, args.mask:]).sum(1)
+            # REPEAT accumulations, so the reference is scaled to match
+            ref = rep * (x[:, :args.mask] + x[:, args.mask:]).sum(1)
             err = (y - ref).abs().max().item()
             rel = err / ref.abs().max().item()
             good = rel < args.tol
             ok = ok and good
             t_op = _run(lambda: _fold_reduce_kernel[(1,)](
-                x, y, ROWS=rows, HALF=args.mask, FULL=full, ROW_BLK=row_blk),
-                args.reps, args.warmup)
+                x, y, ROWS=rows, HALF=args.mask, FULL=full, ROW_BLK=row_blk,
+                REPEAT=rep), args.reps, args.warmup)
             t_tri = _run(lambda: _triton_kernel[(1,)](
-                x, y_ref, ROWS=rows, HALF=args.mask, FULL=full),
+                x, y_ref, ROWS=rows, HALF=args.mask, FULL=full, REPEAT=rep),
                 args.reps, args.warmup)
-            print(f"{rows:5d} {err:11.2e} {rel:9.2e} {t_op:8.2f} "
-                  f"{t_tri:10.2f} {t_tri / t_op:7.2f}x")
+            # strip the launch floor before dividing by the repeat count
+            op_us = max(t_op - args.floor_us, 1e-3) / rep
+            tri_us = max(t_tri - args.floor_us, 1e-3) / rep
+            print(f"{rows:5d} {err:11.2e} {rel:9.2e} {op_us:8.3f} "
+                  f"{tri_us:10.3f} {tri_us / op_us:7.2f}x")
         except Exception as exc:  # compile or device error is a result here
             ok = False
             detail = f"{type(exc).__name__}: {exc}".rstrip()
