@@ -47,6 +47,8 @@ Known-slow spots, in the order I would attack them
 from __future__ import annotations
 
 import argparse
+import statistics
+import time
 
 import torch
 
@@ -216,48 +218,122 @@ def _selftest(args) -> int:
 
     dev = args.device
     ok = True
-    for gain in (1.0, -20.0):
-        # Reference in fp64 on the CPU; the kernel gets the same values in fp32
-        # on the device, so the comparison is "kernel error", not "input error".
-        base = make_inputs(args.tokens, args.heads, args.dim, args.seed,
-                           torch.float64, gate_gain=gain)
-        ref_out, ref_S = serial_ref(base["qn"], base["kn"], base["v"],
-                                    base["decay"], base["beta"], base["S0"])
-        inp = {k: t.float().to(dev) for k, t in base.items()}
+    # A second length that is not a multiple of C, so the padded tail of the last
+    # chunk is exercised: padded rows carry decay=1 (the cumulative gate stops)
+    # and kn=0, which is what makes gc[-1] equal gc at the last live token.
+    lengths = (args.tokens, max(args.chunk, args.tokens - 6))
+    for tok in lengths:
+        for gain in (1.0, -20.0):
+            # Reference in fp64 on the CPU; the kernel gets the same values in fp32
+            # on the device, so the comparison is "kernel error", not "input error".
+            base = make_inputs(tok, args.heads, args.dim, args.seed,
+                               torch.float64, gate_gain=gain)
+            ref_out, ref_S = serial_ref(base["qn"], base["kn"], base["v"],
+                                        base["decay"], base["beta"], base["S0"])
+            inp = {k: t.float().to(dev) for k, t in base.items()}
 
-        H, K, V = inp["S0"].shape
-        # [slots,H,V,K] contiguous then viewed as [slots,H,K,V]: that is the
-        # only layout the kernel accepts (stride(2)==1).
-        pool = torch.zeros(2, H, V, K, dtype=torch.float32, device=dev)
-        pool[1] = inp["S0"].transpose(-1, -2)
-        state = pool.transpose(-1, -2)
+            H, K, V = inp["S0"].shape
+            # [slots,H,V,K] contiguous then viewed as [slots,H,K,V]: that is the
+            # only layout the kernel accepts (stride(2)==1).
+            pool = torch.zeros(2, H, V, K, dtype=torch.float32, device=dev)
+            pool[1] = inp["S0"].transpose(-1, -2)
+            state = pool.transpose(-1, -2)
 
-        out = run_chunked(
-            inp["qn"], inp["kn"], inp["v"], inp["decay"], inp["beta"], state,
-            torch.tensor([1], dtype=torch.int32, device=dev),
-            torch.tensor([0, inp["qn"].shape[0]], dtype=torch.int32, device=dev),
-            C=args.chunk,
-            BV=args.bv,
-        )
-        torch.npu.synchronize()
+            out = run_chunked(
+                inp["qn"], inp["kn"], inp["v"], inp["decay"], inp["beta"], state,
+                torch.tensor([1], dtype=torch.int32, device=dev),
+                torch.tensor([0, inp["qn"].shape[0]], dtype=torch.int32, device=dev),
+                C=args.chunk,
+                BV=args.bv,
+            )
+            torch.npu.synchronize()
 
-        out_err = (out.float().cpu().double() - ref_out).abs().max().item()
-        state_err = (state[1].float().cpu().double() - ref_S).abs().max().item()
-        out_rel = out_err / ref_out.abs().max().item()
-        state_rel = state_err / ref_S.abs().max().item()
-        # A magnitude ratio separates the two failure modes we have actually
-        # hit: wildly wrong values (~1e15) mean a divergent half was summed,
-        # while ~2 means the right values went to the wrong places.
-        mag = out.float().abs().max().item() / ref_out.abs().max().item()
-        good = out_rel < args.tol and state_rel < args.tol
-        ok = ok and good
-        print(f"gate_gain={gain:6.1f}  out rel {out_rel:.3e}  state rel "
-              f"{state_rel:.3e}  |out| ratio {mag:9.2e}  "
-              f"{'PASS' if good else 'FAIL'}")
+            out_err = (out.float().cpu().double() - ref_out).abs().max().item()
+            state_err = (state[1].float().cpu().double() - ref_S).abs().max().item()
+            out_rel = out_err / ref_out.abs().max().item()
+            state_rel = state_err / ref_S.abs().max().item()
+            # A magnitude ratio separates the two failure modes we have actually
+            # hit: wildly wrong values (~1e15) mean a divergent half was summed,
+            # while ~2 means the right values went to the wrong places.
+            mag = out.float().abs().max().item() / ref_out.abs().max().item()
+            good = out_rel < args.tol and state_rel < args.tol
+            ok = ok and good
+            print(f"T={tok:<6d} gate_gain={gain:6.1f}  out rel {out_rel:.3e}  "
+                  f"state rel {state_rel:.3e}  |out| ratio {mag:9.2e}  "
+                  f"{'PASS' if good else 'FAIL'}")
 
     print(f"\nchunk={args.chunk} bv={args.bv} tokens={args.tokens} "
           f"heads={args.heads} dim={args.dim}  {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
+
+
+def _clone_kcontig(state: torch.Tensor) -> torch.Tensor:
+    """Clone a state pool while preserving the [V,K] backing.
+
+    A plain ``.clone()`` keeps the logical [slots,H,K,V] shape but gives it
+    contiguous strides for *that* shape, i.e. stride(2)==V instead of 1 -- the
+    transposed layout the kernel rejects (and which, if it were accepted, would
+    silently read the state transposed). Clone the [slots,H,V,K] buffer and
+    re-view instead. The same trap is documented in bench_kda_tle.clone_state.
+    """
+    return state.transpose(-1, -2).clone().transpose(-1, -2)
+
+
+def _bench(args) -> int:
+    """Time the chunked recurrence on prepared inputs.
+
+    The kernel currently covers only the recurrence, so the honest comparisons
+    are (a) the full serial kernel measured earlier on this machine and (b) the
+    serial recurrence with the prep ablated, also measured earlier. Both are
+    printed as context, clearly labelled as earlier measurements rather than
+    re-run here.
+    """
+    from chunked_ref import make_inputs
+
+    dev = args.device
+    H, K = args.heads, args.dim
+    base = make_inputs(args.tokens, H, K, args.seed, torch.float32)
+    inp = {k: t.to(dev) for k, t in base.items()}
+    # [slots,H,V,K] contiguous, viewed as [slots,H,K,V]: same construction as
+    # the self-test, K-contiguous is what the kernel indexes against.
+    pool = torch.zeros(2, H, K, K, dtype=torch.float32, device=dev)
+    pool[1] = inp["S0"].transpose(-1, -2)
+    state0 = pool.transpose(-1, -2)
+    idx = torch.tensor([1], dtype=torch.int32, device=dev)
+    qsl = torch.tensor([0, args.tokens], dtype=torch.int32, device=dev)
+
+    def run(st):
+        return run_chunked(inp["qn"], inp["kn"], inp["v"], inp["decay"],
+                           inp["beta"], st, idx, qsl, C=args.chunk, BV=args.bv)
+
+    for _ in range(args.warmup):
+        run(_clone_kcontig(state0))
+    torch.npu.synchronize()
+    ts = []
+    for _ in range(args.reps):
+        st = _clone_kcontig(state0)
+        torch.npu.synchronize()
+        t0 = time.perf_counter()
+        run(st)
+        torch.npu.synchronize()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    ms = statistics.median(ts)
+    us_per_tok = ms * 1e3 / args.tokens
+    blocks = H * (K // args.bv)
+
+    print(f"T={args.tokens} H={H} C={args.chunk} BV={args.bv} "
+          f"blocks={blocks} reps={args.reps}")
+    print(f"  chunked recurrence   {ms:9.3f} ms   {us_per_tok:8.1f} ns/token")
+    # Earlier measurements on this same card, for scale only.
+    for serial_tok, full_ms, abl_ms in ((8192, 8.86, 5.01), (16384, 17.6, 10.0)):
+        if serial_tok == args.tokens:
+            print(f"  serial, full (T={serial_tok})    {full_ms:9.3f} ms   "
+                  f"{full_ms * 1e3 / serial_tok:8.1f} ns/token   "
+                  f"-> {full_ms / ms:5.1f}x")
+            print(f"  serial, prep-ablated       {abl_ms:9.3f} ms   "
+                  f"{abl_ms * 1e3 / serial_tok:8.1f} ns/token   "
+                  f"-> {abl_ms / ms:5.1f}x")
+    return 0
 
 
 def main() -> None:
@@ -265,6 +341,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--selftest", action="store_true",
                    help="compare the kernel against chunked_ref.serial_ref")
+    p.add_argument("--bench", action="store_true",
+                   help="time the chunked recurrence on prepared inputs")
     p.add_argument("--tokens", type=int, default=256)
     p.add_argument("--heads", type=int, default=2)
     p.add_argument("--dim", type=int, default=128)
@@ -275,14 +353,18 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--tol", type=float, default=2e-2)
+    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--reps", type=int, default=20)
     args = p.parse_args()
 
-    if not args.selftest:
+    if not args.selftest and not args.bench:
         p.print_help()
         return
     if not _HAS_NPU:
         raise SystemExit("the self-test needs an NPU (torch_npu)")
     torch.npu.set_device(args.device)
+    if args.bench:
+        raise SystemExit(_bench(args))
     raise SystemExit(_selftest(args))
 
 
