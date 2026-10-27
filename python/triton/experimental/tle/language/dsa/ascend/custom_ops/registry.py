@@ -521,3 +521,53 @@ class unpack_sort:
         self.symbol = "custom_unpack_sort_float"
         self.bitcode = CUSTOM_OPS_BITCODE
         self.extra_buffers = [(tl.float16, 0)]
+
+
+@al.register_custom_op
+class fold_reduce_rows:
+    """
+    /*
+     * Function:
+     *   Fold each row's two halves together, then reduce all rows to one result
+     *   each, in two instructions.  This is the multi-result reduce that
+     *   triton cannot express: a tl.sum over C rows becomes C separate
+     *   reductions, and tl.join/tl.split do not lower on this backend.
+     *
+     *   dst[r] = sum_{i < mask} ( src[r, i] + src[r, i + mask] )
+     *
+     * Inputs:
+     *   src: UB tensor holding [repeat_times, 2 * mask] row-major, rows
+     *     src_rep_stride datablocks apart
+     *   repeat_times: number of rows, i.e. number of results
+     *   mask: lanes per half; mask == 64 covers one 256 B register per repeat
+     *   src_rep_stride: address stride between adjacent rows, in 32 B datablocks
+     *
+     * Outputs:
+     *   out: required two-element sequence
+     *     - out[0] / dst: UB tensor of repeat_times results, contiguous
+     *     - out[1] / tmp: UB scratch of [repeat_times, mask], same dtype
+     */
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, repeat_times, mask, src_rep_stride, out=None):
+        assert out is not None and len(out) == 2, (
+            "fold_reduce_rows requires out to be [dst, tmp]")
+        dt = _element_dtype(src)
+        assert _element_dtype(out[0]) == dt, (
+            f"fold_reduce_rows requires dst dtype ({_element_dtype(out[0])}) "
+            f"to match src dtype ({dt})")
+        assert _element_dtype(out[1]) == dt, (
+            f"fold_reduce_rows requires tmp dtype ({_element_dtype(out[1])}) "
+            f"to match src dtype ({dt})")
+        if dt == tl.float16:
+            self.symbol = "custom_fold_reduce_rows_half"
+        elif dt == tl.float32:
+            self.symbol = "custom_fold_reduce_rows_float"
+        else:
+            assert False, (f"fold_reduce_rows does not support dtype {dt} yet "
+                           f"(fp16/fp32 only)")
+        self.bitcode = CUSTOM_OPS_BITCODE
