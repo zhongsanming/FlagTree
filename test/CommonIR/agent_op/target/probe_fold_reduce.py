@@ -74,6 +74,44 @@ def _fold_reduce_kernel(X, Y0, Y1, ROWS: tl.constexpr, ROWS2: tl.constexpr,
     tl.store(Y1 + tl.arange(0, ROWS), d1)
 
 
+def _env_report(expect_params):
+    """Print which triton/registry/bitcode is actually loaded, and whether the
+    op's Python signature matches what this file calls it with.
+
+    Added after a round was lost to "TypeError: got multiple values for argument
+    'out'": the interpreter had imported an older registry.py (the runtime here
+    can come from site-packages rather than the checkout), so the call was
+    correct and the module was stale.  One line of self-report makes that
+    obvious instead of looking like a call-site bug.
+    """
+    import inspect
+    import os
+    try:
+        import triton
+        import triton.experimental.tle.language.dsa.ascend.custom_ops as ops
+        from triton.experimental.tle.language.dsa.ascend.custom_ops import (
+            registry,
+        )
+        sig = inspect.signature(registry.fold_reduce_rows.__init__)
+        params = [p for p in sig.parameters if p != "self"]
+        bc = registry.CUSTOM_OPS_BITCODE
+        print(f"  triton   : {os.path.dirname(os.path.dirname(triton.__file__))}")
+        print(f"  registry : {registry.__file__}")
+        print(f"  bitcode  : {bc} {'exists' if os.path.exists(bc) else 'MISSING'}"
+              f" {os.path.getmtime(bc):.0f}" if os.path.exists(bc) else f"  bitcode  : {bc} MISSING")
+        print(f"  op params: {params}")
+        if params != expect_params:
+            print(f"  MISMATCH : this file calls it with {expect_params}")
+            print("             -> the imported registry.py is stale or from another")
+            print("                install. Check that `import triton` resolves to the")
+            print("                checkout you edited, or reinstall it.")
+            return False
+    except Exception as exc:  # a missing op is a result too
+        print(f"  registry : ERROR {type(exc).__name__}: {exc}")
+        return False
+    return True
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -92,6 +130,8 @@ def main() -> None:
     full = 2 * half
     row_blk = full * 4 // 32              # 32 B datablocks per row of fp32
     ok = True
+    if not _env_report(["src", "repeat0", "repeat1", "mask", "src_rep_stride", "out"]):
+        raise SystemExit(2)
     print(f"device={args.device}  HALF={half}  FULL={full}")
     print(f"{'rows':>5} {'max |err| d0':>13} {'max |err| d1':>13} {'rel':>9}")
 
