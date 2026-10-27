@@ -2,13 +2,13 @@
 
 Scope of this file, deliberately narrow so it can be validated on its own:
 
-* prefill, one packed sequence per launch, one program per (sequence, head),
-  full V on one program.  That is 4 blocks for H=4, so it under-uses the card;
-  the point here is the algebra and the per-token cost, not occupancy.
+* prefill, one packed sequence per launch, one program per (sequence, head,
+  value-tile).  BV is the value split: BV=32 gives 4 heads x 4 tiles = 16
+  blocks at H=4, and keeps the [BV,K] state tile inside the UB budget.
 * inputs are *prepared* (qn, kn, decay=exp(gate), beta).  Folding the prep back
   in is the next step; keeping it out makes this file comparable to
   chunked_ref.py line for line.
-* no tracking / checkpoints, no V tiling, no varlen beyond the per-sequence loop.
+* no tracking / checkpoints, and no varlen beyond the per-sequence loop.
 
 Why chunk = 16, and why it is safe without knowing the gate distribution
 -----------------------------------------------------------------------
@@ -64,9 +64,11 @@ import triton.language as tl
 def _chunked_kernel(
     QN, KN, VV, DECAY, BETA, OUT, STATE, STARTS, INDICES,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, C: tl.constexpr,
+    BV: tl.constexpr,
 ):
     seq = tl.program_id(0)
     h = tl.program_id(1)
+    iv = tl.program_id(2)
 
     bos = tl.load(STARTS + seq).to(tl.int64)
     eos = tl.load(STARTS + seq + 1).to(tl.int64)
@@ -75,17 +77,22 @@ def _chunked_kernel(
 
     cidx = tl.arange(0, C)
     ks = tl.arange(0, K)
-    vs = tl.arange(0, V)
+    vs = iv * BV + tl.arange(0, BV)          # this program's value rows
 
     # State tile: the pool is [slots,H,V,K] viewed as [slots,H,K,V], i.e. K is
-    # contiguous, so one value-tile is V*K contiguous floats.  Kept as [V,K]
-    # (v-major) so no 128x128 transpose is ever needed: every projection below
-    # is written transposed instead.
-    sbase = (slot * H + h) * (K * V)
+    # contiguous, so BV value-rows are BV*K contiguous floats.  Kept as [BV,K]
+    # (v-major) so no big transpose is ever needed: every projection below is
+    # written transposed instead.
+    #
+    # BV is what makes this fit in UB.  At BV=V the [V,K] tile is 64 KB and it
+    # is an operand of two dots, each staged into L1 and doubled by the auto
+    # multibuffer -> the compiler asked for 379 KB against 192 KB available.
+    # 16 or 32 per program brings that back inside the budget.
+    sbase = (slot * H + h) * (K * V) + iv * (BV * K)
     if slot > 0:
-        st = tl.reshape(tl.load(STATE + sbase + tl.arange(0, K * V)), [V, K])
+        st = tl.reshape(tl.load(STATE + sbase + tl.arange(0, BV * K)), [BV, K])
     else:
-        st = tl.zeros([V, K], tl.float32)
+        st = tl.zeros([BV, K], tl.float32)
 
     eye = (cidx[:, None] == cidx[None, :]).to(tl.float32)      # [C,C]
     upper = cidx[:, None] < cidx[None, :]                      # s < t
@@ -103,7 +110,6 @@ def _chunked_kernel(
         beta = tl.load(BETA + (bos + rows) * H + h, mask=live, other=0.0)
         voff = (bos + rows)[:, None] * (H * V) + h * V + vs[None, :]
         vv = tl.load(VV + voff, mask=live[:, None], other=0.0).to(tl.float32)
-
         gc = tl.cumsum(tl.log(dc), axis=0)                # [C,K], <= 0
         lam = tl.exp(gc)                                  # [C,K], <= 1
         ktil = kn * lam                                   # k~ = lam * k
@@ -118,14 +124,14 @@ def _chunked_kernel(
         # column sweep below consumes.
         MmT = eye + tl.where(upper, AT * beta[None, :], 0.0)
 
-        # rhs = beta * (v - k~ St^T), transposed to [V,C] so `st` stays [V,K].
+        # rhs = beta * (v - k~ St^T), transposed to [BV,C] so `st` stays [BV,K].
         rhsT = beta[None, :] * (tl.trans(vv) - tl.dot(st, tl.trans(ktil)))
 
         # uT MmT = rhsT, solved as a column sweep: after step t, column t is
         # final and is subtracted from every later column.
         uT = rhsT
         for t in tl.static_range(C):
-            col = tl.sum(tl.where(cidx[None, :] == t, uT, 0.0), axis=1)   # [V]
+            col = tl.sum(tl.where(cidx[None, :] == t, uT, 0.0), axis=1)   # [BV]
             row = tl.sum(tl.where(cidx[:, None] == t, MmT, 0.0), axis=0)  # [C]
             coef = tl.where(cidx > t, row, 0.0)                          # s > t
             uT = uT - col[:, None] * coef[None, :]
@@ -140,35 +146,50 @@ def _chunked_kernel(
         kbar = kn * tl.exp(gc_last[None, :] - gc)
         st = tl.exp(gc_last)[None, :] * st + tl.dot(uT, kbar)
 
-        ooff = (bos + rows)[None, :] * (H * V) + h * V + vs[:, None]
-        tl.store(OUT + ooff, outT.to(OUT.dtype.element_ty), mask=live[None, :])
+        ooff = ((bos + rows)[:, None] * (H * V) + h * V
+                + (iv * BV + tl.arange(0, BV))[None, :])
+        # Store in token-major [C,BV] order, i.e. the order OUT is laid out in.
+        # Handing the store a [BV,C] tile makes the compiler insert a
+        # transposing cbuf->cbuf copy, which this backend rejects outright
+        # ("Unsupported copy from cbuf to cbuf"); an explicit tl.trans is a UB
+        # transpose and is supported.
+        tl.store(OUT + ooff, tl.trans(outT).to(OUT.dtype.element_ty),
+                 mask=live[:, None])
 
     if slot > 0:
-        tl.store(STATE + sbase + tl.arange(0, K * V), tl.reshape(st, [K * V]))
+        tl.store(STATE + sbase + tl.arange(0, BV * K),
+                 tl.reshape(st, [BV * K]))
 
 
 # ---------------------------------------------------------------------------
-# Host wrapper: single-sequence prefill, prepared inputs, full V per program
+# Host wrapper: prepared inputs, one program per (sequence, head, value-tile)
 # ---------------------------------------------------------------------------
 def run_chunked(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
                 decay: torch.Tensor, beta: torch.Tensor, state: torch.Tensor,
                 indices: torch.Tensor, cu_seqlens: torch.Tensor,
-                C: int = 16) -> torch.Tensor:
+                C: int = 16, BV: int = 32) -> torch.Tensor:
     """qn, kn, decay: [T,H,K] fp32; v: [T,H,V]; beta: [T,H]; state: [slots,H,K,V].
 
-    `state` is mutated in place.  Returns out [T,H,V]-shaped like `v`.
+    `state` is mutated in place.  Returns out shaped like `v`.
     Only the layout the kernels in this repo require is accepted: the pool must
     be K-contiguous (stride(2)==1) and dense in slot/head.
+
+    BV is the value split: grid = (sequences, H, V//BV).  It is a UB budget
+    knob first (the [BV,K] state tile is staged into L1 for every dot and the
+    auto multibuffer doubles that) and an occupancy knob second.  32 keeps
+    4 heads x 4 tiles = 16 blocks busy for H=4.
     """
     T, H, K = qn.shape
     V = v.shape[-1]
     assert state.stride(2) == 1 and state.stride(3) == K, "state must be K-contiguous"
     assert state.stride(1) == K * V and state.stride(0) == H * K * V, "dense pool"
+    if V % BV:
+        raise ValueError(f"BV={BV} must divide V={V}")
     out = torch.empty_like(v)
-    grid = (indices.numel(), H)
+    grid = (indices.numel(), H, V // BV)
     _chunked_kernel[grid](
         qn, kn, v, decay, beta, out, state, cu_seqlens, indices,
-        H=H, K=K, V=V, C=C,
+        H=H, K=K, V=V, C=C, BV=BV,
         num_warps=1, num_stages=1, multibuffer=False,
     )
     return out
@@ -203,6 +224,7 @@ def _selftest(args) -> int:
             torch.tensor([1], dtype=torch.int32, device=dev),
             torch.tensor([0, inp["qn"].shape[0]], dtype=torch.int32, device=dev),
             C=args.chunk,
+            BV=args.bv,
         )
         torch.npu.synchronize()
 
@@ -216,8 +238,8 @@ def _selftest(args) -> int:
               f"{state_rel:.3e}  tol {args.tol:.0e}  "
               f"{'PASS' if good else 'FAIL'}")
 
-    print(f"\nchunk={args.chunk} tokens={args.tokens} heads={args.heads} "
-          f"dim={args.dim}  {'PASS' if ok else 'FAIL'}")
+    print(f"\nchunk={args.chunk} bv={args.bv} tokens={args.tokens} "
+          f"heads={args.heads} dim={args.dim}  {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
 
@@ -230,6 +252,9 @@ def main() -> None:
     p.add_argument("--heads", type=int, default=2)
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--chunk", type=int, default=16)
+    p.add_argument("--bv", type=int, default=32,
+                   help="value split; 32 or 16 keeps the UB budget; 128 only "
+                        "if the multibuffer is disabled")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--tol", type=float, default=2e-2)
