@@ -114,7 +114,10 @@ def chunked_ref(qn: torch.Tensor, kn: torch.Tensor, v: torch.Tensor,
         Aq = relative_gram_explicit(kn[sl], qn[sl], gc)
         strict = torch.tril(A.permute(2, 0, 1), -1).permute(1, 2, 0)
 
-        M = eye + beta[sl][None] * strict            # [n,n,H]
+        # Row scaling, not column: u_t = beta_t (v_t - sum_{s<t} A[t,s] u_s), so
+        # the coefficient is beta of the *row* token.  beta[sl][None] puts it on
+        # the column index and silently solves a different system.
+        M = eye + beta[sl][:, None, :] * strict      # [n,n,H]
         rhs = beta[sl][:, :, None] * (
             v[sl] - torch.einsum("nhk,hkv->nhv", kn[sl] * lam, S)
         )
@@ -194,6 +197,17 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a - b).abs().max().item() / den if den > 0 else float("inf")
 
 
+def _lower_only(x: torch.Tensor) -> torch.Tensor:
+    """Keep s <= t.  The factored gemm produces a full C x C matrix, and its
+    upper half is exp(gc_t - gc_s) with t < s, i.e. > 1 and astronomically so;
+    the algorithm never reads it, so comparing it against the explicit form
+    (which leaves it zero) measures nothing but the overflow."""
+    C = x.shape[0]
+    keep = torch.tril(torch.ones(C, C, dtype=torch.bool,
+                                 device=x.device)).unsqueeze(-1)
+    return torch.where(keep, x, torch.zeros_like(x))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -203,6 +217,9 @@ def main() -> None:
     p.add_argument("--chunks", default="8,16,32,64")
     p.add_argument("--dtypes", default="fp32,bf16")
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--gate-gain", type=float, default=1.0,
+                   help="scales the gate input: 1.0 = bench-like (fast decay), "
+                        "negative values approach decay=1 (slow, long memory)")
     args = p.parse_args()
 
     dt_map = {"fp32": torch.float32, "bf16": torch.bfloat16,
@@ -211,13 +228,15 @@ def main() -> None:
     dtypes = [dt_map[d.strip()] for d in args.dtypes.split(",")]
     tok = args.tokens
 
-    base = make_inputs(tok, args.heads, args.dim, args.seed, torch.float64)
+    base = make_inputs(tok, args.heads, args.dim, args.seed, torch.float64,
+                      gate_gain=args.gate_gain)
     qn, kn = base["qn"], base["kn"]
     decay, beta, S0 = base["decay"], base["beta"], base["S0"]
 
     # --- gate statistics ---------------------------------------------------
     g = torch.log(decay)
-    print(f"tokens={tok} heads={args.heads} dim={args.dim} seed={args.seed}")
+    print(f"tokens={tok} heads={args.heads} dim={args.dim} seed={args.seed} "
+          f"gate_gain={args.gate_gain}")
     print("gate statistics (fp64):")
     print(f"  decay   min {decay.min():.4e}  median {decay.median():.4e}  "
           f"mean {decay.mean():.4e}")
@@ -239,29 +258,38 @@ def main() -> None:
 
     # --- factored form, i.e. what a kernel can compute ----------------------
     print("\nfactored vs explicit intra-chunk gram (kernel-expressible form):")
-    print(f"  {'C':>4} {'dtype':>6} {'max exp(-gc)':>13} {'A rel':>10} {'Aq rel':>10}")
+    print("  compared on the lower triangle only, which is all the algorithm reads")
+    print(f"  {'C':>4} {'dtype':>6} {'max exp(-gc)':>13} {'A rel':>10} {'Aq rel':>10}"
+          f" {'|A| max':>10}  note")
     for C in chunks:
         gc_all = torch.cumsum(
             g[: (tok // C) * C].reshape(-1, C, *g.shape[1:]), dim=1)
         gc, rmax = gc_all[0], torch.exp(-gc_all.min()).item()
         kn_c, qn_c = kn[:C], qn[:C]
-        A_ref = relative_gram_explicit(kn_c, kn_c, gc)
-        Aq_ref = relative_gram_explicit(kn_c, qn_c, gc)
+        A_ref = _lower_only(relative_gram_explicit(kn_c, kn_c, gc))
+        Aq_ref = _lower_only(relative_gram_explicit(kn_c, qn_c, gc))
         for dt in dtypes:
             A_f = relative_gram_factored(kn_c, kn_c, gc, dt)
             Aq_f = relative_gram_factored(kn_c, qn_c, gc, dt)
             name = {torch.float32: "fp32", torch.bfloat16: "bf16",
                     torch.float16: "fp16"}[dt]
+            amax = A_f.abs().max().item()
+            note = ""
+            if not torch.isfinite(A_f).all() or not torch.isfinite(Aq_f).all():
+                note = "non-finite -> chunk too big for this dtype"
             print(f"  {C:4d} {name:>6} {rmax:13.3e} "
-                  f"{_rel(A_f, A_ref):10.3e} {_rel(Aq_f, Aq_ref):10.3e}")
+                  f"{_rel(_lower_only(A_f), A_ref):10.3e} "
+                  f"{_rel(_lower_only(Aq_f), Aq_ref):10.3e} {amax:10.3e}  {note}")
 
     print("\nhow to read this:")
     print("  algebra rows ~1e-15  : the derivation is right; a later mismatch is kernel code")
-    print("  A/Aq rel err by dtype: the accuracy cost of the factored form at that chunk size")
-    print("  max exp(-gc)         : the factor that must survive the chosen dtype. bf16 and")
-    print("                         fp32 share the exponent range, so this is a soft limit,")
-    print("                         but beyond ~1e30 the mantissa is gone and the gemm result")
-    print("                         is noise; pick the largest C that stays well under it")
+    print("  A/Aq rel err        : the accuracy bill for the factored form, lower triangle")
+    print("                        only (that is all the algorithm reads)")
+    print("  |A| max (unmasked)  : grows like exp(+gc) in the upper half; when it is non-")
+    print("                        finite the factor overflowed the dtype and even the valid")
+    print("                        half is garbage, so that (C, dtype) is simply unusable")
+    print("  max exp(-gc)        : the factor that has to survive. Under 1e30 leaves room;")
+    print("                        past ~1e38 it is inf in both fp32 and bf16")
 
 
 if __name__ == "__main__":
