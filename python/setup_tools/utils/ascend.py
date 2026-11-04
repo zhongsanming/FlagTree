@@ -40,6 +40,21 @@ os.environ.setdefault("TRITON_BUILD_PROTON", "OFF")
 os.environ.setdefault("TRITON_BUILD_FLAGPRISM", "OFF")
 
 
+def precompile_hook_ascend(*args, **kwargs):
+    """Fetch the FLIR revision required by the Ascend CommonIR lowering."""
+    from tools import DownloadManager, Module, flagtree_configs
+
+    downloader = DownloadManager()
+    flir = Module(
+        name="flir-ascend",
+        url="https://github.com/kateyijian/flir.git",
+        commit_id="482b60b881219cab7df987f005b9d8bf5c97cbe5",
+        dst_path=os.path.join(flagtree_configs.flagtree_submodule_dir, "flir"),
+    )
+    downloader.download(module=flir, required=True)
+    return kwargs.get("default_backends")
+
+
 def _is_linux_os(os_id: str) -> bool:
     try:
         with open("/etc/os-release") as f:
