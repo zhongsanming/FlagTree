@@ -338,6 +338,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
                   ${PYTHON_SRC_PATH}/llvm.cc
                   ${PYTHON_SRC_PATH}/specialize.cc)
 
+  if(FLAGTREE_BACKEND STREQUAL "ascend")
+    # Ascend exposes a pybind11 submodule (triton._C.libtriton.buffer_ir) that
+    # must live in the core triton module; triton_ascend.cc registers it.
+    target_sources(triton PRIVATE
+      ${PROJECT_SOURCE_DIR}/third_party/ascend/python/src/buffer_ir.cc)
+  endif()
+
   # Link triton with its dependencies
   target_link_libraries(triton PUBLIC ${TRITON_LIBRARIES})  # flagtree: PUBLIC
   flagtree_configure_backend_triton_target(triton)

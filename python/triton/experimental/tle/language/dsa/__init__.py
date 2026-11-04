@@ -8,6 +8,8 @@ sub-namespace (see ``dsa.tsingmicro``, mirroring upstream ``dsa.ascend``).
 """
 
 from .core import (
+    tile_load,
+    tile_store,
     pipeline,
     alloc,
     copy,
@@ -30,11 +32,14 @@ from .types import (
     buffered_tensor,
     buffered_tensor_type,
 )
+from . import ascend
 from . import tsingmicro
 from . import thrive
 from .semantic import DSASemantic, DSASemanticError
 
 __all__ = [
+    "tile_load",
+    "tile_store",
     "pipeline",
     "alloc",
     "copy",
@@ -52,6 +57,7 @@ __all__ = [
     "insert_slice",
     "scope",
     "local",
+    "ascend",
     "tsingmicro",
     "thrive",
     "buffered_tensor",

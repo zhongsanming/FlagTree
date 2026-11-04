@@ -68,6 +68,11 @@ submodule_registrar = SubmoduleRegistrar(submodules=(
         "name": "cuda-tile", "url": "https://github.com/NVIDIA/cuda-tile.git", "relative_path":
         "tileir/third_party/cuda-tile", "commit_id": "7e8e2e68fa219716103824c01f7303367cf7df8d"
     },
+    {
+        "name": "AscendNPU-IR", "url": "https://gitcode.com/Ascend/AscendNPU-IR.git",
+        "relative_path": "ascend/AscendNPU-IR",
+        "commit_id": "bb13ef6120526aa3df6f950006af5ec0e585d2f6"
+    },
 ))
 
 

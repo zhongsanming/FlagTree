@@ -542,3 +542,32 @@ def insert_tile(
         return tl.tensor(output, x.type)
     except Exception as e:
         raise RuntimeError(f"Failed to create insert_tile operation: {str(e)}") from e
+
+
+@tl.builtin
+def make_partition_view(base, shape, strides, tile, padding_value="zero", _semantic=None) -> "tl.tensor_view":
+    """Create a tiled partition view over a scalar base pointer.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_partition_view(base, shape, strides, tile, padding_value)
+
+
+@tl.builtin
+def make_strided_view(base, shape, strides, tile, traversal_strides, padding_value="zero",
+                      _semantic=None) -> "tl.tensor_view":
+    """Create a tiled pointer view whose origins advance by ``traversal_strides``.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_strided_view(base, shape, strides, tile, traversal_strides, padding_value)
+
+
+@tl.builtin
+def make_gather_scatter_view(base, shape, strides, tile, sparse_dim, padding_value="zero",
+                             _semantic=None) -> "tl.tensor_view":
+    """Create a pointer view with tensor-valued indices in selected dimensions.
+
+    ``padding_value`` must be one of ``"zero"``, ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+    return _semantic.make_gather_scatter_view(base, shape, strides, tile, sparse_dim, padding_value)

@@ -604,3 +604,15 @@ def insert_slice(x: tl.tensor, tile: tl.tensor, offsets, sizes=None, strides=Non
     handle = builder.create_dsa_insert_slice(x.type.to_ir(builder), x.handle, tile.handle, static_offsets, dyn_offsets,
                                              sizes, strides)
     return tl.tensor(handle, x.type)
+
+
+@tl.builtin
+def tile_load(src, index=None, dst_space=None, _semantic=None, _generator=None) -> tensor:
+    """Load a tile from an encoded tensor_view via tile.load."""
+    return tle_semantic.tile_load(src, index, dst_space, _semantic.builder)
+
+
+@tl.builtin
+def tile_store(src, value=None, index=None, dst=None, src_space=None, _semantic=None, _generator=None):
+    """Store a tile into an encoded tensor_view via tile.store."""
+    tle_semantic.tile_store(src, dst, value, index, _semantic.builder, src_space)
