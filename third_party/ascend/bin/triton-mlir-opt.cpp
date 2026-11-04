@@ -23,6 +23,9 @@
 // BishengIR includes
 #include "bishengir/InitAllDialects.h"
 
+#include "ascend/include/CommonIRToHIVM/Passes.h"
+#include "triton-shared/Conversion/TensorViewLowering/Passes.h"
+
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/InitAllPasses.h"
@@ -36,6 +39,8 @@ int main(int argc, char **argv) {
 
   // Register BishengIR dialects and passes
   bishengir::registerAllDialects(registry);
+  mlir::triton::registerCommonIRToHIVMPasses();
+  mlir::triton::registerTensorViewLoweringPasses();
 
   return mlir::asMainReturnCode(mlir::MlirOptMain(
       argc, argv, "Triton-Ascend optimizer driver\n", registry));
