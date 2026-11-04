@@ -355,6 +355,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         compile_on_910_95 = metadata["compile_on_910_95"]
         compile_mode = opt.compile_mode
         metadata["compile_mode"] = compile_mode
+        use_commonir_tensor_view = metadata.get("use_commonir_tensor_view", True)
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
@@ -380,9 +381,19 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
+        if use_commonir_tensor_view:
+            # Legalize tv.ptr kernel arguments, then lower CommonIR tile.* ops
+            # and inline unresolved !tile.buf signatures.
+            ascend.passes.ttir.add_commonir_tv_ptr_legalize(pm)
+            ascend.passes.ttir.add_commonir_to_hivm(pm)
+            passes.common.add_inliner(pm)
+            passes.common.add_canonicalizer(pm)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
+        if not use_commonir_tensor_view:
+            # Alternative native TensorView bufferization tail.
+            ascend.passes.ttir.add_tensor_view_lowering(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, False, False)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
@@ -644,6 +655,12 @@ def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
     return [bishengir_target_opt]
+
+
+def _append_custom_pipeline_option(compile_options, metadata):
+    custom_pipeline = metadata.get("custom_pipeline")
+    if custom_pipeline is not None:
+        compile_options.append(f"--custom-compilation-pipeline={custom_pipeline}")
 
 
 @functools.lru_cache()
@@ -922,6 +939,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if plan_memory_strategy is not None:
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
+        _append_custom_pipeline_option(_compile_option_list, metadata)
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -1133,6 +1151,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
+        _append_custom_pipeline_option(_compile_option_list, metadata)
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -1260,6 +1279,7 @@ class NPUOptions:
     # Backend-managed BiSheng arguments. Keep the name discoverable so legacy
     # launch keywords are accepted, but never forward a user-supplied value.
     bisheng_options: str = field(default="-cce-link-aicore-ll-module " + get_libdevice(), init=False)
+    custom_pipeline: str = None
     multibuffer: bool = True
     # Public dictionaries are stored as sorted pairs for hashing and JSON caches.
     multibuffer_mode: Optional[Union[Dict[str, int], Tuple[Tuple[str, int], ...]]] = None
@@ -1348,6 +1368,7 @@ class NPUOptions:
     enable_select_analysis: bool = field(default=True, init=False)
     enable_simt_reorder_instruction: bool = field(default=False, init=False)
     enable_sync_block_lock: Optional[bool] = field(default=None, init=False)
+    use_commonir_tensor_view: bool = True
     enable_ub_refine_opt: bool = field(default=False, init=False)
     enable_vf_fusion: Optional[bool] = field(default=None, init=False)
     force_simt_only: bool = field(default=False, init=False)
@@ -1515,6 +1536,7 @@ def ttir_to_npubin(mod, metadata, opt):
                     _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
+        _append_custom_pipeline_option(_compile_option_list, metadata)
         cmd_list = ([npu_compiler_path, src_path] + _compile_option_list + ["-o", bin_file])
         ret = subprocess.run(cmd_list, env=env, capture_output=True, check=True)
         if not Path(bin_path).exists():

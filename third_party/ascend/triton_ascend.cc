@@ -24,6 +24,13 @@
 #include "ascend/include/TritonToStructured/Passes.h"
 #include "ascend/include/TritonToUnstructure/Passes.h"
 
+#include "triton-shared/Conversion/TensorViewLowering/Passes.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
+
+#ifdef __TLE_DSA__
+#include "ascend/include/CommonIRToHIVM/Passes.h"
+#endif
+
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
@@ -65,6 +72,20 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     opts.autoBlockifySize = autoBlockifySize;
     pm.addPass(mlir::triton::createAutoBlockifyPass(opts));
   });
+
+  m.def("add_tensor_view_lowering", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTensorViewLoweringPass());
+  });
+
+#ifdef __TLE_DSA__
+  m.def("add_commonir_tv_ptr_legalize", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createCommonIRTvPtrLegalizePass());
+  });
+
+  m.def("add_commonir_to_hivm", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createCommonIRToHIVMPass());
+  });
+#endif
 
   m.def("add_triton_to_structure",
         [](mlir::PassManager &pm, bool enableMaskFallbackConversion,
@@ -464,7 +485,8 @@ void init_triton_ascend(py::module &&m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
-    registry.insert<mlir::triton::ascend::TritonAscendDialect>();
+    registry.insert<mlir::triton::ascend::TritonAscendDialect,
+                    mlir::triton::tv::TensorViewDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

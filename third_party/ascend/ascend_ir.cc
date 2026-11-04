@@ -30,6 +30,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewBuilder.h"
 #include "ascend/include/TritonToGraph/ProgramAxisDependenceAnalysis.h"
 #include "ascend/include/TritonToGraph/ProgramGridTransform.h"
 #include "ascend/include/TritonToGraph/ProgramMappingScalarSpecialization.h"
@@ -55,6 +57,19 @@
 
 using namespace mlir;
 namespace py = pybind11;
+
+static triton::tv::PaddingValue
+parseTensorViewPaddingValue(const std::string &value) {
+  if (value == "zero")
+    return triton::tv::PaddingValue::ZERO;
+  if (value == "nan")
+    return triton::tv::PaddingValue::NAN_VALUE;
+  if (value == "inf")
+    return triton::tv::PaddingValue::POS_INF;
+  if (value == "-inf")
+    return triton::tv::PaddingValue::NEG_INF;
+  throw py::value_error("unknown TensorView padding value: " + value);
+}
 
 struct AscendNPUIROpBuilder : public TritonOpBuilder {
   std::string target;
@@ -1569,6 +1584,110 @@ void init_ascend_ir(py::module &&m) {
                      hivm::DataLayoutAttr::get(ctx, hivm::DataLayout::ND),
                      hivm::DataLayoutAttr::get(ctx, hivm::DataLayout::ND))
                  .getResult();
+           })
+      // Convert or bridge a call argument to !tv.ptr.
+      .def("convert_to_tensor_view_ptr",
+           [](AscendNPUIROpBuilder &self, Value value) -> Value {
+             return triton::tv::convertToTensorViewPtr(value);
+           })
+      .def("create_tensor_view",
+           [](AscendNPUIROpBuilder &self, Value base,
+              std::vector<Value> shape, std::vector<Value> strides) -> Value {
+             FailureOr<Value> view = triton::tv::createTensorViewBase(
+                 self.getBuilder(), self.getLastLoc(), base, shape, strides);
+             if (failed(view))
+               throw py::value_error(
+                   "TensorView base pointers must not contain pointer offsets");
+             return *view;
+           })
+      .def("create_partition_view",
+           [](AscendNPUIROpBuilder &self, Value view,
+              std::vector<int64_t> tile,
+              std::string paddingValue) -> Value {
+             return triton::tv::createPartitionView(
+                 self.getBuilder(), self.getLastLoc(), view, tile,
+                 parseTensorViewPaddingValue(paddingValue));
+           })
+      .def("create_strided_view",
+           [](AscendNPUIROpBuilder &self, Value view,
+              std::vector<int64_t> tile,
+              std::vector<int64_t> traversalStrides,
+              std::string paddingValue) -> Value {
+             return triton::tv::createStridedView(
+                 self.getBuilder(), self.getLastLoc(), view, tile,
+                 traversalStrides,
+                 parseTensorViewPaddingValue(paddingValue));
+           })
+      .def("create_gather_scatter_view",
+           [](AscendNPUIROpBuilder &self, Value view,
+              std::vector<int64_t> tile, std::vector<int64_t> sparseDims,
+              std::string paddingValue) -> Value {
+             return triton::tv::createGatherScatterView(
+                 self.getBuilder(), self.getLastLoc(), view, tile, sparseDims,
+                 parseTensorViewPaddingValue(paddingValue));
+           })
+      .def("tensor_view_load",
+           [](AscendNPUIROpBuilder &self, Value view,
+              std::vector<Value> index, Type resultTy) -> Value {
+             return triton::tv::tensorViewLoad(
+                 self.getBuilder(), self.getLastLoc(), view, index, resultTy);
+           })
+      .def("tensor_view_store",
+           [](AscendNPUIROpBuilder &self, Value view, Value value,
+              std::vector<Value> index) -> void {
+             triton::tv::tensorViewStore(self.getBuilder(), self.getLastLoc(),
+                                         view, index, value);
+           })
+      .def("tensor_view_ptr_load",
+           [](AscendNPUIROpBuilder &self, Value pointers,
+              const std::vector<std::vector<int64_t>> &coordinates,
+              Type resultTy) -> Value {
+             llvm::SmallVector<llvm::ArrayRef<int64_t>> coordinateRefs;
+             for (const auto &coordinate : coordinates)
+               coordinateRefs.push_back(coordinate);
+             return triton::tv::tensorViewPtrLoad(
+                 self.getBuilder(), self.getLastLoc(), pointers,
+                 coordinateRefs, resultTy);
+           })
+      .def("tensor_view_ptr_store",
+           [](AscendNPUIROpBuilder &self, Value pointers, Value value,
+              const std::vector<std::vector<int64_t>> &coordinates) -> void {
+             llvm::SmallVector<llvm::ArrayRef<int64_t>> coordinateRefs;
+             for (const auto &coordinate : coordinates)
+               coordinateRefs.push_back(coordinate);
+             triton::tv::tensorViewPtrStore(
+                 self.getBuilder(), self.getLastLoc(), pointers, value,
+                 coordinateRefs);
+           })
+      .def("get_tensor_view_ty",
+           [](AscendNPUIROpBuilder &self, Type elementType, int64_t rank,
+              std::string viewKind, std::vector<int64_t> tile,
+              std::vector<int64_t> traversalStrides,
+              std::vector<int64_t> sparseDims,
+              std::string paddingValue) -> Type {
+             llvm::SmallVector<int64_t> dynShape(rank,
+                                                 ShapedType::kDynamic);
+             llvm::SmallVector<int64_t> dynStrides(
+                 rank, ShapedType::kDynamic);
+             Attribute encoding;
+             triton::tv::PaddingValue padding =
+                 parseTensorViewPaddingValue(paddingValue);
+             if (viewKind == "partition") {
+               encoding = triton::tv::PartitionViewAttr::get(
+                   self.getBuilder().getContext(), tile, padding);
+             } else if (viewKind == "strided") {
+               encoding = triton::tv::StridedViewAttr::get(
+                   self.getBuilder().getContext(), tile, traversalStrides,
+                   padding);
+             } else if (viewKind == "gather_scatter") {
+               encoding = triton::tv::GatherScatterViewAttr::get(
+                   self.getBuilder().getContext(), tile, sparseDims, padding);
+             } else if (!viewKind.empty()) {
+               throw py::value_error("unknown TensorView encoding: " +
+                                     viewKind);
+             }
+             return triton::tv::TensorViewType::get(dynShape, elementType,
+                                                    dynStrides, encoding);
            });
 
   installTritonContextManager();

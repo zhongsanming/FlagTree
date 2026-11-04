@@ -358,7 +358,6 @@ macro(flagtree_configure_flir_dependency)
       message(FATAL_ERROR "The ${FLAGTREE_BACKEND} backend requires third_party/flir")
     endif()
 
-    # TsingMicro only consumes FLIR's C++ targets; do not build its Python/CPU plugin.
     set(TRITON_SHARED_BUILD_CPU_BACKEND OFF)
     list(REMOVE_ITEM TRITON_CODEGEN_BACKENDS "flir")
     if(NOT TARGET TritonSharedUtils)
@@ -367,6 +366,32 @@ macro(flagtree_configure_flir_dependency)
         "${PROJECT_BINARY_DIR}/third_party/flir"
       )
     endif()
+  elseif(FLAGTREE_BACKEND STREQUAL "ascend")
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/flir/CMakeLists.txt")
+      message(FATAL_ERROR "The ascend backend requires third_party/flir")
+    endif()
+
+    # Ascend consumes only FLIR's CommonIR/TensorView surface. Adding the
+    # full FLIR tree would create duplicate targets such as TritonToLinalg,
+    # TritonToStructured and DiscreteMaskAccessConversion that already exist
+    # in third_party/ascend.
+    add_definitions(-D__LLVM_MAJOR_VERSION_21_COMPATIBLE__)
+    add_definitions(-D__LLVM_MAJOR_VERSION_22_COMPATIBLE__)
+    include_directories("${PROJECT_SOURCE_DIR}/third_party/flir/include")
+    include_directories("${PROJECT_BINARY_DIR}/third_party/flir/include")
+
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/include/mlir-ext/Dialect/CommonIR"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/include/mlir-ext/Dialect/CommonIR")
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/lib/Dialect/CommonIR/IR"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/lib/Dialect/CommonIR/IR")
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/include/triton-shared/Dialect/TensorView"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/include/triton-shared/Dialect/TensorView")
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/lib/Dialect/TensorView/IR"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/lib/Dialect/TensorView/IR")
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/include/triton-shared/Conversion/TensorViewLowering"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/include/triton-shared/Conversion/TensorViewLowering")
+    add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/flir/lib/Conversion/TensorViewLowering"
+                     "${PROJECT_BINARY_DIR}/third_party/flir/lib/Conversion/TensorViewLowering")
   endif()
 endmacro()
 
