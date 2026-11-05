@@ -22,6 +22,13 @@
 
 import os
 import platform
+import sys
+
+# setup_helper loads this file with importlib under the synthetic module name
+# "module"; make its sibling modules importable by name.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 # Upstream triton-ascend 3.6 pins LLVM f6ded0be and applies this patch before
 # building. The resulting MLIR has extra bufferization ops (to_memref,
