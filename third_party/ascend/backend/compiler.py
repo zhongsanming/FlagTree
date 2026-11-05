@@ -459,6 +459,17 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         return _serialize_module(mod, opt)
 
 
+def _use_text_bishengir() -> bool:
+    """Use text IR for the bishengir-opt hand-off.
+
+    The triton-ascend-patched LLVM emits a bytecode property layout that
+    external/CANN bishengir-opt builds may not understand. Text mode avoids
+    that incompatibility; it is opt-in because a matching bundled BishengIR
+    payload handles bytecode correctly and is faster.
+    """
+    return os.getenv("TRITON_ASCEND_BISHENGIR_TEXT", "").lower() in ("1", "on", "true", "yes")
+
+
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
     """
     Convert Linalg IR to MLIR Bytecode format using triton-mlir-opt.
@@ -470,6 +481,12 @@ def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
     Returns:
         Bytecode data as bytes (not file path, to avoid temp directory cleanup issues)
     """
+    if _use_text_bishengir():
+        if opt.debug:
+            dump_manager = get_dump_manager(metadata["hash"])
+            dump_manager.put(linalg, "kernel.mlirbc", binary=False)
+        return linalg
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ttadapter_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
         bc_path = os.path.join(tmpdir, "kernel.mlirbc")
@@ -511,15 +528,21 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
         bc_path = os.path.join(tmpdir, "kernel.mlirbc")
         mlir_path = os.path.join(tmpdir, "kernel.mlir")
 
-        # Write bytecode data to temporary file
-        with open(bc_path, "wb") as f:
-            f.write(bc_data)
+        if isinstance(bc_data, str):
+            # Text hand-off: external bishengir-opt builds that do not match
+            # the patched LLVM bytecode property layout can parse this.
+            input_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
+            Path(input_path).write_text(bc_data)
+        else:
+            input_path = bc_path
+            with open(bc_path, "wb") as f:
+                f.write(bc_data)
 
         bishengir_opt_path, env = _get_bishengir_opt_path()
 
         cmd = [
             bishengir_opt_path,
-            bc_path,
+            input_path,
         ]
         if opt.debug:
             cmd += ["--mlir-print-debuginfo"]
