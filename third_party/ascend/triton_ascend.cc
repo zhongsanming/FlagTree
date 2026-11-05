@@ -1,4 +1,5 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -486,7 +487,13 @@ void init_triton_ascend(py::module &&m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::ascend::TritonAscendDialect,
-                    mlir::triton::tv::TensorViewDialect>();
+                    mlir::triton::tv::TensorViewDialect,
+                    mlir::func::FuncDialect>();
+    // MLIR 22 moved the func dialect's inliner interface into an explicit
+    // dialect extension. The CommonIR pipeline adds an inline pass, so it must
+    // be registered or MLIR aborts with "dialect 'func' promised
+    // DialectInlinerInterface but never implemented".
+    mlir::func::registerInlinerExtension(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
