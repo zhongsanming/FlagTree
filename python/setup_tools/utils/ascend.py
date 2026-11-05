@@ -105,6 +105,35 @@ def install_extension(*args, **kwargs):
                 pass
         print(f"[ascend] copied {name} to {dst}")
 
+    _copy_bishengir_payload(extdir)
+
+
+def _copy_bishengir_payload(extdir):
+    """Bundle a BishengIR payload that matches the patched LLVM.
+
+    The CANN-provided ``bishengir-opt`` may be built against a different MLIR
+    revision, which makes it misread the bytecode emitted by our patched
+    ``triton-mlir-opt``. Set ``TRITON_ASCEND_BISHENGIR_PATH`` to a payload built
+    from the same AscendNPU-IR/LLVM revision (for example, the payload from an
+    official triton-ascend 3.6 wheel).
+    """
+    source = os.getenv("TRITON_ASCEND_BISHENGIR_PATH", "").strip()
+    if not source:
+        return
+    source = os.path.abspath(os.path.expanduser(source))
+    required = [
+        os.path.join(source, "bin", "bishengir-compile"),
+        os.path.join(source, "bin", "bishengir-opt"),
+        os.path.join(source, "lib"),
+    ]
+    if not all(os.path.exists(path) for path in required):
+        raise RuntimeError(
+            "TRITON_ASCEND_BISHENGIR_PATH must contain bin/bishengir-compile, "
+            "bin/bishengir-opt, and lib")
+    dest = os.path.join(os.path.dirname(extdir), "backends", "ascend", "bishengir")
+    shutil.copytree(source, dest, dirs_exist_ok=True, symlinks=True)
+    print(f"[ascend] copied BishengIR payload to {dest}")
+
 
 def _is_linux_os(os_id: str) -> bool:
     try:
