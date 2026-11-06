@@ -494,14 +494,19 @@ def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
 
         triton_mlir_opt_path = _get_triton_mlir_opt_path()
 
-        # The --emit-bytecode flag ensures output is in BC format
-        subprocess.run([
+        # The default native bytecode version is 6 (LLVM 22). CANN's
+        # bishengir-opt may be built against LLVM 19 and then misreads the
+        # property layout, so default to version 4 unless overridden.
+        bytecode_version = os.getenv("TRITON_ASCEND_BISHENGIR_BYTECODE_VERSION", "4").strip()
+        cmd = [
             triton_mlir_opt_path,
             ttadapter_path,
             "--emit-bytecode",
-            "-o",
-            bc_path,
-        ], check=True, capture_output=True, text=True)
+        ]
+        if bytecode_version and bytecode_version.lower() not in ("native", "0", "none"):
+            cmd.append(f"--emit-bytecode-version={bytecode_version}")
+        cmd += ["-o", bc_path]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
 
         # Read bytecode as binary before temp directory is cleaned up
         with open(bc_path, "rb") as f:
