@@ -495,6 +495,25 @@ def _get_triton_mlir_opt_path() -> str:
     return _get_tool_path("triton-mlir-opt")
 
 
+def _prepend_bisheng_toolchain_path(env, compiler_path: str):
+    """Prefer the linker/BiSheng tools from the same CANN toolchain.
+
+    LLVM_SYSPATH's bin directory is often earlier in PATH and its ld.lld does
+    not know the ``aicorelinux`` emulation used by BiShengIR.
+    """
+    tool_dir = os.path.dirname(os.path.abspath(compiler_path))
+    candidates = (
+        tool_dir,
+        os.path.join(os.path.dirname(tool_dir), "bisheng_compiler", "bin"),
+        os.path.join(os.path.dirname(os.path.dirname(tool_dir)), "bisheng_compiler", "bin"),
+    )
+    current = env.get("PATH", "").split(os.pathsep)
+    for candidate in reversed(candidates):
+        if os.path.isdir(candidate) and candidate not in current:
+            env["PATH"] = candidate + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def _get_bishengir_opt_path() -> str:
     ascend_dir = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
@@ -509,6 +528,7 @@ def _get_bishengir_opt_path() -> str:
             if bishengir_opt_root is None:
                 raise EnvironmentError("Couldn't find executable bishengir-opt or TRITON_NPU_COMPILER_PATH")
             bishengir_opt_path = os.path.join(bishengir_opt_root, "bishengir-opt")
+        _prepend_bisheng_toolchain_path(env, bishengir_opt_path)
     return bishengir_opt_path, env
 
 
@@ -526,6 +546,7 @@ def _get_npucompiler_path() -> str:
             if npu_compiler_root is None:
                 raise EnvironmentError("Couldn't find executable bishengir-compile or TRITON_NPU_COMPILER_PATH.")
             npu_compiler_path = os.path.join(npu_compiler_root, "npuc")
+        _prepend_bisheng_toolchain_path(env, npu_compiler_path)
     return npu_compiler_path, env
 
 
