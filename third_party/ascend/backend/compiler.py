@@ -388,6 +388,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             ascend.passes.ttir.add_commonir_to_hivm(pm)
             passes.common.add_inliner(pm)
             passes.common.add_canonicalizer(pm)
+        if metadata.get("enable_reduce_sum_strength", False) and hasattr(
+                ascend.passes.ttir, "add_reduce_sum_strength"):
+            ascend.passes.ttir.add_reduce_sum_strength(pm, True, 2)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
@@ -1397,6 +1400,10 @@ class NPUOptions:
     enable_simt_reorder_instruction: bool = field(default=False, init=False)
     enable_sync_block_lock: Optional[bool] = field(default=None, init=False)
     use_commonir_tensor_view: bool = True
+    # Compatibility option from the FlagTree 3.5 Ascend line. The pass itself
+    # is not part of the upstream 3.6 backend yet; accepting the option keeps
+    # existing kernels compiling.
+    enable_reduce_sum_strength: bool = False
     enable_ub_refine_opt: bool = field(default=False, init=False)
     enable_vf_fusion: Optional[bool] = field(default=None, init=False)
     force_simt_only: bool = field(default=False, init=False)

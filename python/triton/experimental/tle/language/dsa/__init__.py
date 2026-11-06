@@ -25,6 +25,10 @@ from .core import (
     div,
     extract_slice,
     insert_slice,
+    parallel,
+    hint,
+    workspace,
+    extract_element,
 )
 from .types import (
     scope,
@@ -55,6 +59,10 @@ __all__ = [
     "div",
     "extract_slice",
     "insert_slice",
+    "parallel",
+    "hint",
+    "workspace",
+    "extract_element",
     "scope",
     "local",
     "ascend",

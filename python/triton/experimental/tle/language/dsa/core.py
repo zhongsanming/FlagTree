@@ -616,3 +616,106 @@ def tile_load(src, index=None, dst_space=None, _semantic=None, _generator=None) 
 def tile_store(src, value=None, index=None, dst=None, src_space=None, _semantic=None, _generator=None):
     """Store a tile into an encoded tensor_view via tile.store."""
     tle_semantic.tile_store(src, dst, value, index, _semantic.builder, src_space)
+
+
+class parallel(range):
+    """Iterator with parallel execution semantics (Ascend DSA)."""
+
+    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None):
+        super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor)
+
+
+def hint(**kwargs):
+    """Compile-time hint marker; consumed by the TLE code generator."""
+    raise RuntimeError("tle.dsa.hint() cannot be called directly.")
+
+
+hint.__triton_builtin__ = True
+hint.__tle_builtin__ = True
+
+
+@tl.builtin
+def extract_element(src, indice, _semantic=None, _generator=None):
+    """Read one element from a ranked tensor at the given indices."""
+    assert len(src.shape) > 0
+    new_indice = [_semantic.to_tensor(i) if isinstance(i, constexpr) else i for i in indice]
+    result = _semantic.builder.create_extract_scalar(src.handle, [i.handle for i in new_indice])
+    return tl.tensor(result, src.type.scalar)
+
+
+class Workspace:
+    """Compile-time descriptor for a caller-provided GM ring buffer."""
+
+    __triton_compile_time_value__ = True
+
+    def __init__(self, base, capacity, shape, dtype, strides=None, stage_stride=None):
+        self.base = base
+        self.capacity = tl._unwrap_if_constexpr(capacity)
+        if not isinstance(self.capacity, int):
+            raise TypeError("workspace capacity must be a compile-time integer")
+        if self.capacity < 1:
+            raise ValueError("workspace capacity must be positive")
+        self.shape = tl._unwrap_shape(shape)
+        if not isinstance(self.shape, (tuple, list)):
+            raise TypeError("workspace shape must be list/tuple")
+        self.shape = list(self.shape)
+        self.dtype = tl._unwrap_if_constexpr(dtype)
+        if strides is None:
+            stride = 1
+            computed_strides = []
+            for dim in reversed(self.shape):
+                computed_strides.insert(0, stride)
+                stride *= dim
+            self.strides = computed_strides
+        else:
+            self.strides = list(tl._unwrap_shape(strides))
+        if stage_stride is None:
+            stage_stride_value = 1
+            for dim in self.shape:
+                stage_stride_value *= dim
+            self.stage_stride = stage_stride_value
+        else:
+            self.stage_stride = tl._unwrap_if_constexpr(stage_stride)
+
+    def slot(self, stage, _semantic=None):
+        if isinstance(stage, tensor):
+            stage_offset = stage.__mul__(self.stage_stride, _semantic=_semantic)
+        else:
+            stage_offset = stage * self.stage_stride
+        if len(self.shape) == 1:
+            offs = tl.arange(0, self.shape[0], _semantic=_semantic)
+            elem_offset = offs.__mul__(self.strides[0], _semantic=_semantic)
+            if isinstance(stage_offset, tensor):
+                offset = stage_offset.__add__(elem_offset, _semantic=_semantic)
+            else:
+                offset = elem_offset.__add__(stage_offset, _semantic=_semantic)
+            if isinstance(self.base, tensor):
+                return self.base.__add__(offset, _semantic=_semantic)
+            return self.base + offset
+        if len(self.shape) == 2:
+            offs_m = tl.arange(0, self.shape[0], _semantic=_semantic).__getitem__((slice(None), None),
+                                                                                  _semantic=_semantic)
+            offs_n = tl.arange(0, self.shape[1], _semantic=_semantic).__getitem__((None, slice(None)),
+                                                                                  _semantic=_semantic)
+            m_offset = offs_m.__mul__(self.strides[0], _semantic=_semantic)
+            n_offset = offs_n.__mul__(self.strides[1], _semantic=_semantic)
+            if isinstance(stage_offset, tensor):
+                row_offset = stage_offset.__add__(m_offset, _semantic=_semantic)
+            else:
+                row_offset = m_offset.__add__(stage_offset, _semantic=_semantic)
+            if isinstance(self.base, tensor):
+                rows = self.base.__add__(row_offset, _semantic=_semantic)
+            else:
+                rows = self.base + row_offset
+            if isinstance(rows, tensor):
+                return rows.__add__(n_offset, _semantic=_semantic)
+            return rows + n_offset
+        raise NotImplementedError("workspace supports rank 1 or rank 2 payloads")
+
+
+def workspace(base, capacity, shape, dtype, strides=None, stage_stride=None, _semantic=None):
+    return Workspace(base, capacity, shape, dtype, strides, stage_stride)
+
+
+workspace.__triton_builtin__ = True
+workspace.__tle_builtin__ = True

@@ -1153,6 +1153,18 @@ class CodeGenerator(ast.NodeVisitor):
             context = node.items[0].context_expr
             if isinstance(context, ast.Call):
                 withitemClass = self.visit(context.func)
+                # ``tle.dsa.hint(...)`` is a compile-time marker. It has no
+                # runtime context-manager behaviour; just emit its body.
+                try:
+                    from ..experimental.tle import language as _tle
+                    _dsa_hint = getattr(getattr(_tle, "dsa", None), "hint", None)
+                except (ImportError, AttributeError):
+                    _dsa_hint = None
+                if _dsa_hint is not None and withitemClass is _dsa_hint:
+                    if ContainsReturnChecker(self.gscope).visit(node):
+                        raise self._unsupported(
+                            node, "Cannot have `return` statements inside `with` statements in triton ")
+                    return self.visit_compound_statement(node.body)
                 handler = WITH_DISPATCH.get(withitemClass)
                 if handler:
                     # Dispatch to registered handler (e.g., handle_scope_with)
@@ -1338,15 +1350,18 @@ class CodeGenerator(ast.NodeVisitor):
         try:
             from ..experimental.tle import language as tle
             tle_dsa_pipeline = tle.dsa.pipeline
+            tle_dsa_parallel = tle.dsa.parallel
         except (ImportError, AttributeError):
             tle_dsa_pipeline = None
+            tle_dsa_parallel = None
 
         # flagtree tle: check supported
-        if IteratorClass in (tle_pipeline, tle_range, tle_dsa_pipeline) and IteratorClass is not None:
+        if IteratorClass in (tle_pipeline, tle_range, tle_dsa_pipeline,
+                             tle_dsa_parallel) and IteratorClass is not None:
             self._require_tle_primitive(IteratorClass)
 
         if IteratorClass in [language.range, tle_pipeline, tle_range, tle_dsa_pipeline,
-                             extension.parallel]:  # flagtree reorder-loop-loads
+                             tle_dsa_parallel, extension.parallel]:  # flagtree reorder-loop-loads
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1427,7 +1442,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.disable_licm", self.builder.get_unit_attr())
             if reorder and _unwrap_if_constexpr(loop_unroll_factor) is not None:  # flagtree reorder-loop-loads
                 for_op.set_attr("tt.reorder", self.builder.get_bool_attr(True))  # flagtree reorder-loop-loads
-            if (IteratorClass is extension.parallel):
+            if IteratorClass is extension.parallel or (
+                    tle_dsa_parallel is not None and IteratorClass is tle_dsa_parallel):
                 for_op.set_attr("hivm.parallel_loop", self.builder.get_unit_attr())
 
             self.scf_stack.append(node)
