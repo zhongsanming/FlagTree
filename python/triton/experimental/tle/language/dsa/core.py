@@ -85,6 +85,24 @@ def alloc(
     # --- Validate inputs via semantic layer ---
     unwrapped_shape = DSASemantic.validate_alloc_shape(shape)
     elem_dtype = DSASemantic.validate_alloc_dtype(dtype)
+
+    if _has_tile_builder(builder):
+        # Ascend/CommonIR path: allocate a tile.buf in the requested address
+        # space. ``scope`` is an Ascend address-space object (e.g.
+        # ``tle.dsa.ascend.UB``); ``None`` means the backend default.
+        elem_ir_ty = elem_dtype.to_ir(builder)
+        space = tl._unwrap_if_constexpr(scope)
+        if space is None:
+            space_attr = builder.dsa_get_null_attr()
+            memory_space = ""
+        else:
+            space_attr = space.to_ir(builder) if hasattr(space, "to_ir") else builder.dsa_get_null_attr()
+            memory_space = str(getattr(space, "name", space))
+        buf_ir_ty = builder.tile_get_buffer_type(list(unwrapped_shape), elem_ir_ty, space_attr)
+        alloc_value = builder.create_tile_alloc(buf_ir_ty)
+        buf_ty = tle.buffered_tensor_type(unwrapped_shape, elem_dtype, memory_space=memory_space)
+        return tle.buffered_tensor(alloc_value, buf_ty)
+
     resolved_scope = DSASemantic.validate_alloc_scope(scope)
 
     elem_ir_ty = elem_dtype.to_ir(builder)
@@ -92,6 +110,23 @@ def alloc(
     alloc_value = builder.create_dsa_alloc(list(unwrapped_shape), elem_ir_ty)
     buf_ty = tle.buffered_tensor_type(unwrapped_shape, elem_dtype, resolved_scope)
     return tle.buffered_tensor(alloc_value, buf_ty)
+
+
+def _has_tile_builder(builder) -> bool:
+    """Whether *builder* exposes the Ascend/CommonIR ``tile.*`` surface."""
+    return getattr(builder, "create_tile_alloc", None) is not None
+
+
+def _offset_handles(offsets, builder):
+    """Convert per-dim offsets to IR values, preserving dimension order."""
+    handles = []
+    for off in offsets:
+        off = tl._unwrap_if_constexpr(off)
+        if isinstance(off, tl.tensor):
+            handles.append(off.handle)
+        else:
+            handles.append(builder.get_int32(int(off)))
+    return handles
 
 
 class CopyDirection(Enum):
@@ -131,6 +166,13 @@ def copy(
     builder = _semantic.builder
     if builder is None:
         raise ValueError("copy must be used inside @triton.jit")
+
+    if _has_tile_builder(builder):
+        # Ascend/CommonIR path: a single tile.copy handles GM<->local and
+        # local<->local transfers (including pointer destinations).
+        shape_vals = [builder.get_int32(int(tl._unwrap_if_constexpr(x))) for x in shape]
+        builder.create_tile_copy(src.handle, dst.handle, shape_vals, False)
+        return None
 
     src_is_buf = isinstance(src, tle.buffered_tensor)
     dst_is_buf = isinstance(dst, tle.buffered_tensor)
@@ -341,6 +383,9 @@ def to_tensor(buffer: tle.buffered_tensor, writable: bool = True, _semantic=None
         raise ValueError(f"to_tensor requires a buffered_tensor, got {type(buffer).__name__}")
     shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
     result_ty = tl.block_type(buffer.type.element_ty, list(shape))
+    if _has_tile_builder(builder):
+        handle = builder.create_tile_to_tensor(buffer.handle, bool(writable))
+        return tl.tensor(handle, result_ty)
     result_ir = result_ty.to_ir(builder)
     handle = builder.create_dsa_to_tensor(result_ir, buffer.handle, bool(writable))
     return tl.tensor(handle, result_ty)
@@ -375,7 +420,10 @@ def to_buffer(src: tl.tensor, space=None, _semantic=None) -> tle.buffered_tensor
     if not shape:
         raise ValueError("to_buffer src must be a non-scalar tensor")
     buf = alloc(shape, src.dtype, scope=space, _semantic=_semantic)
-    builder.create_dsa_to_buffer(src.handle, buf.handle)
+    if _has_tile_builder(builder):
+        builder.create_tile_store_tensor(src.handle, buf.handle)
+    else:
+        builder.create_dsa_to_buffer(src.handle, buf.handle)
     return buf
 
 
@@ -554,6 +602,9 @@ def extract_slice(x: tl.tensor, offsets, sizes, strides, _semantic=None) -> tl.t
 
     # tensor.extract_slice semantics: sizes is the result shape.
     result_ty = tl.block_type(x.type.element_ty, sizes)
+    if _has_tile_builder(builder):
+        handle = builder.create_extract_slice(x.handle, _offset_handles(offsets, builder), sizes, strides)
+        return tl.tensor(handle, result_ty)
     result_ir = result_ty.to_ir(builder)
 
     handle = builder.create_dsa_extract_slice(result_ir, x.handle, static_offsets, dyn_offsets, sizes, strides)
@@ -601,6 +652,9 @@ def insert_slice(x: tl.tensor, tile: tl.tensor, offsets, sizes=None, strides=Non
     static_offsets, dyn_offsets = _split_offsets(offsets, "insert_slice")
     _check_static_slice_bounds("insert_slice", src_shape, static_offsets, sizes, strides)
 
+    if _has_tile_builder(builder):
+        handle = builder.create_insert_slice(x.handle, tile.handle, _offset_handles(offsets, builder), sizes, strides)
+        return tl.tensor(handle, x.type)
     handle = builder.create_dsa_insert_slice(x.type.to_ir(builder), x.handle, tile.handle, static_offsets, dyn_offsets,
                                              sizes, strides)
     return tl.tensor(handle, x.type)
@@ -639,7 +693,11 @@ def extract_element(src, indice, _semantic=None, _generator=None):
     """Read one element from a ranked tensor at the given indices."""
     assert len(src.shape) > 0
     new_indice = [_semantic.to_tensor(i) if isinstance(i, constexpr) else i for i in indice]
-    result = _semantic.builder.create_extract_scalar(src.handle, [i.handle for i in new_indice])
+    builder = _semantic.builder
+    if _has_tile_builder(builder):
+        result = builder.create_extract_scalar(src.handle, [i.handle for i in new_indice])
+    else:
+        result = builder.create_dsa_extract_scalar(src.handle, [i.handle for i in new_indice])
     return tl.tensor(result, src.type.scalar)
 
 

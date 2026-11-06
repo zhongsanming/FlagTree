@@ -141,6 +141,14 @@ __all__ = [
 
 from . import distributed, dsa, gpu, raw
 
+# Ascend uses the ACL shared-memory communicator rather than FlagCX.
+try:
+    from triton._flagtree_backend import FLAGTREE_BACKEND as _FLAGTREE_BACKEND
+except ImportError:
+    _FLAGTREE_BACKEND = None
+if _FLAGTREE_BACKEND == "ascend":
+    from .dsa.ascend.communication import (init_communicator, create_dist_tensor, cleanup_communicator)  # noqa: F811
+
 # TLE-specific loop iterator: tl.range plus the `reorder` extension hint.
 from .gpu import range
 

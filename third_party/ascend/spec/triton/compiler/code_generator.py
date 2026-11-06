@@ -90,6 +90,13 @@ def _is_constexpr(o: Any) -> bool:
     return o is None or isinstance(o, (constexpr, language.core.dtype, JITCallable))
 
 
+def _is_native_nontensor_value(value):
+    native_nontensor_types = (language.dtype, language.tuple)
+    # TLE descriptors such as pipes/workspaces are Python compile-time objects;
+    # they opt in explicitly so unrelated objects are not misclassified.
+    return isinstance(value, native_nontensor_types) or getattr(value, "__triton_compile_time_value__", False)
+
+
 def _is_non_scalar_tensor(o: Any) -> bool:
     return _is_triton_tensor(o) and (o.type.is_block() and o.type.numel != 1)
 
@@ -414,6 +421,14 @@ class CodeGenerator(ast.NodeVisitor):
         self.buffer_builder = buffer_ir.buffer_builder(context)
         self.buffer_builder.set_loc(file_name, begin_line, 0)
         setup_unified_builder_with_buffer_builder(self.builder, self.buffer_builder)
+
+        # Ascend DSA pipes allocate hardware event ids per kernel; reset the
+        # allocator for every compilation unit.
+        try:
+            from triton.experimental.tle.language.dsa.ascend.pipe import reset_pipe_event_allocator
+            reset_pipe_event_allocator()
+        except ImportError:
+            pass
 
         # dict of functions provided by the backend. Below are the list of possible functions:
         # Convert custom types not natively supported on HW.
@@ -789,11 +804,10 @@ class CodeGenerator(ast.NodeVisitor):
         def _sanitize_value(value):
             if isinstance(value, language.tuple):
                 return _apply_to_tuple_values(value, _sanitize_value)
-            native_nontensor_types = (language.dtype, language.tuple)
             value = _unwrap_if_constexpr(value)
             if value is not None and \
                 not _is_triton_value(value) and \
-                not isinstance(value, native_nontensor_types):
+                not _is_native_nontensor_value(value):
                 value = self.semantic.to_tensor(value)
             return value
 
@@ -881,8 +895,17 @@ class CodeGenerator(ast.NodeVisitor):
         ast.NodeVisitor.generic_visit(self, node)
 
     def visit_Tuple(self, node):
-        args = [self.visit(x) for x in node.elts]
+        args = [self._wrap_tuple_element(self.visit(x)) for x in node.elts]
         return language.tuple(args)
+
+    def _wrap_tuple_element(self, value):
+        # Compile-time descriptors (TLE pipes, workspaces) and JIT functions
+        # carry no IR type; wrap them as constexpr so tuple construction works.
+        if _is_triton_value(value):
+            return value
+        if getattr(value, "__triton_compile_time_value__", False) or isinstance(value, JITCallable):
+            return language.core.constexpr(value)
+        return value
 
     def _apply_binary_method(self, node, method_name, lhs, rhs):
         # TODO: raise something meaningful if getattr fails below, esp for reverse method
@@ -1506,7 +1529,8 @@ class CodeGenerator(ast.NodeVisitor):
         args = inspect.getcallargs(fn.fn, *args, **kwargs)
         args = [args[name] for name in fn.arg_names]
         for i, arg in enumerate(args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction, language.PropagateNan)):
+            if isinstance(arg, (language.dtype, float, int, bool, JITFunction, language.PropagateNan)) or \
+                    _is_native_nontensor_value(arg):
                 args[i] = language.core.constexpr(arg)
         args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
         args_cst = {path: get_iterable_path(args, path) for path in args_cst}
@@ -1563,7 +1587,8 @@ class CodeGenerator(ast.NodeVisitor):
         bound_args = inspect.getcallargs(fn.fn, *args, **kwargs)
         ordered_args = [bound_args[name] for name in fn.arg_names]
         for i, arg in enumerate(ordered_args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
+            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)) or \
+                    _is_native_nontensor_value(arg):
                 ordered_args[i] = language.core.constexpr(arg)
 
         parsed = fn.parse()

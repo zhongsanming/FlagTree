@@ -110,6 +110,19 @@ def pipe(
     one_shot=True models a single ready/full edge. The writer still commits and
     readers still wait, but acquire/release/close are not part of the contract.
     """
+    # Ascend DSA compatibility: 3.5 pipes carry ``tle.dsa.workspace`` payloads
+    # and are lowered by the Ascend-specific deferred scheduler.
+    try:
+        from .dsa.core import Workspace
+
+        if fields and all(isinstance(_unwrap_pipe_constexpr(field), Workspace) for field in fields.values()):
+            from .dsa.ascend.pipe import _deferred_pipe
+
+            return _deferred_pipe(capacity=capacity, scope=scope, name=name, readers=readers, one_shot=one_shot,
+                                  _semantic=_semantic, **fields)
+    except ImportError:
+        pass
+
     capacity = _unwrap_pipe_constexpr(capacity)
     scope = _unwrap_pipe_constexpr(scope)
     name = _unwrap_pipe_constexpr(name)

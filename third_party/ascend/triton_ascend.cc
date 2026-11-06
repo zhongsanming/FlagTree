@@ -28,6 +28,8 @@
 #include "triton-shared/Conversion/TensorViewLowering/Passes.h"
 #include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
+#include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
+
 #ifdef __TLE_DSA__
 #include "ascend/include/CommonIRToHIVM/Passes.h"
 #endif
@@ -488,6 +490,7 @@ void init_triton_ascend(py::module &&m) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::ascend::TritonAscendDialect,
                     mlir::triton::tv::TensorViewDialect,
+                    mlir::triton::tile::CommonIRDialect,
                     mlir::func::FuncDialect>();
     // MLIR 22 moved the func dialect's inliner interface into an explicit
     // dialect extension. The CommonIR pipeline adds an inline pass, so it must
