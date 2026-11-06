@@ -1311,7 +1311,9 @@ class NPUOptions:
     # launch keywords are accepted, but never forward a user-supplied value.
     bisheng_options: str = field(default="-cce-link-aicore-ll-module " + get_libdevice(), init=False)
     custom_pipeline: str = None
-    multibuffer: bool = True
+    # 3.5-compatible default: auto multi-buffer is disabled on the 950
+    # generation, where the extra ring buffers can overflow the 248 KiB UB.
+    multibuffer: Optional[bool] = None
     # Public dictionaries are stored as sorted pairs for hashing and JSON caches.
     multibuffer_mode: Optional[Union[Dict[str, int], Tuple[Tuple[str, int], ...]]] = None
     vf_fusion_mode: str = None
@@ -1451,6 +1453,8 @@ class NPUOptions:
             "compile_on_910_95",
             isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")),
         )
+        if self.multibuffer is None:
+            object.__setattr__(self, "multibuffer", not self.compile_on_910_95)
         try:
             normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
         except ProgramGridContractError as error:
