@@ -207,13 +207,8 @@ static void lowerScatteredLoad(tile::CopyOp op, Value ptr, Value buf,
       triton::EvictionPolicy::NORMAL, false);
 
   auto ty = cast<RankedTensorType>(loaded.getType());
-#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
   Value mem = rewriter.create<bufferization::ToMemrefOp>(
       loc, MemRefType::get(ty.getShape(), ty.getElementType()), loaded);
-#else
-  Value mem = rewriter.create<bufferization::ToBufferOp>(
-      loc, MemRefType::get(ty.getShape(), ty.getElementType()), loaded);
-#endif
 
   rewriter.create<hivm::CopyOp>(loc, TypeRange{}, mem,
                                 getAsMemRef(buf, rewriter));
@@ -414,13 +409,10 @@ struct TileStoreTensorToHIVM : OpRewritePattern<tile::StoreTensorOp> {
         return failure();
       auto memrefTy =
           MemRefType::get(tensorTy.getShape(), tensorTy.getElementType());
-#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
-      srcMem = rewriter.create<bufferization::ToMemrefOp>(op.getLoc(), memrefTy,
-                                                          srcMem);
-#else
-      srcMem = rewriter.create<bufferization::ToBufferOp>(op.getLoc(), memrefTy,
-                                                          srcMem);
-#endif
+      // Use the legacy to_memref spelling: CANN's external bishengir tools
+      // (built with an older MLIR) do not know bufferization.to_buffer.
+      srcMem = rewriter.create<bufferization::ToMemrefOp>(
+          op.getLoc(), memrefTy, srcMem);
     }
 
     rewriter.create<hivm::CopyOp>(op.getLoc(), TypeRange{}, srcMem, dstMem);
@@ -577,13 +569,8 @@ struct LowerPtrTensorCastToMemref
         triton::CacheModifier::NONE, triton::EvictionPolicy::NORMAL,
         /*isVolatile=*/false);
     // %m = bufferization.to_memref %t
-#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
     Value asMemref =
         rewriter.create<bufferization::ToMemrefOp>(loc, outMemref, loaded);
-#else
-    Value asMemref =
-        rewriter.create<bufferization::ToBufferOp>(loc, outMemref, loaded);
-#endif
     rewriter.replaceOp(op, asMemref);
     return success();
   }

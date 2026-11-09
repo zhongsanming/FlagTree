@@ -95,7 +95,9 @@ def create_sync_block_wait(sender, receiver, event_id, sender_pipe: PIPE, receiv
 
 
 def sub_vec_id(_semantic=None) -> tl.tensor:
-    return tl.tensor(_semantic.builder._ascend_builder.create_get_sub_vec_id(), tl.int64)
+    # Use the main builder's attached wrapper so the delegate builder's
+    # insertion point is synchronized before creating the op.
+    return tl.tensor(_semantic.builder.create_get_sub_vec_id(), tl.int64)
 
 
 def copy_from_ub_to_l1(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], _semantic=None):

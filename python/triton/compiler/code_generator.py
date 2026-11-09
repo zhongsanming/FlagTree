@@ -78,6 +78,17 @@ def _is_constexpr(o: Any) -> bool:
     return o is None or isinstance(o, (constexpr, language.core.dtype, JITCallable))
 
 
+def _is_native_nontensor_value(value) -> bool:
+    """Whether ``value`` is a Python-side compile-time descriptor.
+
+    TLE workspaces and pipe endpoints deliberately carry no IR type. They opt in
+    with ``__triton_compile_time_value__`` so assignment/tuple handling keeps
+    them as Python objects instead of trying to convert them to tensors.
+    """
+    native_nontensor_types = (language.dtype, language.tuple)
+    return isinstance(value, native_nontensor_types) or getattr(value, "__triton_compile_time_value__", False)
+
+
 def _is_non_scalar_tensor(o: Any) -> bool:
     return _is_triton_tensor(o) and (o.type.is_block() and o.type.numel != 1)
 
@@ -607,7 +618,7 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_List(self, node):
         ctx = self.visit(node.ctx)
         assert ctx is None
-        elts = language.tuple([self.visit(elt) for elt in node.elts])
+        elts = language.tuple([self._wrap_tuple_element(self.visit(elt)) for elt in node.elts])
         return elts
 
     def visit_ListComp(self, node: ast.ListComp):
@@ -763,11 +774,10 @@ class CodeGenerator(ast.NodeVisitor):
         def _sanitize_value(value):
             if isinstance(value, language.tuple):
                 return _apply_to_tuple_values(value, _sanitize_value)
-            native_nontensor_types = (language.dtype, language.tuple)
             value = _unwrap_if_constexpr(value)
             if value is not None and \
                 not _is_triton_value(value) and \
-                not isinstance(value, native_nontensor_types):
+                not _is_native_nontensor_value(value):
                 value = self.semantic.to_tensor(value)
             return value
 
@@ -855,8 +865,17 @@ class CodeGenerator(ast.NodeVisitor):
         ast.NodeVisitor.generic_visit(self, node)
 
     def visit_Tuple(self, node):
-        args = [self.visit(x) for x in node.elts]
+        args = [self._wrap_tuple_element(self.visit(x)) for x in node.elts]
         return language.tuple(args)
+
+    def _wrap_tuple_element(self, value):
+        # Compile-time descriptors (TLE pipes, workspaces) and JIT functions carry
+        # no IR type; wrap them as constexpr so tuple type construction still works.
+        if _is_triton_value(value):
+            return value
+        if getattr(value, "__triton_compile_time_value__", False) or isinstance(value, JITCallable):
+            return language.core.constexpr(value)
+        return value
 
     def _apply_binary_method(self, node, method_name, lhs, rhs):
         # TODO: raise something meaningful if getattr fails below, esp for reverse method
@@ -1292,14 +1311,17 @@ class CodeGenerator(ast.NodeVisitor):
         try:
             from ..experimental.tle import language as tle
             tle_dsa_pipeline = tle.dsa.pipeline
+            tle_dsa_parallel = getattr(tle.dsa, "parallel", None)
         except (ImportError, AttributeError):
             tle_dsa_pipeline = None
+            tle_dsa_parallel = None
 
         # flagtree tle: check supported
-        if IteratorClass in (tle_pipeline, tle_range, tle_dsa_pipeline) and IteratorClass is not None:
+        if IteratorClass in (tle_pipeline, tle_range, tle_dsa_pipeline, tle_dsa_parallel) and IteratorClass is not None:
             self._require_tle_primitive(IteratorClass)
 
-        if IteratorClass in [language.range, tle_pipeline, tle_range, tle_dsa_pipeline]:  # flagtree reorder-loop-loads
+        if IteratorClass in [language.range, tle_pipeline, tle_range, tle_dsa_pipeline,
+                             tle_dsa_parallel]:  # flagtree reorder-loop-loads
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1441,7 +1463,7 @@ class CodeGenerator(ast.NodeVisitor):
         args = inspect.getcallargs(fn.fn, *args, **kwargs)
         args = [args[name] for name in fn.arg_names]
         for i, arg in enumerate(args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
+            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)) or _is_native_nontensor_value(arg):
                 args[i] = language.core.constexpr(arg)
         args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
         args_cst = {path: get_iterable_path(args, path) for path in args_cst}
@@ -1498,7 +1520,7 @@ class CodeGenerator(ast.NodeVisitor):
         bound_args = inspect.getcallargs(fn.fn, *args, **kwargs)
         ordered_args = [bound_args[name] for name in fn.arg_names]
         for i, arg in enumerate(ordered_args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
+            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)) or _is_native_nontensor_value(arg):
                 ordered_args[i] = language.core.constexpr(arg)
 
         parsed = fn.parse()
@@ -1856,6 +1878,17 @@ class CodeGenerator(ast.NodeVisitor):
 
 
 def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None):
+    # Ascend pipe event ids are allocated per kernel compilation. Reset the
+    # allocator here so compiling the same kernel for a second shape cannot
+    # collide with the previous compilation's ranges.
+    try:
+        from triton._flagtree_backend import FLAGTREE_BACKEND
+        if FLAGTREE_BACKEND == "ascend":
+            from triton.experimental.tle.language.dsa.legacy.ascend.pipe import reset_pipe_event_allocator
+            reset_pipe_event_allocator()
+    except ImportError:
+        pass
+
     arg_types = [None] * len(fn.arg_names)
 
     for k, v in src.signature.items():

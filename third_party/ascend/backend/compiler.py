@@ -540,7 +540,13 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
         if opt.debug:
             cmd += ["--mlir-print-debuginfo"]
         cmd += ["-o", mlir_path]
-        subprocess.run(cmd, env=env, capture_output=True, check=True, text=True)
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"bishengir-opt failed with exit code {proc.returncode}\n"
+                f"command: {shlex.join(cmd)}\n"
+                f"stdout:\n{proc.stdout}\n"
+                f"stderr:\n{proc.stderr}")
 
         # Read the generated MLIR text
         linalg_text = Path(mlir_path).read_text()
@@ -961,7 +967,18 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+            stdout = (e.stdout or b"").decode("utf-8", errors="replace")
+            stderr = (e.stderr or b"").decode("utf-8", errors="replace")
+            failed_dir = os.path.join(tempfile.gettempdir(), f"triton_ascend_failed_{os.getpid()}")
+            os.makedirs(failed_dir, exist_ok=True)
+            failed_mlir = os.path.join(failed_dir, "kernel.mlir")
+            Path(failed_mlir).write_text(Path(ttadapter_path).read_text())
+            raise RuntimeError(
+                f"bishengir-compile failed with exit code {e.returncode}\n"
+                f"command: {shlex.join(cmd_list)}\n"
+                f"failed MLIR: {failed_mlir}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}") from e
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -1172,7 +1189,18 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+            stdout = (e.stdout or b"").decode("utf-8", errors="replace")
+            stderr = (e.stderr or b"").decode("utf-8", errors="replace")
+            failed_dir = os.path.join(tempfile.gettempdir(), f"triton_ascend_failed_{os.getpid()}")
+            os.makedirs(failed_dir, exist_ok=True)
+            failed_mlir = os.path.join(failed_dir, "kernel.mlir")
+            Path(failed_mlir).write_text(Path(ttadapter_path).read_text())
+            raise RuntimeError(
+                f"bishengir-compile failed with exit code {e.returncode}\n"
+                f"command: {shlex.join(cmd_list)}\n"
+                f"failed MLIR: {failed_mlir}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}") from e
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
