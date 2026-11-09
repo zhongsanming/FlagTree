@@ -104,8 +104,9 @@ class CopyDirection(Enum):
 def copy(
     src,
     dst,
-    shape,
+    shape=None,
     offsets: Sequence[constexpr | tensor] = None,
+    inter_no_alias: bool = False,
     _semantic=None,
 ) -> None:
     """
@@ -125,8 +126,9 @@ def copy(
         dst: Destination operand - either a ``tl.tensor`` (pointer) or ``buffered_tensor``.
         shape: Logical shape of the data to copy (used for GM<->Local).
         offsets: Reserved for API compatibility with TMA copy (unused on DSA).
+        inter_no_alias: Compat hint (3.5.x); ignored by generic DSA path.
     """
-    del offsets  # DSA copy does not use offsets
+    del offsets, inter_no_alias  # DSA copy does not use offsets/hint here
 
     builder = _semantic.builder
     if builder is None:
@@ -604,3 +606,115 @@ def insert_slice(x: tl.tensor, tile: tl.tensor, offsets, sizes=None, strides=Non
     handle = builder.create_dsa_insert_slice(x.type.to_ir(builder), x.handle, tile.handle, static_offsets, dyn_offsets,
                                              sizes, strides)
     return tl.tensor(handle, x.type)
+
+
+# -----------------------------------------------------------------------------
+# 3.5.x / Ascend tutorial compatibility helpers
+# -----------------------------------------------------------------------------
+
+class hint:
+    """Marker for `with tle.dsa.hint(...):` blocks (codegen intercepts)."""
+    __triton_builtin__ = True
+    __triton_compile_time_value__ = True
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class Workspace:
+    __triton_compile_time_value__ = True
+
+    def __init__(self, base, capacity, shape, dtype, strides=None, stage_stride=None):
+        self.base = base
+        self.capacity = int(tl._unwrap_if_constexpr(capacity))
+        self.shape = list(tl._unwrap_shape(shape))
+        self.dtype = tl._unwrap_if_constexpr(dtype)
+        if strides is None:
+            stride = 1
+            computed = []
+            for dim in reversed(self.shape):
+                computed.insert(0, stride)
+                stride *= dim
+            self.strides = computed
+        else:
+            self.strides = list(tl._unwrap_shape(strides))
+        self.stage_stride = int(tl._unwrap_if_constexpr(stage_stride)) if stage_stride is not None else None
+        if self.stage_stride is None:
+            s = 1
+            for d in self.shape:
+                s *= int(d)
+            self.stage_stride = s
+
+    def slot(self, stage, _semantic=None):
+        if isinstance(stage, tensor):
+            stage_offset = stage.__mul__(self.stage_stride, _semantic=_semantic)
+        else:
+            stage_offset = stage * self.stage_stride
+        if len(self.shape) == 1:
+            offs = tl.arange(0, self.shape[0], _semantic=_semantic)
+            elem_offset = offs.__mul__(self.strides[0], _semantic=_semantic)
+            if isinstance(stage_offset, tensor):
+                offset = stage_offset.__add__(elem_offset, _semantic=_semantic)
+            else:
+                offset = elem_offset.__add__(stage_offset, _semantic=_semantic)
+            if isinstance(self.base, tensor):
+                return self.base.__add__(offset, _semantic=_semantic)
+            return self.base + offset
+        if len(self.shape) == 2:
+            offs_m = tl.arange(0, self.shape[0], _semantic=_semantic).__getitem__((slice(None), None), _semantic=_semantic)
+            offs_n = tl.arange(0, self.shape[1], _semantic=_semantic).__getitem__((None, slice(None)), _semantic=_semantic)
+            m_offset = offs_m.__mul__(self.strides[0], _semantic=_semantic)
+            n_offset = offs_n.__mul__(self.strides[1], _semantic=_semantic)
+            if isinstance(stage_offset, tensor):
+                row_offset = stage_offset.__add__(m_offset, _semantic=_semantic)
+            else:
+                row_offset = m_offset.__add__(stage_offset, _semantic=_semantic)
+            rows = self.base.__add__(row_offset, _semantic=_semantic) if isinstance(self.base, tensor) else self.base + row_offset
+            return rows.__add__(n_offset, _semantic=_semantic) if isinstance(rows, tensor) else rows + n_offset
+        raise NotImplementedError("workspace supports rank 1 or rank 2 payloads")
+
+
+@tl.builtin
+def workspace(base, capacity, shape, dtype, strides=None, stage_stride=None, _semantic=None):
+    return Workspace(base, capacity, shape, dtype, strides, stage_stride)
+
+
+@tl.builtin
+def extract_element(src, indice, _semantic=None, _generator=None):
+    """Extract a scalar element from a tensor (compat)."""
+    # 3.5.x path used tle_semantic.extract_element; on 3.6 try builder/semantic fallbacks.
+    builder = getattr(_semantic, 'builder', None)
+    idx = tl._unwrap_if_constexpr(indice)
+    if not isinstance(idx, (tuple, list)):
+        idx = (idx,)
+    idx_vals = []
+    for i in idx:
+        if isinstance(i, tensor):
+            idx_vals.append(i)
+        else:
+            idx_vals.append(_semantic.to_tensor(i))
+    # Try triton semantic gather/scalar extract patterns
+    if hasattr(_semantic, 'extract_scalar') and builder is not None:
+        return _semantic.extract_scalar(src, idx_vals)
+    if builder is not None and hasattr(builder, 'create_extract_scalar'):
+        handles = [v.handle for v in idx_vals]
+        res = builder.create_extract_scalar(src.type.scalar.to_ir(builder), src.handle, handles)
+        return tensor(res, src.type.scalar)
+    # Fallback: reduce to scalar via 1-element slice load pattern where possible
+    raise NotImplementedError("extract_element is not supported by this backend/build yet")
+
+
+try:
+    from triton.language.extra.cann.extension.aux_ops import parallel, range as cann_range
+except Exception:
+    try:
+        from triton.language.extra.cann import parallel  # type: ignore
+    except Exception:
+        parallel = tl.range  # type: ignore
+        cann_range = tl.range  # type: ignore

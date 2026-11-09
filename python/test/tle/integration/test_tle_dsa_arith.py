@@ -1,26 +1,18 @@
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
+from .._dsa_backend import get_dsa_backend
 
-def _is_txda():
-    try:
-        import torch_txda  # noqa: F401
-    except ImportError:
-        return False
-    target = triton.runtime.driver.active.get_current_target()
-    return getattr(target, "backend", None) == "txda"
-
-
-pytestmark = pytest.mark.skipif(not _is_txda(), reason="TLE DSA tests require TsingMicro (txda) backend")
+BACKEND, DEVICE, SPACE = get_dsa_backend()
 
 
 @triton.jit
 def dsa_arith_kernel(x_ptr, y_ptr, out_ptr, M, N, P, Q, BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr,
-                     BQ: tl.constexpr, OP: tl.constexpr):
+                     BQ: tl.constexpr, OP: tl.constexpr, SPACE: tl.constexpr):
     """Four-dimensional three-operand buffer arithmetic (tiled)."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -37,8 +29,8 @@ def dsa_arith_kernel(x_ptr, y_ptr, out_ptr, M, N, P, Q, BM: tl.constexpr, BN: tl
     lhs = tl.load(x_ptr + idx, mask=mask)
     rhs = tl.load(y_ptr + idx, mask=mask)
 
-    lhs_buf = tle.dsa.to_buffer(lhs, tle.dsa.tsingmicro.SPM)
-    rhs_buf = tle.dsa.to_buffer(rhs, tle.dsa.tsingmicro.SPM)
+    lhs_buf = tle.dsa.to_buffer(lhs, SPACE)
+    rhs_buf = tle.dsa.to_buffer(rhs, SPACE)
     out_buf = tle.dsa.alloc((BM, BN, BP, BQ), tl.float32)
 
     if OP == "add":
@@ -81,12 +73,12 @@ class TestTLEDsaArith:
         torch.manual_seed(42)
         m, n, p, q = shape
         bm, bn, bp, bq = block
-        a = torch.randn(*shape, device="txda", dtype=torch.float32)
-        b = torch.randn(*shape, device="txda", dtype=torch.float32)
+        a = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
         out = torch.empty_like(a)
 
         grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), triton.cdiv(p, bp))
-        dsa_arith_kernel[grid](a, b, out, m, n, p, q, BM=bm, BN=bn, BP=bp, BQ=bq, num_ctas=1, OP=op)
+        dsa_arith_kernel[grid](a, b, out, m, n, p, q, BM=bm, BN=bn, BP=bp, BQ=bq, num_ctas=1, OP=op, SPACE=SPACE)
 
         expected = ref(a, b)
         torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)

@@ -4,7 +4,7 @@
 ``dsa`` is the multi-vendor namespace for device-specific primitives: the
 shared API surface (``alloc``/``copy``/``pipeline``/slices/arithmetic) lives
 at this level, and each vendor's private primitives live in a per-backend
-sub-namespace (see ``dsa.tsingmicro``, mirroring upstream ``dsa.ascend``).
+sub-namespace (see ``dsa.tsingmicro``, ``dsa.ascend``).
 """
 
 from .core import (
@@ -23,6 +23,11 @@ from .core import (
     div,
     extract_slice,
     insert_slice,
+    hint,
+    workspace,
+    Workspace,
+    extract_element,
+    parallel,
 )
 from .types import (
     scope,
@@ -33,6 +38,11 @@ from .types import (
 from . import tsingmicro
 from . import thrive
 from .semantic import DSASemantic, DSASemanticError
+
+try:
+    from . import ascend
+except Exception:
+    ascend = None
 
 __all__ = [
     "pipeline",
@@ -50,8 +60,14 @@ __all__ = [
     "div",
     "extract_slice",
     "insert_slice",
+    "hint",
+    "workspace",
+    "Workspace",
+    "extract_element",
+    "parallel",
     "scope",
     "local",
+    "ascend",
     "tsingmicro",
     "thrive",
     "buffered_tensor",

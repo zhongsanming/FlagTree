@@ -203,6 +203,43 @@ try:
 except ModuleNotFoundError:
     raw = None
 
+# Re-export runtime API for compatibility (3.5.x tutorials use `import triton.experimental.tle as tle`)
+_RUNTIME_NAMES = {
+    "dsa", "pipe", "scope", "load", "cumsum", "extract_tile", "insert_tile",
+    "make_partition_view", "make_strided_view", "make_gather_scatter_view",
+    "tile_load", "tile_store", "range",
+    "MeshConfig", "device_mesh", "sharding", "ShardingSpec", "ShardedTensor",
+    "make_sharded_tensor", "reshard", "remote", "shard_id", "signal", "signal_wait",
+    "distributed_barrier", "distributed_dot", "distributed", "gpu", "mem_pool",
+    "get_mem_pool", "create_dist_tensor", "cleanup_communicator",
+    "S", "P", "B", "BarrierKind", "MemoryOrder", "MemoryScope", "GroupKind",
+}
+
+
+def __getattr__(name):
+    if name == "init_communicator":
+        try:
+            from .language.communication import init_communicator
+        except Exception:
+            def init_communicator(*args, **kwargs):
+                raise RuntimeError("init_communicator is not available")
+        globals()[name] = init_communicator
+        return init_communicator
+    if name in ("swizzle2d_Nz", "gemm_swizzle2d_Nz"):
+        from .language.dsa.ascend.distributed import swizzle2d_Nz, gemm_swizzle2d_Nz
+        globals()["swizzle2d_Nz"] = swizzle2d_Nz
+        globals()["gemm_swizzle2d_Nz"] = gemm_swizzle2d_Nz
+        return globals()[name]
+    if name in _RUNTIME_NAMES or hasattr(language, name):
+        try:
+            val = getattr(language, name)
+            globals()[name] = val
+            return val
+        except AttributeError:
+            pass
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "language",
     "TLE_PRIMITIVES",
@@ -211,6 +248,9 @@ __all__ = [
     "is_tle_supported",
     "primitive_name",
     "require_tle",
+    "init_communicator",
+    "swizzle2d_Nz",
+    "gemm_swizzle2d_Nz",
 ]
 
 if raw is not None:

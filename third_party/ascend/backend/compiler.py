@@ -1781,6 +1781,18 @@ class AscendBackend(BaseBackend):
         buffer_ir.load_dialects(ctx)
         ascend_ir.load_dialects(ctx)
         ascend.load_dialects(ctx)
+        # TLE/DSA dialects (needed for tle.dsa.* primitives)
+        try:
+            from triton._C.libtriton import tle as tle_ir
+            tle_ir.load_dialects(ctx)
+        except Exception:
+            pass
+        try:
+            from triton._C.libtriton.tle import dsa as tle_dsa_ir
+            if hasattr(tle_dsa_ir, "load_dialects"):
+                tle_dsa_ir.load_dialects(ctx)
+        except Exception:
+            pass
 
     def add_stages(self, stages, options, language):
         if self.target.backend != "npu":
