@@ -1,6 +1,7 @@
 # Copyright 2026- Xcoresigma Technology Co., Ltd
 
 import os
+import time
 import torch
 import torch.distributed as dist
 import shmem as ash
@@ -11,11 +12,21 @@ _g_mem_count = 0
 
 
 def _get_ash_ip_port():
-    # default to 8666 if ASH_MASTER_PORT is not set
-    ash_port = os.environ.get("ASH_MASTER_PORT", "8666")
-    # default to 127.0.0.1 if ASH_MASTER_ADDR is not set
-    ash_addr = os.environ.get("ASH_MASTER_ADDR", "127.0.0.1")
+    # Prefer the explicit ASH_* settings, then the torchrun rendezvous port so
+    # repeated/multi-run jobs do not collide on the hard-coded 8666 default.
+    ash_port = os.environ.get("ASH_MASTER_PORT") or os.environ.get("MASTER_PORT") or "8666"
+    ash_addr = os.environ.get("ASH_MASTER_ADDR") or os.environ.get("MASTER_ADDR") or "127.0.0.1"
     return f"tcp://{ash_addr}:{ash_port}"
+
+
+def _default_ash_size():
+    # 1 GiB was enough to make some older SHMEM builds fail at init on 950.
+    # The tutorials only need a small symmetric heap; allow an override.
+    raw = os.environ.get("ASH_LOCAL_MEM_SIZE", str(256 * 1024 * 1024))
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"ASH_LOCAL_MEM_SIZE must be an integer byte count, got {raw!r}") from None
 
 
 def init_communicator(ip_port=None, ash_size=None, engine_type=None):
@@ -25,7 +36,16 @@ def init_communicator(ip_port=None, ash_size=None, engine_type=None):
             "tle.init_communicator() must be launched with torchrun "
             "(for example: torchrun --nproc-per-node=2 <script>); LOCAL_RANK is unset")
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(local_rank)
+    # A preceding torchrun/shmem process may still be releasing the device.
+    # Retry briefly instead of failing the whole job with Resource_Busy.
+    for attempt in range(3):
+        try:
+            torch.npu.set_device(local_rank)
+            break
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
     dist.init_process_group(backend="hccl", rank=local_rank)
     _g_pe = dist.get_rank()
     _g_world_size = dist.get_world_size()
@@ -35,15 +55,22 @@ def init_communicator(ip_port=None, ash_size=None, engine_type=None):
     attributes = ash.InitAttr()
     attributes.my_rank = _g_pe
     attributes.n_ranks = _g_world_size
-    attributes.local_mem_size = ash_size if ash_size is not None else 1024 * 1024 * 1024
+    attributes.local_mem_size = ash_size if ash_size is not None else _default_ash_size()
     attributes.ip_port = ip_port if ip_port is not None else _get_ash_ip_port()
     # ROCE/RDMA is the inter-node (multi-machine) protocol; MTE is intra-node only.
     if engine_type is None:
         engine_type = ash.OpEngineType.MTE
     attributes.option_attr.data_op_engine_type = engine_type
-    ret = ash.aclshmem_init(attributes)
+    try:
+        ret = ash.aclshmem_init(attributes)
+    except Exception:
+        dist.destroy_process_group()
+        raise
     if ret != 0:
-        raise ValueError("[ERROR] aclshmem_init failed")
+        dist.destroy_process_group()
+        raise ValueError(
+            f"[ERROR] aclshmem_init failed (ret={ret}, rank={_g_pe}, world_size={_g_world_size}, "
+            f"port={attributes.ip_port}, local_mem_size={attributes.local_mem_size})")
     _g_mem_count = 0
 
 

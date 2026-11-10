@@ -16,9 +16,10 @@ pipe = tle.dsa.ascend.PIPE
     'unit_flag': True,
     # The stage-1 kernel only just exceeds the 950 UB budget once automatic
     # multi-buffering is applied.  Keep the original K_TILE=128 geometry
-    # (which the block-table/top-k indexing assumes) and disable the
-    # automatic multi-buffer instead.
+    # (which the block-table/top-k indexing assumes) and let the compiler
+    # save UB instead of changing the tile shape.
     'multibuffer': False,
+    'enable_ubuf_saving': True,
 })],
                  key=['K_TILE', 'N_CORE'])
 @triton.jit

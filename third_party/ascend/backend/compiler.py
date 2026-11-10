@@ -893,6 +893,12 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 f"--enable-auto-multi-buffer={multi_buffer_value}",
             ]
 
+        enable_ubuf_saving = metadata["enable_ubuf_saving"]
+        if enable_ubuf_saving is not None:
+            _compile_option_list += [
+                f"--enable-ubuf-saving={enable_ubuf_saving}",
+            ]
+
         vf_fusion_mode = metadata["vf_fusion_mode"]
         if vf_fusion_mode is not None:
             _compile_option_list += [
