@@ -68,6 +68,7 @@ from triton.backends.ascend.utils import (
     graph_ub_budget_bytes_for_arch,
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
+    has_bishengir_shmem_payload,
     is_cann_version_at_least,
 )
 from triton.backends.ascend.driver import (NPUUtils)
@@ -84,6 +85,20 @@ from triton.backends.compiler import (
     GPUTarget,
 )
 from triton.runtime.cache import get_dump_manager
+
+
+def _warn_if_distributed_payload_missing(linalg: str) -> None:
+    """Point at the Shmem payload requirement before the vendor link fails."""
+    if "aclshmem" not in linalg or has_bishengir_shmem_payload():
+        return
+    warnings.warn(
+        "TLE distributed primitives use aclshmem device wrappers, but no BiShengIR "
+        "payload containing them was found. If bishengir-compile fails with undefined "
+        "_mlir_ciface_aclshmem_* symbols, rebuild with TRITON_BUILD_NPUIR=ON after "
+        "sourcing CANN, or set TRITON_ASCEND_BISHENGIR_PATH to a Shmem-enabled payload.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 # TODO: materialize the concrete min shape
@@ -845,6 +860,7 @@ def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: di
 
 def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
+    _warn_if_distributed_payload_missing(linalg)
     _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir"
@@ -1094,6 +1110,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
+    _warn_if_distributed_payload_missing(linalg)
     _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir"

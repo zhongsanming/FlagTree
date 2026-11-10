@@ -10,7 +10,18 @@ import shutil
 
 
 def _build_npuir_enabled():
-    value = os.environ.get("TRITON_BUILD_NPUIR", "OFF").strip().upper()
+    value = os.environ.get("TRITON_BUILD_NPUIR")
+    if value is None:
+        # Distributed TLE primitives need the aclshmem wrappers, which only
+        # exist in a locally built BiShengIR payload.  When CANN is sourced,
+        # build the matching payload by default; no-CANN builds stay light.
+        # Users who want the old default can set TRITON_BUILD_NPUIR=OFF.
+        enabled = bool(os.environ.get("ASCEND_HOME_PATH"))
+        if enabled:
+            print("[ascend] ASCEND_HOME_PATH is set; building the BiShengIR payload with the "
+                  "Shmem template (set TRITON_BUILD_NPUIR=OFF to disable)", flush=True)
+        return enabled
+    value = value.strip().upper()
     if value in {"ON", "1", "YES", "TRUE", "Y"}:
         return True
     if value in {"OFF", "0", "NO", "FALSE", "N"}:
@@ -49,6 +60,24 @@ def _copy_ascend_tools(extdir, cmake_dir):
             print(f"[ascend] Stripped {name} to reduce size", flush=True)
 
 
+def _bitcode_mentions_shmem(payload):
+    """Heuristic check that the linked meta-op bitcode contains the Shmem wrappers.
+
+    Distributed TLE primitives lower to ``_mlir_ciface_aclshmem_*`` calls.  A
+    payload built without ``--build-shmem-template`` links fine until those
+    calls are resolved, then fails with undefined aclshmem symbols.  Catch
+    that at package time so the error points at the build flag instead of the
+    first distributed tutorial.
+    """
+    for path in payload.glob("lib/meta_op.*.bc"):
+        try:
+            if b"aclshmem" in path.read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _validate_bishengir_payload(payload):
     for name in ("bishengir-opt", "bishengir-compile", "hivmc", "hivmc-a5"):
         executable = payload / "bin" / name
@@ -64,6 +93,12 @@ def _validate_bishengir_payload(payload):
         found = [path for path in payload.glob(f"lib/{stem}.*bc") if path.stat().st_size]
         if not found:
             raise RuntimeError(f"Missing or empty BiShengIR template: {payload / 'lib' / (stem + '*.bc')}")
+    if not _bitcode_mentions_shmem(payload):
+        raise RuntimeError(
+            "BiShengIR payload has no aclshmem wrappers, so distributed TLE primitives "
+            "(remote/shard_id/distributed_barrier/device_mesh) will fail to link. "
+            "Rebuild the payload with the Shmem template enabled "
+            "(AscendNPU-IR build.sh --build-shmem-template, as done by TRITON_BUILD_NPUIR=ON).")
 
 
 def _build_bishengir():
@@ -124,6 +159,12 @@ def finalize_build_tree(build_lib):
         raise RuntimeError(f"Backend staging escapes build_lib: {destination}")
     _remove_generated_directory(destination)
     if not enabled:
+        print(
+            "[ascend] WARNING: no bundled BiShengIR payload. Distributed TLE primitives "
+            "(remote/shard_id/distributed_barrier/device_mesh) require a payload built with "
+            "the Shmem template; rebuild with TRITON_BUILD_NPUIR=ON after sourcing CANN, "
+            "or set TRITON_ASCEND_BISHENGIR_PATH to a prebuilt payload.",
+            flush=True)
         return
     payload = _build_bishengir()
     destination.parent.mkdir(parents=True, exist_ok=True)

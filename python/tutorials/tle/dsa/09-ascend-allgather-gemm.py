@@ -1,4 +1,10 @@
 # Copyright 2026- Xcoresigma Technology Co., Ltd
+#
+# Distributed TLE primitives (remote/shard_id/distributed_barrier) lower to
+# aclshmem device wrappers.  Build/install a BiShengIR payload with the Shmem
+# template (TRITON_BUILD_NPUIR=ON) or set TRITON_ASCEND_BISHENGIR_PATH to such
+# a payload; otherwise the device link fails with
+# undefined `_mlir_ciface_aclshmem_*` symbols.
 
 import enum
 import os

@@ -495,19 +495,85 @@ def _get_triton_mlir_opt_path() -> str:
     return _get_tool_path("triton-mlir-opt")
 
 
-def _get_bishengir_payload_tool(tool: str):
-    """Use bundled tools as a pair, or leave resolution to PATH/CANN."""
-    root = Path(__file__).resolve().parent / "bishengir"
-    if not os.path.lexists(root):
-        return None
+def _bishengir_payload_candidates():
+    """Yield candidate BiShengIR payload roots.
+
+    The packaged ``bishengir`` directory is preferred.  Also look at a
+    source-tree AscendNPU-IR build output so a locally built payload with the
+    Shmem template can be used without copying it into the wheel first.
+    """
+    env_root = os.environ.get("TRITON_ASCEND_BISHENGIR_PATH")
+    if env_root:
+        yield Path(env_root).expanduser().resolve(), True
+
+    yield Path(__file__).resolve().parent / "bishengir", False
+
+    seen = set()
+    here = Path(__file__).resolve()
+    for base in here.parents:
+        for candidate in (
+                base / "third_party" / "ascend" / "AscendNPU-IR" / "build" / "bishengir-output",
+                base / "third_party" / "ascend" / "AscendNPU-IR" / "build" / "install" / "bishengir",
+                base / "AscendNPU-IR" / "build" / "bishengir-output",
+                base / "third_party" / "ascend" / "backend" / "bishengir",
+        ):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            yield candidate, False
+
+
+def _check_bishengir_payload_root(root: Path, *, required: bool):
     for name in ("bishengir-opt", "bishengir-compile"):
         executable = root / "bin" / name
         if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise EnvironmentError(f"Incomplete BiShengIR payload {root}: missing executable {executable}")
+            if required:
+                raise EnvironmentError(f"Incomplete BiShengIR payload {root}: missing executable {executable}")
+            return None
     env = os.environ.copy()
     bin_dir = str(root / "bin")
     env["PATH"] = bin_dir + os.pathsep + env.get("PATH", os.defpath)
-    return str(root / "bin" / tool), env
+    return env
+
+
+@functools.lru_cache(maxsize=1)
+def has_bishengir_shmem_payload() -> bool:
+    """Whether any candidate payload carries the aclshmem device wrappers.
+
+    Distributed TLE kernels lower to ``_mlir_ciface_aclshmem_*`` calls.  The
+    wrappers live in the Shmem template bitcode, which is only present when
+    BiShengIR was built with ``--build-shmem-template``.  Reading the linked
+    meta-op bitcode is a cheap heuristic and lets us warn before the vendor
+    linker reports dozens of undefined symbols.
+    """
+    for root, _required in _bishengir_payload_candidates():
+        lib = root / "lib"
+        if not lib.is_dir():
+            continue
+        for bitmap in lib.glob("meta_op.*.bc"):
+            try:
+                if b"aclshmem" in bitmap.read_bytes():
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _get_bishengir_payload_tool(tool: str):
+    """Use a bundled/source-tree payload pair, or leave resolution to PATH/CANN."""
+    env_root = os.environ.get("TRITON_ASCEND_BISHENGIR_PATH")
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+        env = _check_bishengir_payload_root(root, required=True)
+        return str(root / "bin" / tool), env
+
+    for root, _required in _bishengir_payload_candidates():
+        if not root.is_dir():
+            continue
+        env = _check_bishengir_payload_root(root, required=False)
+        if env is not None:
+            return str(root / "bin" / tool), env
+    return None
 
 
 def _get_bishengir_opt_path() -> str:

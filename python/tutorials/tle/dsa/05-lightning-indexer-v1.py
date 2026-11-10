@@ -214,7 +214,10 @@ def lightning_indexer_triton(
     )
     USED_CORES = 24
     Q_TILE = 4
-    K_TILE = 128
+    # Keep the stage-1 qk tile within the 950 UB budget.  K_TILE=128 only
+    # just exceeds the available UB once the cube/vector pipeline buffers
+    # are allocated; 64 halves the qk/workspace footprint.
+    K_TILE = 64
     wsp = torch.empty(
         (2 * USED_CORES * Q_TILE * query_head_num * K_TILE),
         dtype=torch.float32,
