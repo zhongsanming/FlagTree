@@ -18,6 +18,7 @@ import triton.language as tl
 from .._dsa_backend import get_dsa_backend
 
 BACKEND, DEVICE, SPACE = get_dsa_backend()
+IS_ASCEND = BACKEND in ("npu", "ascend")
 
 
 @triton.jit
@@ -140,6 +141,11 @@ def member_roundtrip(x_ptr, out_ptr, shape: tl.constexpr, offsets: tl.constexpr)
     tl.store(out_ptr + _idx(shape), y)
 
 
+@pytest.mark.skipif(
+    IS_ASCEND,
+    reason="tle.extract_tile/insert_tile leave the TLE dialect in the ttadapter IR, "
+    "but the Ascend binary pipeline does not register dialect 'tle'",
+)
 class TestTile:
 
     def test_extract_scalar(self):
@@ -206,6 +212,12 @@ class TestTile:
         torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.skipif(
+    IS_ASCEND,
+    reason="4D slice forms are not yet supported by the Ascend legacy frontend "
+    "(constexpr tuple offsets / default sizes) and exceed the 950 UB budget; "
+    "TestTLEDsaSlice2D covers Ascend",
+)
 class TestSlice:
 
     def test_extract_static(self):
@@ -267,6 +279,42 @@ class TestSlice:
         expected = x.clone()
         expected[8:16, 8:16, 8:16, 8:16] = x[0:8, 0:8, 0:8, 0:8] + 1.0
         torch.testing.assert_close(out, expected)
+
+
+@triton.jit
+def dsa_slice_2d_kernel(x_ptr, out_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr, OFF_M: tl.constexpr,
+                        OFF_N: tl.constexpr, SM: tl.constexpr, SN: tl.constexpr):
+    """2D extract -> insert round-trip on a zero block."""
+    offs_m = tl.arange(0, BM)
+    offs_n = tl.arange(0, BN)
+    idx = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + idx, mask=mask)
+
+    z = tl.zeros((BM, BN), dtype=tl.float32)
+    sub = tle.dsa.extract_slice(x, (OFF_M, OFF_N), (SM, SN), (1, 1))
+    out = tle.dsa.insert_slice(z, sub, (OFF_M, OFF_N), (SM, SN), (1, 1))
+    tl.store(out_ptr + idx, out, mask=mask)
+
+
+class TestTLEDsaSlice2D:
+    """Portable 2D slice test that runs on both txda and Ascend NPU."""
+
+    @pytest.mark.parametrize("shape,block,off,sz", [((32, 32), (32, 32), (4, 8), (8, 8))])
+    def test_extract_insert(self, shape, block, off, sz):
+        torch.manual_seed(0)
+        m, n = shape
+        bm, bn = block
+        a = torch.randn(*shape, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros_like(a)
+
+        launch_kwargs = {} if IS_ASCEND else {"num_ctas": 1}
+        dsa_slice_2d_kernel[(1, )](a, out, m, n, BM=bm, BN=bn, OFF_M=off[0], OFF_N=off[1], SM=sz[0], SN=sz[1],
+                                   **launch_kwargs)
+
+        expected = torch.zeros_like(a)
+        expected[off[0]:off[0] + sz[0], off[1]:off[1] + sz[1]] = a[off[0]:off[0] + sz[0], off[1]:off[1] + sz[1]]
+        torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
