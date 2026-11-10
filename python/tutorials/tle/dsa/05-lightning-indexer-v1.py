@@ -11,7 +11,15 @@ import triton.language.extra.cann.libdevice as libdevice
 pipe = tle.dsa.ascend.PIPE
 
 
-@triton.autotune(configs=[triton.Config({'disable_auto_inject_block_sync': True, 'unit_flag': True})],
+@triton.autotune(configs=[triton.Config({
+    'disable_auto_inject_block_sync': True,
+    'unit_flag': True,
+    # The stage-1 kernel only just exceeds the 950 UB budget once automatic
+    # multi-buffering is applied.  Keep the original K_TILE=128 geometry
+    # (which the block-table/top-k indexing assumes) and disable the
+    # automatic multi-buffer instead.
+    'multibuffer': False,
+})],
                  key=['K_TILE', 'N_CORE'])
 @triton.jit
 def lightning_indexer_tnd_pa_stage1_kernel(
@@ -214,10 +222,10 @@ def lightning_indexer_triton(
     )
     USED_CORES = 24
     Q_TILE = 4
-    # Keep the stage-1 qk tile within the 950 UB budget.  K_TILE=128 only
-    # just exceeds the available UB once the cube/vector pipeline buffers
-    # are allocated; 64 halves the qk/workspace footprint.
-    K_TILE = 64
+    # K_TILE must stay equal to the physical PA block size (128); the
+    # block-table indexing and top-k column layout assume one physical
+    # block per tile.  UB pressure is handled by multibuffer=False above.
+    K_TILE = 128
     wsp = torch.empty(
         (2 * USED_CORES * Q_TILE * query_head_num * K_TILE),
         dtype=torch.float32,
