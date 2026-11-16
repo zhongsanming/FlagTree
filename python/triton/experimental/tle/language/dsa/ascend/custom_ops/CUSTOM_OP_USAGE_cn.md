@@ -433,13 +433,26 @@ c310 / Ascend950 是 reg-based 架构，旧的 mem-based intrinsic（`vector_dup
 实现，参考 `${ASCEND_HOME_PATH}/asc`（或 asc-devkit）中的
 `impl/basic_api/dav_3510/`。
 
-当前已适配：`mem_ops/duplicate.cpp`。其余算子逐步适配；在全部完成前可用
+已在 c310 教程中通过验证：`gather_gm_to_ub`、`compare_scalar`、`cast_int4_to_fp16`。
+`gather_gm_to_l1` 可以编译，但其写入的 L1 tile 在 c310 上不能直接交给 `tl.dot`（见上文）。
+这些算子显式声明 `supported_arches = ("c220", "c310")`。
 
-```bash
-CUSTOM_OPS_ARCH_FAMILY=c310 ALLOW_PARTIAL=1 ./build_custom_ops.sh
-```
+以下算子在 c310 上仍不可用，算子类通过 `supported_arches = ("c220",)` 声明
+支持架构，`custom_semantic` 在分发时直接抛出 `NotImplementedError`，避免落到
+BishengIR 的 `'memref.alloc' op error: read before first write` 或静默错误结果：
 
-构建已适配算子的子集（脚本会列出被跳过的算子）。
+- `duplicate_bitwise_mask`（结果错误：未按 bit mask 填充）
+- `gather_mask_builtin_pattern`
+- `gather_mask_custom_pattern`
+- `pair_reduce_sum_continuous_mask`
+- `sort32`
+- `sort_1d_pack`
+- `merge_exhaust_sort4`
+- `mrgsort`
+- `unpack_sort`
+
+这些算子仍可在 c220（A2/A3）上使用。c310 bitcode 仍会照常生成，gate 位于
+Python registry，错误信息会包含算子名、c310 架构和失败原因。
 
 
 ## compare_scalar
