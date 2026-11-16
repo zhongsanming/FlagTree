@@ -46,7 +46,7 @@ custom_ops/
     └── unpack_sort.cpp             # proposal 拆包为 value/index
 ```
 
-`registry.py` 中的所有算子按目标架构引用 `custom_ops.c310.bc`（A5/950）或 `custom_ops.c220.bc`（A2/A3）。每个算子的 `.cpp` 分别用对应 ccec 架构（`dav-c220-cube`/`dav-c220-vec` 或 `dav-c310-cube`/`dav-c310-vec`）编译为自己的 `.bc`，再与 Template bitcode 一起 `llvm-link` 成对应架构的 `custom_ops.<arch>.bc`。不支持 c310 的算子不会编译进 `custom_ops.c310.bc`。bitcode 架构必须与 kernel 编译架构一致，否则会出现 `Cannot select` intrinsic 或 data layout 不匹配错误。
+`registry.py` 中的所有算子按目标架构引用 `custom_ops.c310.bc`（A5/950）或 `custom_ops.c220.bc`（A2/A3）。每个算子的 `.cpp` 分别用对应 ccec 架构（`dav-c220-cube`/`dav-c220-vec` 或 `dav-c310-cube`/`dav-c310-vec`）编译为自己的 `.bc`，再与 Template bitcode 一起 `llvm-link` 成对应架构的 `custom_ops.<arch>.bc`。bitcode 架构必须与 kernel 编译架构一致，否则会出现 `Cannot select` intrinsic 或 data layout 不匹配错误。
 
 ## 调用约定（OP扩展框架）
 
@@ -398,7 +398,7 @@ out[1] = UB int32 dst_index
 
 ### 默认自动编译
 
-正常构建工程时，CMake 会直接调用 `ccec` / `llvm-link` 生成或更新**所有配置架构**的 `custom_ops.<arch>.bc`（默认 `c220;c310`，即一次构建同时产出 A2/A3 和 A5/950 两套 bitcode）。规则位于 `third_party/ascend/CMakeLists.txt`：架构列表由 `-DASCEND_CUSTOM_OPS_ARCH_FAMILIES=c220;c310` 选择；每个算子的 `.cpp` 按各自 aicore 架构编译为独立 `.bc`（中间产物在构建目录 `ascend_custom_ops/<family>/` 下），对应的 Template 源码编译后一起 `llvm-link` 成 `custom_ops.<family>.bc`。c220-only 算子不会进入 `custom_ops.c310.bc`，c310 也不再链接仅供这些算子使用的 RegBase Template。旧的单值 `-DASCEND_CUSTOM_OPS_ARCH_FAMILY` 已废弃并被忽略。
+正常构建工程时，CMake 会直接调用 `ccec` / `llvm-link` 生成或更新**所有配置架构**的 `custom_ops.<arch>.bc`（默认 `c220;c310`，即一次构建同时产出 A2/A3 和 A5/950 两套 bitcode）。规则位于 `third_party/ascend/CMakeLists.txt`：架构列表由 `-DASCEND_CUSTOM_OPS_ARCH_FAMILIES=c220;c310` 选择；每个算子的 `.cpp` 按各自 aicore 架构编译为独立 `.bc`（中间产物在构建目录 `ascend_custom_ops/<family>/` 下），对应的 Template 源码编译后一起 `llvm-link` 成 `custom_ops.<family>.bc`。旧的单值 `-DASCEND_CUSTOM_OPS_ARCH_FAMILY` 已废弃并被忽略。
 >
 > 构建（以及 `build_custom_ops.sh`）启动时会清理旧的单架构 `custom_ops.bc` 和已废弃的 `custom_ops.<family>.<hash>.bc` 内容寻址别名。构建完成后目录中只应保留 `custom_ops.c220.bc` 和/或 `custom_ops.c310.bc`。
 
@@ -451,8 +451,8 @@ BishengIR 的 `'memref.alloc' op error: read before first write` 或静默错误
 - `mrgsort`
 - `unpack_sort`
 
-这些算子仍可在 c220（A2/A3）上使用，但不会编译进 `custom_ops.c310.bc`。
-gate 位于 Python registry，错误信息会包含算子名、c310 架构和失败原因。
+这些算子仍可在 c220（A2/A3）上使用。c310 bitcode 仍会照常生成，gate 位于
+Python registry，错误信息会包含算子名、c310 架构和失败原因。
 
 
 ## compare_scalar

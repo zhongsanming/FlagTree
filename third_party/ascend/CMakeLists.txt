@@ -218,16 +218,10 @@ if(ASCEND_CCEC_EXECUTABLE AND ASCEND_LLVM_LINK_EXECUTABLE AND EXISTS "${_ASCEND_
 
     # Each custom op is implemented in its own .cpp and compiled into its own
     # bitcode: "<src>::<arch>" — arch is the ccec aicore target for that op.
-    set(_family_ops_common
+    set(_family_ops
+      "mem_ops/duplicate.cpp::dav-${family}-vec"
       "mem_ops/gather_gm_to_l1.cpp::dav-${family}-cube"
       "mem_ops/gather_gm_to_ub.cpp::dav-${family}-vec"
-      "mask_ops/compare_scalar.cpp::dav-${family}-vec"
-      "cast_ops/cast_int4_to_fp16.cpp::dav-${family}-vec"
-    )
-    # c220-only ops; they have no c310 implementation and are not linked into
-    # custom_ops.c310.bc.
-    set(_family_ops_c220_only
-      "mem_ops/duplicate.cpp::dav-${family}-vec"
       "mem_ops/gather_mask.cpp::dav-${family}-vec"
       "reduction_ops/pair_reduce_sum.cpp::dav-${family}-vec"
       "sort_ops/sort32.cpp::dav-${family}-vec"
@@ -235,12 +229,9 @@ if(ASCEND_CCEC_EXECUTABLE AND ASCEND_LLVM_LINK_EXECUTABLE AND EXISTS "${_ASCEND_
       "sort_ops/merge_pack_sort.cpp::dav-${family}-vec"
       "sort_ops/mrgsort.cpp::dav-${family}-vec"
       "sort_ops/unpack_sort.cpp::dav-${family}-vec"
+      "mask_ops/compare_scalar.cpp::dav-${family}-vec"
+      "cast_ops/cast_int4_to_fp16.cpp::dav-${family}-vec"
     )
-    if(family STREQUAL "c310")
-      set(_family_ops ${_family_ops_common})
-    else()
-      set(_family_ops ${_family_ops_common} ${_family_ops_c220_only})
-    endif()
 
     set(_ASCEND_SORT_OPS_DIR "${ASCEND_CUSTOM_OPS_DIR}/sort_ops")
     set(OP_BITCODES "")
@@ -299,11 +290,13 @@ if(ASCEND_CCEC_EXECUTABLE AND ASCEND_LLVM_LINK_EXECUTABLE AND EXISTS "${_ASCEND_
         VERBATIM)
     endforeach()
 
-    # The Template helpers are only used by the c220-only sort/gather paths; the
-    # remaining c310 ops call AscendC directly.
     if(family STREQUAL "c310")
-      set(_family_templates)
-      set(_template_includes)
+      set(_family_templates
+        "lib/RegBase/Vector/Sort1D.cpp"
+        "lib/RegBase/Vector/Copy1D.cpp")
+      set(_template_includes
+        -I "${_ASCEND_TEMPLATE_ROOT}/lib/RegBase/Vector/include"
+        -I "${_ASCEND_TEMPLATE_INCLUDE}")
     else()
       set(_family_templates
         "lib/Vector/Arange/Arange1D.cpp"

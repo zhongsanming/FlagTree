@@ -74,37 +74,15 @@ if [[ "${ARCH_FAMILY}" == "c310" ]]; then
   )
 fi
 
-# Each custom op is implemented in its own .cpp and compiled into its own
-# bitcode: "<src>::<arch>" — arch is the ccec aicore target for that op.
-CUSTOM_OPS_COMMON=(
-  "mem_ops/gather_gm_to_l1.cpp:dav-${ARCH_FAMILY}-cube"
-  "mem_ops/gather_gm_to_ub.cpp:dav-${ARCH_FAMILY}-vec"
-  "mask_ops/compare_scalar.cpp:dav-${ARCH_FAMILY}-vec"
-  "cast_ops/cast_int4_to_fp16.cpp:dav-${ARCH_FAMILY}-vec"
-)
-# c220-only ops; they have no c310 implementation and are not linked into
-# custom_ops.c310.bc.
-CUSTOM_OPS_C220_ONLY=(
-  "mem_ops/duplicate.cpp:dav-${ARCH_FAMILY}-vec"
-  "mem_ops/gather_mask.cpp:dav-${ARCH_FAMILY}-vec"
-  "reduction_ops/pair_reduce_sum.cpp:dav-${ARCH_FAMILY}-vec"
-  "sort_ops/sort32.cpp:dav-${ARCH_FAMILY}-vec"
-  "sort_ops/sort_1d_pack.cpp:dav-${ARCH_FAMILY}-vec"
-  "sort_ops/merge_pack_sort.cpp:dav-${ARCH_FAMILY}-vec"
-  "sort_ops/mrgsort.cpp:dav-${ARCH_FAMILY}-vec"
-  "sort_ops/unpack_sort.cpp:dav-${ARCH_FAMILY}-vec"
-)
-if [[ "${ARCH_FAMILY}" == "c310" ]]; then
-  CUSTOM_OPS=("${CUSTOM_OPS_COMMON[@]}")
-else
-  CUSTOM_OPS=("${CUSTOM_OPS_COMMON[@]}" "${CUSTOM_OPS_C220_ONLY[@]}")
-fi
-
-# The Template helpers are only used by the c220-only sort/gather paths; the
-# remaining c310 ops call AscendC directly.
+# c310 builds the shared Template helpers from the RegBase tree; the mem-based
+# lib/Vector sources are c220-only.
 TEMPLATE_INCLUDES=( -I "${TEMPLATE_INCLUDE}" )
-TEMPLATE_SOURCES=()
-if [[ "${ARCH_FAMILY}" != "c310" ]]; then
+if [[ "${ARCH_FAMILY}" == "c310" ]]; then
+  TEMPLATE_SOURCES=(
+    "${TEMPLATE_ROOT}/lib/RegBase/Vector/Sort1D.cpp"
+    "${TEMPLATE_ROOT}/lib/RegBase/Vector/Copy1D.cpp"
+  )
+else
   TEMPLATE_SOURCES=(
     "${TEMPLATE_LIB}/Vector/Arange/Arange1D.cpp"
     "${TEMPLATE_LIB}/Vector/Elementwise/EltWise1D.cpp"
@@ -112,6 +90,23 @@ if [[ "${ARCH_FAMILY}" != "c310" ]]; then
     "${TEMPLATE_LIB}/DMA/Ubuf/Copy1D.cpp"
   )
 fi
+
+# Each custom op is implemented in its own .cpp and compiled into its own
+# bitcode: "<src>::<arch>" — arch is the ccec aicore target for that op.
+CUSTOM_OPS=(
+  "mem_ops/duplicate.cpp:dav-${ARCH_FAMILY}-vec"
+  "mem_ops/gather_gm_to_l1.cpp:dav-${ARCH_FAMILY}-cube"
+  "mem_ops/gather_gm_to_ub.cpp:dav-${ARCH_FAMILY}-vec"
+  "mem_ops/gather_mask.cpp:dav-${ARCH_FAMILY}-vec"
+  "reduction_ops/pair_reduce_sum.cpp:dav-${ARCH_FAMILY}-vec"
+  "sort_ops/sort32.cpp:dav-${ARCH_FAMILY}-vec"
+  "sort_ops/sort_1d_pack.cpp:dav-${ARCH_FAMILY}-vec"
+  "sort_ops/merge_pack_sort.cpp:dav-${ARCH_FAMILY}-vec"
+  "sort_ops/mrgsort.cpp:dav-${ARCH_FAMILY}-vec"
+  "sort_ops/unpack_sort.cpp:dav-${ARCH_FAMILY}-vec"
+  "mask_ops/compare_scalar.cpp:dav-${ARCH_FAMILY}-vec"
+  "cast_ops/cast_int4_to_fp16.cpp:dav-${ARCH_FAMILY}-vec"
+)
 
 if [[ ! -d "${TEMPLATE_INCLUDE}" ]]; then
   echo "error: Ascend Template include directory not found: ${TEMPLATE_INCLUDE}" >&2
@@ -181,6 +176,9 @@ fi
 TEMPLATE_BC=()
 TEMPLATE_MIX_BC=()
 TEMPLATE_CMD_INCLUDES=( "${TEMPLATE_INCLUDES[@]}" )
+if [[ "${ARCH_FAMILY}" == "c310" ]]; then
+  TEMPLATE_CMD_INCLUDES=( -I "${TEMPLATE_ROOT}/lib/RegBase/Vector/include" "${TEMPLATE_CMD_INCLUDES[@]}" )
+fi
 for i in "${!TEMPLATE_SOURCES[@]}"; do
   src="${TEMPLATE_SOURCES[$i]}"
   bc="${SCRIPT_DIR}/template_$(basename -- "${src}" .cpp).bc"
