@@ -370,15 +370,6 @@ def _legacy_mix_cv_kwargs():
     return {"enable_legacy_insert_load_store_for_mix_cv": True}
 
 
-def _skip_if_c310_gated(name):
-    """Skip groups whose op is gated on c310 by the Python registry."""
-    if custom_ops_arch_family() == "c310":
-        print(f"[SKIP] {name} is gated on c310 (known-unsupported; "
-              "see CUSTOM_OP_USAGE_cn.md)")
-        return True
-    return False
-
-
 def _print_failed_mlir(exc):
     """Temporary: show the IR handed to bishengir-compile on failure."""
     import pathlib
@@ -501,8 +492,6 @@ def _run_sort_case(n, k, index_offset, sort_impl, label):
 
 
 def test_sort_1d_pack():
-    if _skip_if_c310_gated("sort_1d_pack"):
-        return
     # BASE generic path + a non-zero index_offset case
     _run_sort_case(2048, 100, 0, SORT_IMPL_BASE, "BASE")
     _run_sort_case(2048, 100, 500, SORT_IMPL_BASE, "BASE index_offset")
@@ -579,8 +568,6 @@ def _run_merge_case(lengths, label, seed=0):
 
 
 def test_merge_exhaust_sort4():
-    if _skip_if_c310_gated("merge_exhaust_sort4"):
-        return
     _run_merge_case((64, 64, 64, 64), "4-way")
     _run_merge_case((64, 64, 0, 0), "2-way")
     _run_merge_case((64, 0, 64, 32), "3-way with hole")
@@ -592,8 +579,6 @@ def test_merge_exhaust_sort4():
 
 
 def test_unpack_sort():
-    if _skip_if_c310_gated("unpack_sort"):
-        return
     rng = np.random.default_rng(0)
     k = 128
     values = np.sort(rng.random(k))[::-1].astype(np.float32)
@@ -611,8 +596,6 @@ def test_unpack_sort():
 
 
 def test_sort32():
-    if _skip_if_c310_gated("sort32"):
-        return
     torch.manual_seed(0)
     n_experts = 256
     n_groups = 256 // 32
@@ -636,8 +619,6 @@ def test_sort32():
 
 
 def test_mrgsort():
-    if _skip_if_c310_gated("mrgsort"):
-        return
     torch.manual_seed(0)
     n_experts = 128
     n_groups = 4
@@ -667,8 +648,6 @@ def test_mrgsort():
 
 
 def test_gather_mask():
-    if _skip_if_c310_gated("gather_mask"):
-        return
     ONE_REPEAT_SORT_NUM = 32
     torch.manual_seed(0)
     n_experts = 256
@@ -718,8 +697,6 @@ def test_gather_mask():
 
 
 def test_pair_reduce_sum():
-    if _skip_if_c310_gated("pair_reduce_sum"):
-        return
     torch.manual_seed(0)
     n_groups = 8
     top2 = torch.rand([n_groups * 2], dtype=torch.float32, device=DEVICE)
@@ -735,8 +712,6 @@ def test_pair_reduce_sum():
 
 
 def test_duplicate():
-    if _skip_if_c310_gated("duplicate"):
-        return
     ONE_REPEAT_SORT_NUM = 32
     torch.manual_seed(0)
     n_groups = 8

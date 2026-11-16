@@ -435,24 +435,17 @@ c310 / Ascend950 是 reg-based 架构，旧的 mem-based intrinsic（`vector_dup
 
 已在 c310 教程中通过验证：`gather_gm_to_ub`、`compare_scalar`、`cast_int4_to_fp16`。
 `gather_gm_to_l1` 可以编译，但其写入的 L1 tile 在 c310 上不能直接交给 `tl.dot`（见上文）。
-这些算子显式声明 `supported_arches = ("c220", "c310")`。
+所有算子均显式声明 `supported_arches = ("c220", "c310")`。
 
-以下算子在 c310 上仍不可用，算子类通过 `supported_arches = ("c220",)` 声明
-支持架构，`custom_semantic` 在分发时直接抛出 `NotImplementedError`，避免落到
-BishengIR 的 `'memref.alloc' op error: read before first write` 或静默错误结果：
+sort / gather-mask / pair-reduce / duplicate 这些算子原先用
+`extra_buffers = [(tl.float16, 0)]` 作为“禁止 PlanMemory in-place 复用”的
+dummy 临时 buffer。c310 的 `PlanMemory` 不会为 0 元素 alloc 规划地址，
+随后报 `'memref.alloc' op error: read before first write`。现在 dummy buffer
+改为 1 个元素（`[(tl.float16, 1)]`），既保留禁止 in-place 的语义，又能被
+c310 规划；这些算子已重新加入 c310 构建，等待教程回归验证。
 
-- `duplicate_bitwise_mask`（结果错误：未按 bit mask 填充）
-- `gather_mask_builtin_pattern`
-- `gather_mask_custom_pattern`
-- `pair_reduce_sum_continuous_mask`
-- `sort32`
-- `sort_1d_pack`
-- `merge_exhaust_sort4`
-- `mrgsort`
-- `unpack_sort`
-
-这些算子仍可在 c220（A2/A3）上使用。c310 bitcode 仍会照常生成，gate 位于
-Python registry，错误信息会包含算子名、c310 架构和失败原因。
+`duplicate_bitwise_mask` 的 c310 bit mask 语义仍需单独修复（当前结果可能
+只覆盖第一个 datablock）。
 
 
 ## compare_scalar
