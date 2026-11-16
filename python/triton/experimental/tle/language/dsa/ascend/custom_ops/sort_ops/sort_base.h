@@ -7,13 +7,7 @@
 #include "Vector/Cast/CastUtils.h"
 #include "Vector/Sort/SortUtils.h"
 
-// c310 (A5) is reg-based: pipe_barrier only accepts the cross-pipe/all form,
-// so the vector-only barrier used by the c220 path is not available there.
-#if defined(__DAV_C310__)
-#define TLE_PIPE_BARRIER_V() INTRINSIC(pipe_barrier, PIPE_ALL)
-#else
 #define TLE_PIPE_BARRIER_V() INTRINSIC(pipe_barrier, PIPE_V)
-#endif
 
 template <typename T>
 __aiv__ __attribute__((always_inline)) void check_inputs_of_sort_1d_with_index(
