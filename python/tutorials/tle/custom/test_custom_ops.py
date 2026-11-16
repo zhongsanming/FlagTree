@@ -475,6 +475,7 @@ def _run_sort_case(n, k, index_offset, sort_impl, label):
         INDEX_OFFSET=index_offset,
         SORT_IMPL=sort_impl,
         TMP_SIZE=_sort_tmp_size(n, k, sort_impl),
+        **_legacy_mix_cv_kwargs(),
     )
     torch_npu.npu.synchronize()
 
@@ -542,6 +543,7 @@ def _run_merge_case(lengths, label, seed=0):
         L2=lengths[2],
         L3=lengths[3],
         OUT_CAP=4 * way_cap,
+        **_legacy_mix_cv_kwargs(),
     )
     torch_npu.npu.synchronize()
 
@@ -587,7 +589,7 @@ def test_unpack_sort():
     yv = torch.zeros((k, ), dtype=torch.float32, device=DEVICE)
     yi = torch.zeros((k, ), dtype=torch.int32, device=DEVICE)
 
-    unpack_sort_kernel[(1, )](src, yv, yi, K=k)
+    unpack_sort_kernel[(1, )](src, yv, yi, K=k, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     np.testing.assert_array_equal(yv.cpu().numpy(), values, err_msg="unpack_sort values mismatch")
@@ -603,7 +605,7 @@ def test_sort32():
     idx = torch.arange(0, n_experts, dtype=torch.int32, device=DEVICE).view(torch.uint32)
     out = torch.zeros([n_experts * 2], dtype=torch.float32, device=DEVICE)
 
-    sort32_kernel[(1, )](val, idx, n_groups, out, BLOCK_SIZE=n_experts)
+    sort32_kernel[(1, )](val, idx, n_groups, out, BLOCK_SIZE=n_experts, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     out_v, out_i = _decode_props(out.cpu().numpy()[:n_experts * 2])
@@ -634,7 +636,7 @@ def test_mrgsort():
     pair = torch.from_numpy(_encode_props(global_val, global_idx)).to(DEVICE)
     out = torch.zeros([top_k * 2], dtype=torch.float32, device=DEVICE)
 
-    mrgsort_kernel[(1, )](pair, out, TOP_K=top_k)
+    mrgsort_kernel[(1, )](pair, out, TOP_K=top_k, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     out_v, out_i = _decode_props(out.cpu().numpy()[:top_k * 2])
@@ -665,7 +667,7 @@ def test_gather_mask():
     rsvd_cnt = torch.zeros([1], dtype=torch.int64, device=DEVICE)
 
     # top2 value per group
-    gather_mask_custom_pattern_kernel[(1, )](pair, out, rsvd_cnt)
+    gather_mask_custom_pattern_kernel[(1, )](pair, out, rsvd_cnt, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     assert rsvd_cnt.cpu()[0] == n_groups * 2, "gather_mask_custom_pattern rsvd_cnt mismatch"
@@ -687,7 +689,7 @@ def test_gather_mask():
     rsvd_cnt2 = torch.zeros([1], dtype=torch.int64, device=DEVICE)
 
     # gather group indices
-    gather_mask_builtin_pattern_kernel[(1, )](pair2, out2, rsvd_cnt2)
+    gather_mask_builtin_pattern_kernel[(1, )](pair2, out2, rsvd_cnt2, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     assert rsvd_cnt2.cpu()[0] == ONE_REPEAT_SORT_NUM, "gather_mask_builtin_pattern rsvd_cnt mismatch"
@@ -703,7 +705,7 @@ def test_pair_reduce_sum():
     out = torch.zeros([n_groups], dtype=torch.float32, device=DEVICE)
 
     # top2 sum
-    pair_reduce_sum_continuous_mask_kernel[(1, )](top2, out)
+    pair_reduce_sum_continuous_mask_kernel[(1, )](top2, out, **_legacy_mix_cv_kwargs())
     torch_npu.npu.synchronize()
 
     ref = np.sum(top2.cpu().numpy().reshape(n_groups, 2), axis=1)
