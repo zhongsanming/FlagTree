@@ -433,19 +433,24 @@ c310 / Ascend950 是 reg-based 架构，旧的 mem-based intrinsic（`vector_dup
 实现，参考 `${ASCEND_HOME_PATH}/asc`（或 asc-devkit）中的
 `impl/basic_api/dav_3510/`。
 
-已在 c310 教程中通过验证：`gather_gm_to_ub`、`compare_scalar`、`cast_int4_to_fp16`。
-`gather_gm_to_l1` 可以编译，但其写入的 L1 tile 在 c310 上不能直接交给 `tl.dot`（见上文）。
-所有算子均显式声明 `supported_arches = ("c220", "c310")`。
+c310 教程已验证全部已注册算子：`duplicate_bitwise_mask`、
+`gather_gm_to_ub`、`gather_mask_builtin_pattern`、`gather_mask_custom_pattern`、
+`pair_reduce_sum_continuous_mask`、`sort32`、`sort_1d_pack`、
+`merge_exhaust_sort4`、`mrgsort`、`unpack_sort`、`compare_scalar`、
+`cast_int4_to_fp16`。所有算子显式声明
+`supported_arches = ("c220", "c310")`。`gather_gm_to_l1` 可以编译，但其写入
+的 L1 tile 在 c310 上不能直接交给 `tl.dot`（见上文）。
 
-sort / gather-mask / pair-reduce / duplicate 这些算子原先用
-`extra_buffers = [(tl.float16, 0)]` 作为“禁止 PlanMemory in-place 复用”的
-dummy 临时 buffer。c310 的 `PlanMemory` 不会为 0 元素 alloc 规划地址，
-随后报 `'memref.alloc' op error: read before first write`。现在 dummy buffer
-改为 1 个元素（`[(tl.float16, 1)]`），既保留禁止 in-place 的语义，又能被
-c310 规划；这些算子已重新加入 c310 构建，等待教程回归验证。
+c310 使用注意：
 
-`duplicate_bitwise_mask` 的 c310 bit mask 语义仍需单独修复（当前结果可能
-只覆盖第一个 datablock）。
+- sort / gather-mask / pair-reduce / duplicate 用
+  `extra_buffers = [(tl.float16, 1)]` 作为“禁止 PlanMemory in-place 复用”的
+  dummy 临时 buffer。0 元素 alloc 在 c310 不会被 `PlanMemory` 规划，会报
+  `'memref.alloc' op error: read before first write`，因此必须保留非零大小。
+- 不要把同一个 `tle.dsa.alloc` buffer 同时用作 `tle.dsa.copy` 的目的端和
+  custom op 的 `tle.dsa.to_tensor` 输入：c310 bufferization 会为二者分配不同
+  的 memref，DMA 写入一个而 custom op 读取另一个，同样触发
+  `read before first write`。只读输入应直接用 `tl.load`（或 block ptr）传入。
 
 
 ## compare_scalar
