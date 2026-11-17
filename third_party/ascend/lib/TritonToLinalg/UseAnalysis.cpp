@@ -162,8 +162,14 @@ void triton::UseAnalysis::visitOperation(Operation *op,
       })
       .Case<hivm::FixpipeOp>(
           [&](auto fixpipeOp) { propagateUse(operands[0], UseType::DataUse); })
-      .Case<hivm::CopyOp>(
-          [&](auto copyOp) { propagateUse(operands[0], UseType::DataUse); })
+      .Case<hivm::CopyOp>([&](auto copyOp) {
+        // Both the source and the destination are data buffers, not metadata.
+        // In particular the destination must be marked DataUse or a MixUse
+        // source buffer gets cloned for the copy in the meta-user pass below.
+        for (auto operand : operands) {
+          propagateUse(operand, UseType::DataUse);
+        }
+      })
       .Case<hivm::CustomOp, hivm::CustomMacroOp>([&](auto customOp) {
         for (auto operand : operands) {
           propagateUse(operand, UseType::MixUse);
@@ -429,6 +435,13 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
               // results are used only as memory addresses. Keep the call on
               // the materialized value, not a MetaUse clone that is erased
               // before the custom operation's operands are converted.
+            })
+            .Case<hivm::CopyOp>([](auto) {
+              // A copy has no results, so the default branch below would treat
+              // it as an all-meta user and redirect its destination to a
+              // MetaUse clone. The DMA must stay on the materialized buffer
+              // that the tensors alias; otherwise it writes one memref while
+              // to_tensor/custom reads another (read before first write).
             })
             .Default([&](Operation *op) {
               bool allMeta = true;
